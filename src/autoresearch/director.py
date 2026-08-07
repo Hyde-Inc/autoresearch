@@ -3,11 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 
 from openai import OpenAI
 
 from .config import TaskConfig
 from .models import Attempt, Idea
+
+_JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(?P<body>.*?)\s*```\s*$", re.DOTALL)
+
+
+def _extract_json(content: str) -> dict:
+    """Parse JSON, tolerating models that wrap it in a markdown code fence."""
+    match = _JSON_FENCE.match(content)
+    if match:
+        content = match["body"]
+    return json.loads(content)
 
 
 class ResearchDirector:
@@ -38,7 +49,7 @@ class ResearchDirector:
             content = response.choices[0].message.content
             if not content:
                 raise RuntimeError("director returned an empty response")
-            return json.loads(content)
+            return _extract_json(content)
 
         return await asyncio.to_thread(call)
 
