@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import load_config
+from .ingest import ingest_csv, preview_csv
 from .metrics import MetricInterpreter, MetricSpec, MetricValidation, adopt_spec, eval_columns
 from .orchestrator import run_research, validate_baseline
 from .report import build_report
@@ -81,6 +82,44 @@ def resume(
         )
     )
     console.print(f"Run complete: [bold]{completed.run_dir}[/bold]")
+
+
+@app.command()
+def ingest(
+    csv: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="Sales CSV to ingest")],
+    name: Annotated[str, typer.Option("--name", "-n", help="Task name")],
+    tasks_root: Annotated[Path, typer.Option(help="Where task folders are created")] = Path("tasks"),
+    validation_days: Annotated[int | None, typer.Option(help="Validation horizon (days)")] = None,
+    holdout_days: Annotated[int | None, typer.Option(help="Hidden holdout horizon (days)")] = None,
+    overwrite: Annotated[bool, typer.Option(help="Replace an existing task of the same name")] = False,
+) -> None:
+    """Ingest a standard-schema CSV (date, sku_name, sales, selling_price) into a task."""
+    preview = preview_csv(csv)
+    for warning in preview.warnings:
+        console.print(f"[yellow]! {warning}[/yellow]")
+    if not preview.ok:
+        for error in preview.errors:
+            console.print(f"[red]✗ {error}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"Parsed [bold]{preview.rows}[/bold] rows · {preview.skus} SKUs · "
+        f"{preview.distinct_dates} dates ({preview.date_min} → {preview.date_max})"
+    )
+    result = ingest_csv(
+        csv,
+        name=name,
+        tasks_root=tasks_root,
+        validation_days=validation_days,
+        holdout_days=holdout_days,
+        overwrite=overwrite,
+    )
+    console.print(
+        f"[green]Created task[/green] [bold]{result.task}[/bold] at {result.task_dir}\n"
+        f"  train={result.train_rows} rows (→ {result.train_end}), "
+        f"validation={result.validation_rows} (→ {result.validation_end}), "
+        f"holdout={result.holdout_rows} (→ {result.holdout_end})\n"
+        f"  next: [bold]autoresearch metric -c {result.config_path}[/bold] \"your metric\""
+    )
 
 
 def _print_spec(spec: MetricSpec, validation: MetricValidation) -> None:

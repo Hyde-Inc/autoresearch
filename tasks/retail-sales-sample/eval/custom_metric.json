@@ -1,0 +1,44 @@
+{
+  "name": "mape",
+  "direction": "min",
+  "description": "I want the evaluation metric to be MAPE \nwhich is mean absolute percentage error",
+  "understanding": "Mean Absolute Percentage Error (MAPE) measures the average magnitude of forecast errors as a percentage of the actual values. For each row, compute |actual - forecast| / |actual|, then average these values across all rows and express as a percentage. Rows where actual equals zero are excluded from the calculation to avoid division by zero. Formula: MAPE = (1/n) * Σ(|actual_i - forecast_i| / |actual_i|) * 100.",
+  "example": {
+    "rows": [
+      {
+        "sku_name": "A",
+        "date": "2024-01-01",
+        "actual": 100,
+        "forecast": 110
+      },
+      {
+        "sku_name": "A",
+        "date": "2024-01-02",
+        "actual": 200,
+        "forecast": 180
+      },
+      {
+        "sku_name": "B",
+        "date": "2024-01-01",
+        "actual": 50,
+        "forecast": 60
+      },
+      {
+        "sku_name": "B",
+        "date": "2024-01-02",
+        "actual": 400,
+        "forecast": 360
+      }
+    ],
+    "steps": [
+      "Row 1: |100 - 110| / |100| = 10 / 100 = 0.10",
+      "Row 2: |200 - 180| / |200| = 20 / 200 = 0.10",
+      "Row 3: |50  -  60| / |50|  = 10 /  50 = 0.20",
+      "Row 4: |400 - 360| / |400| = 40 / 400 = 0.10",
+      "Mean of [0.10, 0.10, 0.20, 0.10] = 0.50 / 4 = 0.125",
+      "MAPE = 0.125 * 100 = 12.5"
+    ],
+    "value": 12.5
+  },
+  "code": "def metric(df: pd.DataFrame) -> float:\n    import numpy as np\n    import pandas as pd\n\n    # Exclude rows where actual is zero to avoid division by zero\n    valid = df[df['actual'] != 0].copy()\n\n    if len(valid) == 0:\n        return float('nan')\n\n    ape = np.abs(valid['actual'] - valid['forecast']) / np.abs(valid['actual'])\n    mape = float(ape.mean() * 100)\n    return mape\n"
+}

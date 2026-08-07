@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+import yaml
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .config import load_config
+from .ingest import ingest_csv, preview_csv
 from .metrics import (
     MetricInterpreter,
     MetricSpec,
@@ -22,6 +25,7 @@ from .metrics import (
     load_task_spec,
     validate_spec,
 )
+from .report import build_report
 
 STATIC_DIR = Path(__file__).parent / "web" / "static"
 DEFAULT_CONFIG = "examples/demand_forecasting/task.yaml"
@@ -139,6 +143,11 @@ class ConfirmMetricRequest(BaseModel):
     config: str = DEFAULT_CONFIG
 
 
+class SaveBaselineRequest(BaseModel):
+    config: str
+    code: str
+
+
 def create_app(runs_root: Path, project_root: Path | None = None) -> FastAPI:
     runs_root = runs_root.resolve()
     project_root = (project_root or Path.cwd()).resolve()
@@ -200,11 +209,101 @@ def create_app(runs_root: Path, project_root: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="log not found")
         return _parse_agent_log(log_path)
 
-    def _config_for(relative: str):
+    tasks_root = project_root / "tasks"
+
+    def _safe_config_path(relative: str) -> Path:
         config_path = (project_root / relative).resolve()
+        if not str(config_path).startswith(str(project_root)):
+            raise HTTPException(status_code=400, detail="config path escapes project root")
         if not config_path.exists():
             raise HTTPException(status_code=400, detail=f"config not found: {relative}")
-        return load_config(config_path)
+        return config_path
+
+    def _config_for(relative: str):
+        return load_config(_safe_config_path(relative))
+
+    @app.get("/api/tasks")
+    def list_tasks() -> dict:
+        """All runnable task configs (bundled example + ingested tasks)."""
+        found: list[dict] = []
+        candidates = [project_root / DEFAULT_CONFIG]
+        if tasks_root.is_dir():
+            candidates += sorted(tasks_root.glob("*/task.yaml"))
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                raw = yaml.safe_load(path.read_text())
+            except Exception:  # noqa: BLE001
+                continue
+            rel = os.path.relpath(path, project_root)
+            spec = None
+            if raw.get("metric", {}).get("definition"):
+                spec = raw["metric"]
+            found.append(
+                {
+                    "config": rel,
+                    "name": raw.get("name", path.parent.name),
+                    "description": raw.get("description", ""),
+                    "goal": raw.get("goal", ""),
+                    "metric": raw.get("metric", {}).get("name", "wmape"),
+                    "custom_metric": bool(spec and spec.get("definition")),
+                    "bundled": rel == DEFAULT_CONFIG,
+                }
+            )
+        return {"tasks": found}
+
+    @app.post("/api/ingest/preview")
+    async def ingest_preview(file: UploadFile = File(...)) -> dict:
+        content = await file.read()
+        return dataclasses.asdict(preview_csv(content))
+
+    @app.post("/api/ingest")
+    async def ingest(
+        file: UploadFile = File(...),
+        name: str = Form(...),
+        validation_days: int | None = Form(None),
+        holdout_days: int | None = Form(None),
+        overwrite: bool = Form(False),
+    ) -> dict:
+        content = await file.read()
+        try:
+            result = ingest_csv(
+                content,
+                name=name,
+                tasks_root=tasks_root,
+                validation_days=validation_days,
+                holdout_days=holdout_days,
+                overwrite=overwrite,
+            )
+        except (ValueError, FileExistsError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        payload = dataclasses.asdict(result)
+        payload["config"] = os.path.relpath(result.config_path, project_root)
+        payload["config_path"] = str(result.config_path)
+        payload["task_dir"] = str(result.task_dir)
+        return payload
+
+    @app.get("/api/baseline")
+    def get_baseline(config: str = DEFAULT_CONFIG) -> dict:
+        cfg = _config_for(config)
+        path = cfg.resolve(cfg.workspace.seed) / "solution" / "train.py"
+        return {
+            "code": path.read_text() if path.exists() else "",
+            "path": os.path.relpath(path, project_root) if path.exists() else None,
+        }
+
+    @app.post("/api/baseline")
+    def save_baseline(request: SaveBaselineRequest) -> dict:
+        cfg = _config_for(request.config)
+        path = cfg.resolve(cfg.workspace.seed) / "solution" / "train.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(request.code)
+        return {"ok": True, "path": os.path.relpath(path, project_root)}
+
+    @app.get("/api/runs/{task}/{run}/report", response_class=PlainTextResponse)
+    def get_report(task: str, run: str) -> str:
+        return build_report(_run_dir(runs_root, task, run))
 
     @app.get("/api/metric")
     def get_metric(config: str = DEFAULT_CONFIG) -> dict:

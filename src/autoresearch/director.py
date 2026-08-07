@@ -61,6 +61,7 @@ class ResearchDirector:
         round_number: int,
         attempts: list[Attempt],
         notes: str,
+        tracks: list[str] | None = None,
     ) -> list[Idea]:
         history = [
             {

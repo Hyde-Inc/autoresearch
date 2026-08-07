@@ -1,0 +1,46 @@
+name: retail-sales-sample
+description: Forecast daily sales for 80 items from an uploaded sales history (['date',
+  'sku_name', 'sales', 'selling_price']). Produce one non-negative forecast per requested
+  sku_name/date pair. A protected evaluator scores a 28-day validation window and
+  a later hidden 28-day holdout.
+goal: Reduce forecast error on sales while keeping runtime and holdout stable.
+metric:
+  name: mape
+  direction: min
+  definition: eval/custom_metric.json
+secondary_metrics:
+- mape
+- rmse
+- bias_pct
+- runtime_s
+guardrails:
+- runtime_s<=600
+director:
+  model: openrouter/anthropic/claude-sonnet-4.6
+  temperature: 0.35
+agents:
+  model: openrouter/anthropic/claude-sonnet-4.6
+  count: 3
+  timeout_s: 900
+budget:
+  max_experiments: 12
+  train_timeout_s: 600
+  rounds: 4
+data:
+  train: seed/data/train.parquet
+  validation_actuals: private/validation.parquet
+  holdout_actuals: private/holdout.parquet
+  output: forecasts.parquet
+  id_column: sku_name
+  date_column: date
+  target_column: sales
+workspace:
+  seed: seed
+  runs: ../../runs
+  allowed_paths:
+  - solution/
+idea_hints:
+- Per-item seasonal-naive or exponential smoothing with weekly seasonality
+- XGBoost with lag, rolling-mean, calendar, and price features
+- Price-elasticity features from selling_price
+- Robust ensembles and per-item bias calibration

@@ -109,6 +109,47 @@ export interface InterpretResult {
   columns: string[];
 }
 
+export interface TaskInfo {
+  config: string;
+  name: string;
+  description: string;
+  goal: string;
+  metric: string;
+  custom_metric: boolean;
+  bundled: boolean;
+}
+
+export interface IngestPreview {
+  ok: boolean;
+  columns: string[];
+  rows: number;
+  skus: number;
+  date_min: string | null;
+  date_max: string | null;
+  distinct_dates: number;
+  sample: Record<string, string | number>[];
+  errors: string[];
+  warnings: string[];
+  suggested_validation_days: number;
+  suggested_holdout_days: number;
+}
+
+export interface IngestResult {
+  task: string;
+  config: string;
+  config_path: string;
+  task_dir: string;
+  train_rows: number;
+  validation_rows: number;
+  holdout_rows: number;
+  skus: number;
+  train_end: string;
+  validation_end: string;
+  holdout_end: string;
+}
+
+export const REQUIRED_SCHEMA = ["date", "sku_name", "sales", "selling_price"];
+
 async function get<T>(url: string): Promise<T> {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url}: ${response.status}`);
@@ -146,21 +187,65 @@ export const api = {
     if (!response.ok) throw new Error("diff not found");
     return response.text();
   },
-  start: (body: { goal?: string; parallel?: number; max_experiments?: number }) =>
+  start: (body: {
+    config?: string;
+    goal?: string;
+    parallel?: number;
+    max_experiments?: number;
+  }) =>
     fetch("/api/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then((r) => r.json()),
   stop: () => fetch("/api/stop", { method: "POST" }).then((r) => r.json()),
-  metric: () => get<MetricInfo>("/api/metric"),
-  interpretMetric: (description: string) =>
-    post<InterpretResult>("/api/metric/interpret", { description }),
-  confirmMetric: (spec: MetricSpec) =>
+  tasks: () => get<{ tasks: TaskInfo[] }>("/api/tasks"),
+  report: async (task: string, run: string): Promise<string> => {
+    const response = await fetch(`/api/runs/${task}/${run}/report`);
+    if (!response.ok) throw new Error("report not found");
+    return response.text();
+  },
+  ingestPreview: (file: File): Promise<IngestPreview> => {
+    const form = new FormData();
+    form.append("file", file);
+    return fetch("/api/ingest/preview", { method: "POST", body: form }).then((r) => r.json());
+  },
+  ingest: async (
+    file: File,
+    name: string,
+    opts: { validation_days?: number; holdout_days?: number; overwrite?: boolean } = {},
+  ): Promise<IngestResult> => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("name", name);
+    if (opts.validation_days != null) form.append("validation_days", String(opts.validation_days));
+    if (opts.holdout_days != null) form.append("holdout_days", String(opts.holdout_days));
+    form.append("overwrite", String(opts.overwrite ?? false));
+    const response = await fetch("/api/ingest", { method: "POST", body: form });
+    if (!response.ok) {
+      let detail = `ingest failed: ${response.status}`;
+      try {
+        const payload = await response.json();
+        if (typeof payload.detail === "string") detail = payload.detail;
+      } catch {
+        // keep generic
+      }
+      throw new Error(detail);
+    }
+    return response.json();
+  },
+  metric: (config: string) => get<MetricInfo>(`/api/metric?config=${encodeURIComponent(config)}`),
+  interpretMetric: (description: string, config: string) =>
+    post<InterpretResult>("/api/metric/interpret", { description, config }),
+  confirmMetric: (spec: MetricSpec, config: string) =>
     post<{ ok: boolean; definition: string; name: string; direction: string }>(
       "/api/metric/confirm",
-      { spec },
+      { spec, config },
     ),
+  baseline: (config: string) =>
+    get<{ code: string; path: string | null }>(`/api/baseline?config=${encodeURIComponent(config)}`),
+  saveBaseline: (config: string, code: string) =>
+    post<{ ok: boolean; path: string }>("/api/baseline", { config, code }),
 };
 
 export function fmtPct(value: number | undefined | null, digits = 2): string {

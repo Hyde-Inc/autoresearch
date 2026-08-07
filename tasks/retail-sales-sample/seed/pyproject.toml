@@ -1,0 +1,11 @@
+[project]
+name = "retail-sales-sample-experiment"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "pyarrow>=17",
+  "statsmodels>=0.14",
+  "xgboost>=2.1",
+]

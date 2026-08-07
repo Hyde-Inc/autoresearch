@@ -1,151 +1,191 @@
 import { useCallback, useEffect, useState } from "react";
-import { AppHeader } from "./components/AppHeader";
-import { AttemptsTable } from "./components/AttemptsTable";
-import { DefineMetricModal } from "./components/DefineMetricModal";
-import { ExperimentChart } from "./components/ExperimentChart";
-import { KpiStrip } from "./components/KpiStrip";
-import { LiveAgents } from "./components/LiveAgents";
-import { NewRunModal } from "./components/NewRunModal";
-import { NotesPanel } from "./components/NotesPanel";
-import type { Attempt, Note, RunState, TaskRuns } from "./lib/api";
+import { Stepper, type StepDef } from "./components/Stepper";
+import type { IngestResult, TaskInfo } from "./lib/api";
 import { api } from "./lib/api";
+import { StepBaseline } from "./steps/StepBaseline";
+import { StepIngest } from "./steps/StepIngest";
+import { StepLearnings } from "./steps/StepLearnings";
+import { StepMerge } from "./steps/StepMerge";
+import { StepMetric } from "./steps/StepMetric";
+import { StepRun } from "./steps/StepRun";
 
-const POLL_MS = 2500;
+const STEPS: StepDef[] = [
+  { key: "ingest", label: "Ingest data", sub: "Upload sales CSV" },
+  { key: "metric", label: "Define metric", sub: "Metric & grader" },
+  { key: "baseline", label: "Baseline model", sub: "Starting point" },
+  { key: "run", label: "Autoresearch run", sub: "Trigger & monitor" },
+  { key: "learnings", label: "Learnings", sub: "What it found" },
+  { key: "merge", label: "Merge ideas", sub: "Ship the wins" },
+];
 
 export default function App(): React.ReactElement {
-  const [tasks, setTasks] = useState<TaskRuns[]>([]);
-  const [selectedTask, setSelectedTask] = useState<string | null>(null);
-  const [selectedRun, setSelectedRun] = useState<string | null>(null);
-  const [state, setState] = useState<RunState>({});
-  const [attempts, setAttempts] = useState<Attempt[]>([]);
-  const [notes, setNotes] = useState<Note[]>([]);
-  const [selectedAttempt, setSelectedAttempt] = useState<string | null>(null);
-  const [showNewRun, setShowNewRun] = useState(false);
-  const [showDefineMetric, setShowDefineMetric] = useState(false);
+  const [tasks, setTasks] = useState<TaskInfo[]>([]);
+  const [config, setConfig] = useState<string | null>(null);
+  const [taskName, setTaskName] = useState<string | null>(null);
+  const [active, setActive] = useState(0);
+  const [furthest, setFurthest] = useState(0);
+  const [run, setRun] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
+  const loadTasks = useCallback(async () => {
     try {
-      const index = await api.runs();
-      setTasks(index.tasks);
-      let task = selectedTask;
-      let run = selectedRun;
-      if (!task || !run) {
-        // Prefer a running run, else the latest with attempts, else the latest
-        outer: for (const t of index.tasks) {
-          for (const r of t.runs) {
-            if (r.status === "running") {
-              task = t.task;
-              run = r.run;
-              break outer;
-            }
-          }
-        }
-        if ((!task || !run) && index.tasks.length > 0) {
-          const t = index.tasks[0];
-          const withAttempts = t.runs.find((r) => r.attempts > 0);
-          task = t.task;
-          run = (withAttempts ?? t.runs[0]).run;
-        }
-        if (task && run) {
-          setSelectedTask(task);
-          setSelectedRun(run);
-        }
-      }
-      if (task && run) {
-        const [runState, runAttempts, runNotes] = await Promise.all([
-          api.state(task, run),
-          api.attempts(task, run),
-          api.notes(task, run),
-        ]);
-        setState(runState);
-        setAttempts(runAttempts);
-        setNotes(runNotes);
+      const { tasks } = await api.tasks();
+      setTasks(tasks);
+      if (!config && tasks.length > 0) {
+        const preferred = tasks.find((t) => !t.bundled) ?? tasks[0];
+        setConfig(preferred.config);
+        setTaskName(preferred.name);
+        setFurthest((f) => Math.max(f, STEPS.length - 1));
       }
     } catch {
-      // Server briefly unavailable; try again on the next tick.
+      // server starting up
     }
-  }, [selectedTask, selectedRun]);
+  }, [config]);
 
   useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, POLL_MS);
-    return () => clearInterval(interval);
-  }, [refresh]);
+    loadTasks();
+  }, [loadTasks]);
 
-  const metric = state.primary_metric ?? "wmape";
-  const baseline = state.baseline?.[metric];
+  const goto = (index: number): void => {
+    setActive(index);
+    setFurthest((f) => Math.max(f, index));
+  };
+
+  const selectTask = (cfg: string): void => {
+    const info = tasks.find((t) => t.config === cfg);
+    setConfig(cfg);
+    setTaskName(info?.name ?? null);
+    setRun(null);
+    setFurthest(STEPS.length - 1);
+  };
+
+  const onIngested = (result: IngestResult): void => {
+    setConfig(result.config);
+    setTaskName(result.task);
+    setRun(null);
+    loadTasks();
+    goto(1);
+  };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
-      <AppHeader
-        tasks={tasks}
-        selectedTask={selectedTask}
-        selectedRun={selectedRun}
-        state={state}
-        onSelect={(task, run) => {
-          setSelectedTask(task);
-          setSelectedRun(run);
-          setSelectedAttempt(null);
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 24,
+          padding: "10px 20px",
+          background: "var(--ae-surface)",
+          borderBottom: "1px solid var(--ae-divider)",
         }}
-        onNewRun={() => setShowNewRun(true)}
-        onStop={() => api.stop()}
-        onDefineMetric={() => setShowDefineMetric(true)}
-      />
-
-      <main style={{ flex: 1, padding: 16, display: "flex", flexDirection: "column", gap: 12, maxWidth: 1400, width: "100%", margin: "0 auto" }}>
-        {state.goal && (
-          <div style={{ fontSize: 12.5, color: "var(--ae-text-muted)" }}>
-            <span className="ae-stat__label" style={{ marginRight: 8 }}>Goal</span>
-            {state.goal}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 14, minWidth: 0 }}>
+          <div
+            style={{
+              width: 32,
+              height: 32,
+              borderRadius: 8,
+              background: "linear-gradient(135deg, var(--fk-blue) 0%, #7c3aed 100%)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontFamily: "var(--ae-font-display)",
+              fontWeight: 700,
+              fontSize: 15,
+              color: "#fff",
+            }}
+          >
+            A
           </div>
-        )}
-
-        <KpiStrip state={state} attempts={attempts} />
-
-        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(300px, 1fr)", gap: 12, alignItems: "start" }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
-            <div className="ae-card">
-              <div style={{ padding: "12px 16px 4px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span className="ae-stat__label">{metric} per experiment</span>
-                <span style={{ fontSize: 11, color: "var(--ae-text-dim)" }}>click a point to inspect</span>
-              </div>
-              <div style={{ padding: "4px 8px 8px" }}>
-                <ExperimentChart
-                  attempts={[...attempts].sort((a, b) => a.created_at.localeCompare(b.created_at))}
-                  baseline={baseline}
-                  metric={metric}
-                  selectedId={selectedAttempt}
-                  onSelect={setSelectedAttempt}
-                />
-              </div>
+          <div>
+            <div
+              style={{
+                fontFamily: "var(--ae-font-display)",
+                fontSize: 15,
+                fontWeight: 600,
+                letterSpacing: "-0.02em",
+                color: "var(--ae-text-strong)",
+                lineHeight: 1.2,
+              }}
+            >
+              Autoresearch Lab
             </div>
-
-            <div className="ae-card">
-              <div style={{ padding: "12px 16px 4px" }}>
-                <span className="ae-stat__label">Experiments</span>
-              </div>
-              {selectedTask && selectedRun && (
-                <AttemptsTable
-                  task={selectedTask}
-                  run={selectedRun}
-                  attempts={attempts}
-                  metric={metric}
-                  selectedId={selectedAttempt}
-                  onSelect={setSelectedAttempt}
-                />
-              )}
+            <div style={{ fontSize: 11.5, color: "var(--ae-text-muted)" }}>
+              From raw sales data to a shipped forecasting model
             </div>
-          </div>
-
-          <div style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
-            <LiveAgents attempts={attempts} onSelect={setSelectedAttempt} />
-            <NotesPanel notes={notes} />
           </div>
         </div>
-      </main>
 
-      {showNewRun && <NewRunModal onClose={() => setShowNewRun(false)} onStarted={refresh} />}
-      {showDefineMetric && <DefineMetricModal onClose={() => setShowDefineMetric(false)} />}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span className="ae-stat__label">Project</span>
+          <select
+            className="ae-select"
+            value={config ?? ""}
+            onChange={(e) => selectTask(e.target.value)}
+          >
+            {config === null && <option value="">— none yet —</option>}
+            {tasks.map((t) => (
+              <option key={t.config} value={t.config}>
+                {t.name}
+                {t.bundled ? " (demo)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+      </header>
+
+      <div style={{ background: "var(--ae-surface)", borderBottom: "1px solid var(--ae-divider)", padding: "0 12px" }}>
+        <div style={{ maxWidth: 1400, margin: "0 auto" }}>
+          <Stepper steps={STEPS} active={active} furthest={furthest} onSelect={goto} />
+        </div>
+      </div>
+
+      <main style={{ flex: 1, padding: "22px 16px 40px", width: "100%" }}>
+        {active === 0 && <StepIngest onIngested={onIngested} existingConfig={config} />}
+
+        {active === 1 &&
+          (config ? (
+            <StepMetric config={config} onBack={() => goto(0)} onDone={() => goto(2)} />
+          ) : (
+            <NeedTask />
+          ))}
+
+        {active === 2 &&
+          (config ? (
+            <StepBaseline config={config} onBack={() => goto(1)} onDone={() => goto(3)} />
+          ) : (
+            <NeedTask />
+          ))}
+
+        {active === 3 &&
+          (config && taskName ? (
+            <StepRun
+              config={config}
+              taskName={taskName}
+              onBack={() => goto(2)}
+              onDone={() => goto(4)}
+              onRun={(_t, r) => setRun(r)}
+            />
+          ) : (
+            <NeedTask />
+          ))}
+
+        {active === 4 && (
+          <StepLearnings task={taskName} run={run} onBack={() => goto(3)} onDone={() => goto(5)} />
+        )}
+
+        {active === 5 && (
+          <StepMerge task={taskName} run={run} onBack={() => goto(4)} onRestart={() => goto(0)} />
+        )}
+      </main>
+    </div>
+  );
+}
+
+function NeedTask(): React.ReactElement {
+  return (
+    <div style={{ maxWidth: 900, margin: "0 auto", textAlign: "center", color: "var(--ae-text-muted)", padding: 60 }}>
+      Ingest a dataset first (step 1) to unlock this step.
     </div>
   );
 }

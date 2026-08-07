@@ -16,6 +16,10 @@ from .worker import WorkerResult, _run, ensure_seed_repo, remove_worktree, run_w
 
 console = Console()
 
+# Demo hard caps: no run may exceed these regardless of config or API input.
+DEMO_MAX_ROUNDS = 4
+DEMO_MAX_PARALLEL = 4
+
 
 def _better(candidate: float, incumbent: float, direction: str) -> bool:
     return candidate < incumbent if direction == "min" else candidate > incumbent
@@ -88,7 +92,8 @@ async def run_research(
         config.goal = goal
     if guardrails:
         config.guardrails.extend(guardrails)
-    parallel = parallel or config.agents.count
+    parallel = min(parallel or config.agents.count, DEMO_MAX_PARALLEL)
+    max_rounds = min(config.budget.rounds, DEMO_MAX_ROUNDS)
     maximum = max_experiments or config.budget.max_experiments
     seed_template = config.resolve(config.workspace.seed)
     if not seed_template.exists():
@@ -140,7 +145,7 @@ async def run_research(
     )
     director = ResearchDirector(config)
     try:
-        while completed < maximum and round_number < config.budget.rounds:
+        while completed < maximum and round_number < max_rounds:
             if Path(".autoresearch-stop").exists():
                 break
             round_number += 1
