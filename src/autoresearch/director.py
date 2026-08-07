@@ -8,6 +8,7 @@ import re
 from openai import OpenAI
 
 from .config import TaskConfig
+from .metrics import load_task_spec
 from .models import Attempt, Idea
 
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(?P<body>.*?)\s*```\s*$", re.DOTALL)
@@ -80,9 +81,12 @@ class ResearchDirector:
             "respect runtime and metric guardrails. Return strict JSON with key 'ideas', an array "
             "of objects with exactly: title, hypothesis, instructions, category."
         )
+        spec = load_task_spec(self.config)
+        metric_context = f" Definition: {spec.understanding}" if spec else ""
         user = (
             f"Task: {self.config.description}\nGoal: {self.config.goal}\n"
-            f"Primary metric: {self.config.metric.name} ({self.config.metric.direction})\n"
+            f"Primary metric: {self.config.metric.name} "
+            f"({self.config.metric.direction}).{metric_context}\n"
             f"Guardrails: {self.config.guardrails}\nRound: {round_number}\n"
             f"Need {count} ideas.\nSuggested families (not mandatory): {self.config.idea_hints}\n"
             f"Prior attempts: {json.dumps(history)}\nLab notes:\n{notes[-8000:]}"

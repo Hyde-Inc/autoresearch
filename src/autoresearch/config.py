@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field, model_validator
 class MetricConfig(BaseModel):
     name: str = "wmape"
     direction: Literal["min", "max"] = "min"
+    definition: Path | None = None
+    """Optional path (task-relative) to a verified custom metric spec JSON."""
 
 
 class ModelConfig(BaseModel):
@@ -81,4 +83,10 @@ def load_config(path: Path) -> TaskConfig:
         raw = yaml.safe_load(handle)
     config = TaskConfig.model_validate(raw)
     config.config_path = path
+    if config.metric.definition:
+        from .metrics import load_spec
+
+        spec = load_spec(config.resolve(config.metric.definition))
+        config.metric.name = spec.name
+        config.metric.direction = spec.direction
     return config

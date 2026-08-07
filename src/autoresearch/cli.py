@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import load_config
+from .metrics import MetricInterpreter, MetricSpec, MetricValidation, adopt_spec, eval_columns
 from .orchestrator import run_research, validate_baseline
 from .report import build_report
 from .store import RunStore, latest_run
@@ -80,6 +81,58 @@ def resume(
         )
     )
     console.print(f"Run complete: [bold]{completed.run_dir}[/bold]")
+
+
+def _print_spec(spec: MetricSpec, validation: MetricValidation) -> None:
+    console.print(f"\n[bold]Metric:[/bold] {spec.name} ({spec.direction}imize)")
+    console.print(f"[bold]Understanding:[/bold] {spec.understanding}\n")
+    table = Table(title="Hand-worked example")
+    columns = list(spec.example.rows[0].keys())
+    for column in columns:
+        table.add_column(column)
+    for row in spec.example.rows:
+        table.add_row(*(str(row.get(column, "")) for column in columns))
+    console.print(table)
+    for step in spec.example.steps:
+        console.print(f"  • {step}")
+    console.print(f"[bold]Hand-computed value:[/bold] {spec.example.value}\n")
+    console.print("[bold]Grader code:[/bold]")
+    console.print(spec.code, markup=False, highlight=True)
+    console.print()
+    for check in validation.checks:
+        color = "green" if check.passed else "red"
+        console.print(f"[{color}]✓ {check.name}[/{color}]: {check.detail}")
+    for warning in validation.warnings:
+        console.print(f"[yellow]! {warning}[/yellow]")
+
+
+@app.command()
+def metric(
+    config: ConfigOption,
+    description: Annotated[
+        str, typer.Argument(help="Plain-English description of the evaluation metric")
+    ],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+) -> None:
+    """Define the grader's evaluation metric from a plain-language description."""
+    load_dotenv()
+    cfg = load_config(config)
+    columns = eval_columns(cfg)
+    console.print(
+        f"Interpreting metric with [bold]{cfg.director.model}[/bold] "
+        f"(eval columns: {', '.join(columns)})..."
+    )
+    interpreter = MetricInterpreter(cfg.director.model, cfg.director.temperature)
+    spec, validation = asyncio.run(interpreter.interpret(description, columns))
+    _print_spec(spec, validation)
+    if not yes and not typer.confirm("Adopt this metric as the grader?"):
+        console.print("Metric discarded; nothing was changed.")
+        raise typer.Exit(0)
+    saved = adopt_spec(cfg, spec)
+    console.print(
+        f"\n[green]Adopted.[/green] Spec saved to [bold]{saved}[/bold]; "
+        f"task.yaml now grades on [bold]{spec.name}[/bold] ({spec.direction})."
+    )
 
 
 @app.command()
@@ -169,6 +222,22 @@ def stop() -> None:
     """Request that a running orchestrator stop after its current round."""
     Path(".autoresearch-stop").write_text("stop\n")
     console.print("Stop requested.")
+
+
+@app.command()
+def ui(
+    runs_dir: Annotated[Path, typer.Option(help="Runs directory to serve")] = Path("runs"),
+    port: Annotated[int, typer.Option(help="Port for the dashboard")] = 8500,
+    host: Annotated[str, typer.Option(help="Bind address")] = "127.0.0.1",
+) -> None:
+    """Launch the web dashboard."""
+    import uvicorn
+
+    from .webapp import create_app
+
+    load_dotenv()
+    console.print(f"Dashboard: [bold]http://{host}:{port}[/bold]")
+    uvicorn.run(create_app(runs_dir, Path.cwd()), host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":
