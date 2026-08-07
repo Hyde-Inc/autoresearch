@@ -11,6 +11,7 @@ from .config import TaskConfig
 from .director import ResearchDirector
 from .harness import Evaluation, evaluate
 from .models import Attempt, Idea
+from .runlog import ResearchRunLogger
 from .store import RunStore
 from .worker import WorkerResult, _run, ensure_seed_repo, remove_worktree, run_worker
 
@@ -39,9 +40,13 @@ async def _execute_attempt(
     round_number: int,
     base_ref: str,
     baseline: dict[str, float],
+    logger: ResearchRunLogger,
 ) -> tuple[Attempt, WorkerResult]:
     attempt = Attempt(id=attempt_id, round=round_number, idea=idea, status="running")
     store.save_attempt(attempt)
+    logger.agent(attempt_id, "preparing an isolated worktree")
+    logger.agent(attempt_id, "OpenCode is implementing this strategy")
+    worker_worktree = store.worktrees_dir / attempt_id
     worker = await run_worker(
         config=config,
         store=store,
@@ -49,6 +54,7 @@ async def _execute_attempt(
         idea=idea,
         attempt_id=attempt_id,
         base_ref=base_ref,
+        on_event=lambda event: logger.event(attempt_id, event, worker_worktree),
     )
     attempt.branch = worker.branch
     attempt.commit = worker.commit
@@ -56,6 +62,11 @@ async def _execute_attempt(
     diff_path = store.attempts_dir / f"{attempt_id}.patch"
     diff_path.write_text(worker.diff)
     attempt.diff_path = str(diff_path)
+    if worker.changed_paths:
+        logger.agent(
+            attempt_id,
+            f"implementation finished; changed {', '.join(worker.changed_paths)}",
+        )
     forbidden = _paths_allowed(worker.changed_paths, config.workspace.allowed_paths)
     if forbidden:
         attempt.status = "rejected"
@@ -64,6 +75,7 @@ async def _execute_attempt(
         attempt.status = "failed"
         attempt.error = worker.error
     else:
+        logger.agent(attempt_id, "checking the canvas with protected validation and holdout evals")
         result = await evaluate(worker.worktree, config, baseline=baseline)
         attempt.metrics = result.metrics
         attempt.holdout_metrics = result.holdout_metrics
@@ -72,6 +84,12 @@ async def _execute_attempt(
         attempt.error = result.error
         attempt.status = "passed" if result.passed else ("failed" if result.error else "rejected")
     store.save_attempt(attempt)
+    logger.attempt_result(
+        attempt,
+        primary_metric=config.metric.name,
+        incumbent_value=baseline[config.metric.name],
+        direction=config.metric.direction,
+    )
     return attempt, worker
 
 
@@ -134,11 +152,20 @@ async def run_research(
                 "round": 0,
             }
         )
-    console.print(
-        f"[bold]Baseline[/bold] {config.metric.name}={baseline[config.metric.name]:.6f}, "
-        f"holdout={baseline[f'holdout_{config.metric.name}']:.6f}"
+    logger = ResearchRunLogger(store.run_dir / "activity.log", console)
+    logger.run_start(
+        goal=config.goal,
+        primary_metric=config.metric.name,
+        baseline=baseline[config.metric.name],
+        parallel=parallel,
+        maximum=maximum,
+    )
+    logger.message(
+        f"Hidden holdout baseline: "
+        f"{config.metric.name}={baseline[f'holdout_{config.metric.name}']:.6f}"
     )
     director = ResearchDirector(config)
+    run_error: Exception | None = None
     try:
         while completed < maximum and round_number < config.budget.rounds:
             if Path(".autoresearch-stop").exists():
@@ -152,10 +179,10 @@ async def run_research(
                 attempts=store.load_attempts(),
                 notes=notes,
             )
-            console.print(f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments")
+            assignments = [(uuid.uuid4().hex[:8], idea) for idea in ideas]
+            logger.round_plan(round_number, assignments)
             jobs = []
-            for idea in ideas:
-                attempt_id = uuid.uuid4().hex[:8]
+            for attempt_id, idea in assignments:
                 jobs.append(
                     _execute_attempt(
                         config,
@@ -166,10 +193,13 @@ async def run_research(
                         round_number,
                         incumbent_ref,
                         incumbent,
+                        logger,
                     )
                 )
             results = await asyncio.gather(*jobs)
             completed += len(results)
+            round_attempts = [attempt for attempt, _ in results]
+            logger.round_summary(round_number, round_attempts, config.metric.name)
             passing = [
                 (attempt, worker)
                 for attempt, worker in results
@@ -197,13 +227,20 @@ async def run_research(
                     incumbent[f"holdout_{config.metric.name}"] = attempt.holdout_metrics[
                         config.metric.name
                     ]
-                    console.print(
-                        f"[green]Promoted {attempt.id}[/green]: "
-                        f"{config.metric.name}={attempt.metrics[config.metric.name]:.6f}"
+                    logger.message(
+                        f"Promoted [{attempt.id}] {attempt.idea.title}. This is the new starting "
+                        f"canvas at {config.metric.name}={attempt.metrics[config.metric.name]:.6f}",
+                        style="bold green",
                     )
                 store.save_attempt(attempt)
+            else:
+                logger.message(
+                    "No strategy beat the current canvas while passing every guardrail.",
+                    style="yellow",
+                )
             reflection = await director.reflect([attempt for attempt, _ in results])
             store.append_note(f"Round {round_number}", reflection)
+            logger.message(f"Research Director reflection: {reflection}")
             for _, worker in results:
                 await remove_worktree(repo, worker)
             store.save_state(
@@ -220,9 +257,19 @@ async def run_research(
                     "completed": completed,
                 }
             )
+    except Exception as exc:
+        run_error = exc
+        logger.message(f"Research run failed: {exc}", style="bold red")
+        raise
     finally:
         state = store.load_state()
-        state["status"] = "stopped" if Path(".autoresearch-stop").exists() else "completed"
+        if Path(".autoresearch-stop").exists():
+            state["status"] = "stopped"
+        elif run_error:
+            state["status"] = "failed"
+        else:
+            state["status"] = "completed"
         store.save_state(state)
         Path(".autoresearch-stop").unlink(missing_ok=True)
+        logger.message(f"Research run {state['status']}. Activity log: {logger.activity_path}")
     return store

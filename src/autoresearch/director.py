@@ -3,11 +3,36 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 
 from openai import OpenAI
 
 from .config import TaskConfig
 from .models import Attempt, Idea
+
+
+def parse_json_object(content: str) -> dict:
+    """Parse plain, fenced, or prose-prefixed JSON returned by an LLM."""
+    text = content.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            payload, _ = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError(f"director did not return a JSON object: {text[:200]!r}")
 
 
 class ResearchDirector:
@@ -26,19 +51,44 @@ class ResearchDirector:
         )
         model = config.director.model
         self.model = model.removeprefix("openrouter/")
+        seed = config.resolve(config.workspace.seed)
+        task_path = seed / "TASK.md"
+        project_path = seed / "pyproject.toml"
+        self.task_contract = task_path.read_text() if task_path.exists() else config.description
+        self.project_environment = (
+            project_path.read_text() if project_path.exists() else "No dependency file provided."
+        )
 
     async def _json_completion(self, system: str, user: str) -> dict:
         def call() -> dict:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                temperature=self.config.director.temperature,
-                response_format={"type": "json_object"},
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            )
-            content = response.choices[0].message.content
-            if not content:
-                raise RuntimeError("director returned an empty response")
-            return json.loads(content)
+            last_error: ValueError | None = None
+            prompt = user
+            for attempt in range(3):
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=self.config.director.temperature,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                content = response.choices[0].message.content
+                if not content:
+                    last_error = ValueError("director returned an empty response")
+                else:
+                    try:
+                        return parse_json_object(content)
+                    except ValueError as exc:
+                        last_error = exc
+                prompt = (
+                    user
+                    + "\n\nYour previous response was not valid JSON. Return only one JSON object "
+                    "with no markdown fences, preamble, or explanation."
+                    + f"\nRetry {attempt + 1} of 2."
+                )
+            assert last_error is not None
+            raise last_error
 
         return await asyncio.to_thread(call)
 
@@ -66,11 +116,16 @@ class ResearchDirector:
         system = (
             "You are the Research Director for an autonomous ML lab. Propose diverse, testable, "
             "single-change experiments. Learn from results, avoid repeating failed ideas, and "
-            "respect runtime and metric guardrails. Return strict JSON with key 'ideas', an array "
-            "of objects with exactly: title, hypothesis, instructions, category."
+            "respect runtime and metric guardrails. Every idea must be standalone and implementable "
+            "using only the installed dependencies. Agents can only edit solution/, so never ask "
+            "them to add packages, change project configuration, install system software, or refer "
+            "to another parallel idea. Return strict JSON with key 'ideas', an array of objects "
+            "with exactly: title, hypothesis, instructions, category."
         )
         user = (
             f"Task: {self.config.description}\nGoal: {self.config.goal}\n"
+            f"Task contract:\n{self.task_contract}\n"
+            f"Installed project environment:\n{self.project_environment}\n"
             f"Primary metric: {self.config.metric.name} ({self.config.metric.direction})\n"
             f"Guardrails: {self.config.guardrails}\nRound: {round_number}\n"
             f"Need {count} ideas.\nSuggested families (not mandatory): {self.config.idea_hints}\n"

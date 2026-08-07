@@ -48,15 +48,19 @@ def run(
     """Start a new autonomous research run."""
     load_dotenv()
     cfg = load_config(config)
-    store = asyncio.run(
-        run_research(
-            cfg,
-            goal=goal,
-            guardrails=guardrail,
-            parallel=parallel,
-            max_experiments=max_experiments,
+    try:
+        store = asyncio.run(
+            run_research(
+                cfg,
+                goal=goal,
+                guardrails=guardrail,
+                parallel=parallel,
+                max_experiments=max_experiments,
+            )
         )
-    )
+    except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
+        console.print(f"[bold red]Research run failed:[/bold red] {exc}")
+        raise typer.Exit(1) from None
     console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
 
 
@@ -71,14 +75,18 @@ def resume(
     load_dotenv()
     cfg = load_config(config)
     store = _store_from(run_dir, config)
-    completed = asyncio.run(
-        run_research(
-            cfg,
-            parallel=parallel,
-            max_experiments=max_experiments,
-            resume_store=store,
+    try:
+        completed = asyncio.run(
+            run_research(
+                cfg,
+                parallel=parallel,
+                max_experiments=max_experiments,
+                resume_store=store,
+            )
         )
-    )
+    except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
+        console.print(f"[bold red]Research run failed:[/bold red] {exc}")
+        raise typer.Exit(1) from None
     console.print(f"Run complete: [bold]{completed.run_dir}[/bold]")
 
 
@@ -158,10 +166,44 @@ def report(
 @app.command()
 def status(
     run_dir: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    lines: Annotated[int, typer.Option(min=1, help="Recent activity lines to show")] = 12,
 ) -> None:
-    """Show run state and experiment counts."""
+    """Show current strategies, outcomes, and recent activity."""
     store = _store_from(run_dir)
-    console.print_json(json.dumps(store.load_state()))
+    state = store.load_state()
+    metric = state.get("primary_metric", "wmape")
+    console.print(
+        f"[bold]{state.get('task', 'Autoresearch')}[/bold] | "
+        f"status={state.get('status', 'unknown')} | round={state.get('round', 0)} | "
+        f"completed={state.get('completed', 0)}"
+    )
+    console.print(f"Goal: {state.get('goal', 'unknown')}")
+    incumbent = state.get("incumbent", {}).get(metric)
+    if incumbent is not None:
+        console.print(f"Current best: {metric}={incumbent:.6f}")
+
+    attempts = store.load_attempts()
+    table = Table(title="Research strategies")
+    for column in ("Agent", "Round", "Strategy", "Why", "Status", metric.upper()):
+        table.add_column(column)
+    for attempt in attempts[-20:]:
+        value = attempt.metrics.get(metric)
+        table.add_row(
+            attempt.id,
+            str(attempt.round),
+            attempt.idea.title,
+            attempt.idea.hypothesis,
+            attempt.status,
+            f"{value:.6f}" if value is not None else "-",
+        )
+    console.print(table)
+
+    activity = store.run_dir / "activity.log"
+    if activity.exists():
+        recent = activity.read_text().splitlines()[-lines:]
+        console.print(f"[bold]Recent activity ({activity})[/bold]")
+        for entry in recent:
+            console.print(entry, markup=False)
 
 
 @app.command()

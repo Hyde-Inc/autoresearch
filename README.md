@@ -64,6 +64,10 @@ uv run autoresearch run -c examples/demand_forecasting/task.yaml \
 
 The demo can try ideas based on ARIMA, XGBoost, Chronos, calibration, and ensembles.
 
+During a run, every agent has its own color and ID. The CLI shows each strategy, why the director
+picked it, meaningful code changes and local checks, when evaluation starts, and how the result
+compares with the current best model. The same timeline is saved to `activity.log`.
+
 ## View results
 
 ```bash
