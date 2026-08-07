@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .config import TaskConfig
 from .models import Idea
@@ -38,6 +40,24 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:36] or "experiment"
 
 
+def build_worker_prompt(workspace: Path, task_contract: str, experiment: str) -> str:
+    return (
+        f"You are an autonomous ML research engineer assigned to exactly this workspace: "
+        f"{workspace}.\n\n"
+        f"TASK CONTRACT\n{task_contract}\n\n"
+        f"ASSIGNED EXPERIMENT\n{experiment}\n\n"
+        "This is all the setup context you need. Start by inspecting solution/train.py, then "
+        "implement only the assigned hypothesis. Do not search for TASK.md, EXPERIMENT.md, or "
+        "other repository context. "
+        f"Read and write only inside {workspace}; never inspect the parent directory, sibling "
+        "worktrees, the source seed, or other experiments. Only modify files under solution/. "
+        "Do not modify pyproject.toml, install system packages, use subagents, or create todo lists. "
+        "Run focused local checks from this workspace using the provided training data. "
+        "The protected evaluator will run solution/train.py and compare forecasts.parquet. "
+        "Keep runtime within the stated budget. Do not ask questions or commit changes."
+    )
+
+
 async def ensure_seed_repo(seed: Path) -> None:
     if (seed / ".git").exists():
         return
@@ -60,6 +80,7 @@ async def run_worker(
     idea: Idea,
     attempt_id: str,
     base_ref: str,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> WorkerResult:
     branch = f"autoresearch/{attempt_id}-{_slug(idea.title)}"
     worktree = store.worktrees_dir / attempt_id
@@ -77,16 +98,17 @@ async def run_worker(
         f"## Instructions\n{idea.instructions}\n"
     )
     (worktree / "EXPERIMENT.md").write_text(experiment)
-    prompt = (
-        "You are an autonomous ML research engineer. Read TASK.md and EXPERIMENT.md. "
-        "Implement this experiment completely. You may only modify files under solution/. "
-        "Run local checks using training data, but do not ask questions. The protected evaluator "
-        "will run solution/train.py and compare forecasts.parquet. Keep runtime within the stated "
-        "budget. Do not commit changes."
-    )
+    workspace = worktree.resolve()
+    task_contract = (worktree / "TASK.md").read_text()
+    prompt = build_worker_prompt(workspace, task_contract, experiment)
     log_path = store.logs_dir / f"{attempt_id}.jsonl"
     result = await run_opencode(
-        worktree, prompt, config.agents.model, config.agents.timeout_s, log_path
+        worktree,
+        prompt,
+        config.agents.model,
+        config.agents.timeout_s,
+        log_path,
+        on_event=on_event,
     )
     (worktree / "EXPERIMENT.md").unlink(missing_ok=True)
     _, changed = await _run("git", "status", "--porcelain", cwd=worktree)
