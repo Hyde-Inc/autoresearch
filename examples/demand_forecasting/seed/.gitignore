@@ -1,4 +1,0 @@
-.venv/
-forecasts.parquet
-.autoresearch-*-request.parquet
-__pycache__/

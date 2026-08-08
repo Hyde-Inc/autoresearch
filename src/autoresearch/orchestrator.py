@@ -71,6 +71,8 @@ async def _execute_attempt(
         attempt.guardrail_failures = result.guardrail_failures
         attempt.error = result.error
         attempt.status = "passed" if result.passed else ("failed" if result.error else "rejected")
+        if result.validation_frame is not None:
+            store.save_validation_frame(attempt_id, result.validation_frame)
     store.save_attempt(attempt)
     return attempt, worker
 
@@ -114,6 +116,8 @@ async def run_research(
         baseline_eval = await validate_baseline(config)
         if baseline_eval.error:
             raise RuntimeError(f"baseline evaluation failed: {baseline_eval.error}")
+        if baseline_eval.validation_frame is not None:
+            store.save_validation_frame("baseline", baseline_eval.validation_frame)
         baseline = dict(baseline_eval.metrics)
         holdout_key = f"holdout_{config.metric.name}"
         baseline[holdout_key] = baseline_eval.holdout_metrics[config.metric.name]
@@ -155,7 +159,12 @@ async def run_research(
                     round_number=round_number,
                     attempts=store.load_attempts(),
                     notes=notes,
+                    store=store,
                 )
+                if director.last_analysis:
+                    console.print("[bold]Director analyzed the data and errors[/bold]")
+                    for line in director.last_analysis:
+                        console.print(f"  {line}")
                 if director.last_skill_selection.selected:
                     console.print("[bold]Director consulted skills[/bold]")
                     for selected in director.last_skill_selection.selected:

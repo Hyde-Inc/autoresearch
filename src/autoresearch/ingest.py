@@ -21,13 +21,13 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from .config import DEFAULT_MODEL
+
 REQUIRED_COLUMNS = ["date", "sku_name", "sales", "selling_price"]
 ID_COLUMN = "sku_name"
 DATE_COLUMN = "date"
 TARGET_COLUMN = "sales"
 NUMERIC_COLUMNS = ["sales", "selling_price"]
-
-DEFAULT_MODEL = "openrouter/moonshotai/kimi-k3"
 
 
 @dataclass
@@ -362,6 +362,10 @@ def ingest_csv(
     )
     _write(task_dir / "seed" / "pyproject.toml", _SEED_PYPROJECT.format(name=slug))
     _write(task_dir / "seed" / "opencode.json", _OPENCODE_JSON)
+    _write(
+        task_dir / "seed" / ".gitignore",
+        ".venv/\nforecasts.parquet\n.autoresearch-*-request.parquet\n__pycache__/\n",
+    )
 
     config = {
         "name": slug,

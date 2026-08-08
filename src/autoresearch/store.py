@@ -4,6 +4,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pandas as pd
+
 from .models import Attempt
 
 
@@ -51,6 +53,21 @@ class RunStore:
             if item.status == "passed" and metric in item.metrics
         ]
         return sorted(scored, key=lambda item: item.metrics[metric], reverse=direction == "max")
+
+    def save_validation_frame(self, attempt_id: str, frame: pd.DataFrame) -> Path:
+        target = self.attempts_dir / f"{attempt_id}-validation.parquet"
+        frame.to_parquet(target, index=False)
+        return target
+
+    def load_validation_frame(self, attempt_id: str) -> pd.DataFrame | None:
+        target = self.attempts_dir / f"{attempt_id}-validation.parquet"
+        return pd.read_parquet(target) if target.exists() else None
+
+    def list_validation_frames(self) -> list[str]:
+        return sorted(
+            path.name.removesuffix("-validation.parquet")
+            for path in self.attempts_dir.glob("*-validation.parquet")
+        )
 
     def append_note(self, heading: str, body: str) -> None:
         with self.notes_file.open("a") as handle:

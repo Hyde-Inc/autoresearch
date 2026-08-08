@@ -12,7 +12,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .chat import input_box
-from .config import load_config
+from .config import load_config, load_project_config
 from .director import openrouter_client
 from .ingest import ingest_csv, preview_csv
 from .interview import SetupSession, print_spec
@@ -161,6 +161,12 @@ def list_skills(
 
 @app.command()
 def start(
+    repo: Annotated[
+        Path | None,
+        typer.Argument(
+            exists=True, file_okay=False, help="Project repo to research (default: cwd)"
+        ),
+    ] = None,
     config: Annotated[
         Path | None, typer.Option("--config", "-c", exists=True, dir_okay=False)
     ] = None,
@@ -172,16 +178,10 @@ def start(
     parallel: Annotated[int | None, typer.Option(min=1)] = None,
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
-    """Chat with the Research Director to design the run, then start the agents."""
+    """Point the Research Director at a project, design the run in chat, then start it."""
     load_dotenv()
     if config and csv:
         raise typer.BadParameter("pass either --config or --csv, not both")
-    if not config and not csv:
-        source = Path(typer.prompt("Path to task.yaml or sales CSV")).expanduser()
-        if source.suffix.lower() == ".csv":
-            csv = source
-        else:
-            config = source
     if csv:
         preview = preview_csv(csv)
         if not preview.ok:
@@ -194,23 +194,28 @@ def start(
         task_name = name or typer.prompt("Task name")
         result = ingest_csv(csv, name=task_name, tasks_root=tasks_root)
         config = result.config_path
-    if config is None or not config.exists():
-        raise typer.BadParameter(f"task config not found: {config}")
 
-    cfg = load_config(config)
+    if config:
+        experiments = parallel or load_config(config).agents.count
+        session = SetupSession(
+            openrouter_client(), console, experiments=experiments, config_path=config
+        )
+    else:
+        repo = (repo or Path(".")).resolve()
+        overlay = load_project_config(repo)
+        experiments = parallel or int(overlay.get("agents", {}).get("count", 3))
+        session = SetupSession(
+            openrouter_client(), console, experiments=experiments, repo=repo
+        )
+        console.print(f"Project: [bold]{repo}[/bold]")
+
     console.print(
         Panel(
-            "Design the goal, metric, baseline, and first research plan together.\n"
-            "Just talk; the Research Director saves decisions and starts the run "
-            "when you approve the plan.",
+            "The Research Director explores your project itself, then designs the goal, "
+            "metric, baseline, and first research plan with you.\n"
+            "Just talk; it saves decisions and starts the run when you approve the plan.",
             title="Research setup",
         )
-    )
-    session = SetupSession(
-        config,
-        openrouter_client(),
-        console,
-        experiments=parallel or cfg.agents.count,
     )
     console.print("\nWhat should this research improve?")
     try:
@@ -222,10 +227,11 @@ def start(
         console.print(f"[bold red]Setup failed:[/bold red] {exc}")
         raise typer.Exit(1) from None
 
+    assert session.config_path is not None
     try:
         store = asyncio.run(
             run_research(
-                load_config(config),
+                load_config(session.config_path),
                 parallel=parallel,
                 max_experiments=max_experiments,
                 initial_ideas=ideas,

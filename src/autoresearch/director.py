@@ -7,6 +7,7 @@ import re
 
 from openai import OpenAI
 
+from . import eda, evals
 from .config import TaskConfig
 from .metrics import load_task_spec
 from .models import Attempt, Idea
@@ -17,6 +18,7 @@ from .skills import (
     selected_skill_context,
     selection_json,
 )
+from .store import RunStore
 
 
 def openrouter_client() -> OpenAI:
@@ -55,6 +57,47 @@ def parse_json_object(content: str) -> dict:
     raise ValueError(f"director did not return a JSON object: {text[:200]!r}")
 
 
+def analysis_tool_schemas() -> list[dict]:
+    def schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {"type": "object", "properties": properties, "required": required},
+            },
+        }
+
+    return [
+        schema(
+            "explore_training_data",
+            "Run exploratory analysis on the training data before choosing model families.",
+            {
+                "analysis": {
+                    "type": "string",
+                    "enum": ["profile", "seasonality", "intermittency", "drivers"],
+                }
+            },
+            ["analysis"],
+        ),
+        schema(
+            "analyze_errors",
+            "Study a scored attempt's validation errors: overall metrics, weekday and "
+            "horizon breakdowns, and over/under-forecast counts. Use attempt_id 'baseline' "
+            "for the incumbent baseline.",
+            {"attempt_id": {"type": "string"}},
+            ["attempt_id"],
+        ),
+        schema(
+            "worst_items",
+            "List the items contributing the most validation error for a scored attempt, "
+            "with their bias direction.",
+            {"attempt_id": {"type": "string"}, "limit": {"type": "integer"}},
+            ["attempt_id"],
+        ),
+    ]
+
+
 class ResearchDirector:
     def __init__(self, config: TaskConfig):
         self.config = config
@@ -70,6 +113,7 @@ class ResearchDirector:
         )
         self.skills = load_skills(config)
         self.last_skill_selection = SkillSelection()
+        self.last_analysis: list[str] = []
 
     async def _json_completion(self, system: str, user: str) -> dict:
         def call() -> dict:
@@ -102,6 +146,124 @@ class ResearchDirector:
 
         return await asyncio.to_thread(call)
 
+    def _run_analysis_tool(self, store: RunStore, name: str, arguments: dict) -> dict:
+        data = self.config.data
+        try:
+            if name == "explore_training_data":
+                frame = eda.load_table(self.config.resolve(data.train))
+                analysis = arguments.get("analysis", "profile")
+                if analysis == "profile":
+                    return eda.profile(frame)
+                if analysis == "seasonality":
+                    return eda.seasonality(frame, data.date_column, data.target_column)
+                if analysis == "intermittency":
+                    return eda.intermittency(
+                        frame, data.id_column, data.date_column, data.target_column
+                    )
+                if analysis == "drivers":
+                    return eda.drivers(
+                        frame, data.target_column, exclude=[data.id_column, data.date_column]
+                    )
+                return {"error": f"unknown analysis: {analysis}"}
+            frame = store.load_validation_frame(str(arguments.get("attempt_id", "")))
+            if frame is None:
+                return {
+                    "error": "no stored validation forecasts for that attempt",
+                    "available": store.list_validation_frames(),
+                }
+            if name == "analyze_errors":
+                return evals.error_summary(
+                    frame, data.id_column, data.date_column, data.target_column
+                )
+            if name == "worst_items":
+                return evals.worst_items(
+                    frame,
+                    data.id_column,
+                    data.date_column,
+                    data.target_column,
+                    limit=int(arguments.get("limit", 10)),
+                )
+            return {"error": f"unknown tool: {name}"}
+        except Exception as exc:  # noqa: BLE001 - surfaced to the director
+            return {"error": str(exc)}
+
+    async def _json_with_analysis(
+        self, system: str, user: str, store: RunStore, max_tool_rounds: int = 4
+    ) -> dict:
+        """Let the director inspect data and errors with tools, then demand JSON."""
+        tools = analysis_tool_schemas()
+
+        def call() -> dict:
+            messages: list[dict] = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+            for _ in range(max_tool_rounds):
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=self.config.director.temperature,
+                    messages=messages,
+                    tools=tools,
+                )
+                message = response.choices[0].message
+                if not message.tool_calls:
+                    if message.content:
+                        try:
+                            return parse_json_object(message.content)
+                        except ValueError:
+                            pass
+                    break
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": message.content,
+                        "tool_calls": [
+                            {
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.function.name,
+                                    "arguments": call.function.arguments,
+                                },
+                            }
+                            for call in message.tool_calls
+                        ],
+                    }
+                )
+                for tool_call in message.tool_calls:
+                    try:
+                        arguments = json.loads(tool_call.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    result = self._run_analysis_tool(store, tool_call.function.name, arguments)
+                    rendered = ", ".join(f"{k}={v}" for k, v in arguments.items())
+                    self.last_analysis.append(f"{tool_call.function.name}({rendered})")
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": json.dumps(result),
+                        }
+                    )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Return the final answer now as one valid JSON object with no "
+                        "markdown or explanation."
+                    ),
+                }
+            )
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=self.config.director.temperature,
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+            return parse_json_object(response.choices[0].message.content or "")
+
+        return await asyncio.to_thread(call)
+
     async def propose(
         self,
         *,
@@ -109,7 +271,9 @@ class ResearchDirector:
         round_number: int,
         attempts: list[Attempt],
         notes: str,
+        store: RunStore | None = None,
     ) -> list[Idea]:
+        self.last_analysis = []
         history = [
             {
                 "title": item.idea.title,
@@ -144,6 +308,11 @@ class ResearchDirector:
             "array of objects with exactly: title, hypothesis, instructions, category, skills_used. "
             "skills_used must contain only selected skill names."
         )
+        if store is not None:
+            system += (
+                " Before answering you may call the analysis tools to study the training data "
+                "and where scored attempts made their errors; ground your ideas in what you find."
+            )
         spec = load_task_spec(self.config)
         metric_context = f" Definition: {spec.understanding}" if spec else ""
         user = (
@@ -159,7 +328,15 @@ class ResearchDirector:
             f"Skill selection: {selection_json(self.last_skill_selection)}\n\n"
             f"Selected skill guidance:\n{skill_context or 'No skill selected.'}"
         )
-        payload = await self._json_completion(system, user)
+        if store is not None:
+            frames = store.list_validation_frames()
+            user += (
+                f"\n\nAttempts with stored validation forecasts for analyze_errors/"
+                f"worst_items: {frames or 'none yet'}"
+            )
+            payload = await self._json_with_analysis(system, user, store)
+        else:
+            payload = await self._json_completion(system, user)
         ideas = [Idea.model_validate(item) for item in payload.get("ideas", [])]
         for idea in ideas:
             idea.skills_used = [name for name in idea.skills_used if name in selected_names]

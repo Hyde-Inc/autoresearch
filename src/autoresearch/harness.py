@@ -22,6 +22,8 @@ class Evaluation:
     guardrail_failures: list[str] = field(default_factory=list)
     error: str | None = None
     duration_s: float = 0
+    validation_frame: pd.DataFrame | None = None
+    """Merged validation actuals and forecasts, kept for director error analysis."""
 
 
 def forecasting_metrics(actual: np.ndarray, forecast: np.ndarray) -> dict[str, float]:
@@ -38,7 +40,7 @@ def forecasting_metrics(actual: np.ndarray, forecast: np.ndarray) -> dict[str, f
 
 def _validate_forecasts(
     forecast_path: Path, actuals: pd.DataFrame, config: TaskConfig
-) -> dict[str, float]:
+) -> tuple[dict[str, float], pd.DataFrame]:
     data = config.data
     if not forecast_path.exists():
         raise ValueError("solution did not create forecasts.parquet")
@@ -71,7 +73,7 @@ def _validate_forecasts(
             metrics[spec.name] = compile_metric(spec.code)(frame)
         except Exception as exc:
             raise ValueError(f"custom metric '{spec.name}' failed: {exc}") from exc
-    return metrics
+    return metrics, merged
 
 
 async def _evaluate_split(
@@ -79,7 +81,7 @@ async def _evaluate_split(
     actuals_path: Path,
     config: TaskConfig,
     label: str,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, pd.DataFrame]:
     actuals = pd.read_parquet(actuals_path)
     keys = [config.data.id_column, config.data.date_column]
     request = worktree / f".autoresearch-{label}-request.parquet"
@@ -122,7 +124,8 @@ async def _evaluate_split(
         raise ValueError(
             f"solution exited with {process.returncode}: {stdout.decode(errors='replace')[-2000:]}"
         )
-    return _validate_forecasts(output, actuals, config), elapsed
+    metrics, merged = _validate_forecasts(output, actuals, config)
+    return metrics, elapsed, merged
 
 
 async def evaluate(
@@ -133,10 +136,10 @@ async def evaluate(
 ) -> Evaluation:
     started = time.monotonic()
     try:
-        metrics, val_time = await _evaluate_split(
+        metrics, val_time, validation_frame = await _evaluate_split(
             worktree, config.resolve(config.data.validation_actuals), config, "validation"
         )
-        holdout, holdout_time = await _evaluate_split(
+        holdout, holdout_time, _ = await _evaluate_split(
             worktree, config.resolve(config.data.holdout_actuals), config, "holdout"
         )
         metrics["runtime_s"] = val_time
@@ -166,6 +169,7 @@ async def evaluate(
             holdout_metrics=holdout,
             guardrail_failures=failures,
             duration_s=time.monotonic() - started,
+            validation_frame=validation_frame,
         )
     except Exception as exc:  # noqa: BLE001 - evaluator failures become scored failures
         return Evaluation(False, error=str(exc), duration_s=time.monotonic() - started)

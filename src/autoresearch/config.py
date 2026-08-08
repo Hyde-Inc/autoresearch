@@ -6,6 +6,12 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+DEFAULT_MODEL = "openrouter/moonshotai/kimi-k3"
+
+PROJECT_CONFIG_NAME = "autoresearch.yaml"
+"""Optional repo-level file holding only run hyperparameters; everything else is
+discovered by the Research Director during setup."""
+
 
 class MetricConfig(BaseModel):
     name: str = "wmape"
@@ -14,7 +20,7 @@ class MetricConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    model: str
+    model: str = DEFAULT_MODEL
     temperature: float = 0.2
 
 
@@ -46,14 +52,14 @@ class WorkspaceConfig(BaseModel):
 
 
 class TaskConfig(BaseModel):
-    name: str
-    description: str
-    goal: str
+    name: str = "autoresearch-task"
+    description: str = ""
+    goal: str = ""
     metric: MetricConfig = MetricConfig()
     secondary_metrics: list[str] = Field(default_factory=lambda: ["mape", "rmse", "bias_pct"])
     guardrails: list[str] = Field(default_factory=list)
-    director: ModelConfig
-    agents: AgentConfig
+    director: ModelConfig = ModelConfig()
+    agents: AgentConfig = AgentConfig()
     budget: BudgetConfig = BudgetConfig()
     data: DataConfig = DataConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
@@ -82,7 +88,7 @@ def load_config(path: Path) -> TaskConfig:
     path = path.expanduser().resolve()
     with path.open() as handle:
         raw = yaml.safe_load(handle)
-    config = TaskConfig.model_validate(raw)
+    config = TaskConfig.model_validate(raw or {})
     config.config_path = path
     if config.metric.definition:
         from .metrics import load_spec
@@ -91,3 +97,17 @@ def load_config(path: Path) -> TaskConfig:
         config.metric.name = spec.name
         config.metric.direction = spec.direction
     return config
+
+
+def load_project_config(repo: Path) -> dict:
+    """Read run hyperparameters from a project's optional autoresearch.yaml.
+
+    Only the tuning knobs (director, agents, budget, metric, guardrails, skills)
+    are honored; task structure is discovered during setup, not configured.
+    """
+    path = repo / PROJECT_CONFIG_NAME
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text()) or {}
+    allowed = {"director", "agents", "budget", "metric", "guardrails", "skills", "name"}
+    return {key: value for key, value in raw.items() if key in allowed}
