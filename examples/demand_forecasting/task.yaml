@@ -14,10 +14,10 @@ guardrails:
   - "bias_pct within -8..8"
   - "runtime_s<=600"
 director:
-  model: openrouter/anthropic/claude-sonnet-4.6
+  model: openrouter/moonshotai/kimi-k3
   temperature: 0.35
 agents:
-  model: openrouter/anthropic/claude-sonnet-4.6
+  model: openrouter/moonshotai/kimi-k3
   count: 3
   timeout_s: 900
 budget:

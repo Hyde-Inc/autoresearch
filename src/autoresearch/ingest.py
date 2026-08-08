@@ -27,7 +27,7 @@ DATE_COLUMN = "date"
 TARGET_COLUMN = "sales"
 NUMERIC_COLUMNS = ["sales", "selling_price"]
 
-DEFAULT_MODEL = "openrouter/anthropic/claude-sonnet-4.6"
+DEFAULT_MODEL = "openrouter/moonshotai/kimi-k3"
 
 
 @dataclass
