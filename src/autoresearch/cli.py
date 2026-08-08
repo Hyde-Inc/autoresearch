@@ -11,17 +11,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from .chat import input_box
 from .config import load_config
-from .director import ResearchDirector
+from .director import openrouter_client
 from .ingest import ingest_csv, preview_csv
-from .interview import (
-    ResearchBrief,
-    ResearchInterview,
-    append_context,
-    apply_brief,
-    replace_baseline,
-)
-from .metrics import MetricInterpreter, MetricSpec, MetricValidation, adopt_spec, eval_columns
+from .interview import SetupSession, print_spec
+from .metrics import MetricInterpreter, adopt_spec, eval_columns
 from .orchestrator import run_research, validate_baseline
 from .report import build_report
 from .skills import load_skills
@@ -126,26 +121,6 @@ def ingest(
     console.print(f"[green]Created task[/green] {result.config_path}")
 
 
-def _print_spec(spec: MetricSpec, validation: MetricValidation) -> None:
-    console.print(f"\n[bold]Metric:[/bold] {spec.name} ({spec.direction}imize)")
-    console.print(f"[bold]Understanding:[/bold] {spec.understanding}")
-    table = Table(title="Hand-worked example")
-    columns = list(spec.example.rows[0])
-    for column in columns:
-        table.add_column(column)
-    for row in spec.example.rows:
-        table.add_row(*(str(row.get(column, "")) for column in columns))
-    console.print(table)
-    for step in spec.example.steps:
-        console.print(f"  - {step}")
-    console.print(f"[bold]Hand-computed value:[/bold] {spec.example.value}")
-    for check in validation.checks:
-        color = "green" if check.passed else "red"
-        console.print(f"[{color}]{check.name}[/{color}]: {check.detail}")
-    for warning in validation.warnings:
-        console.print(f"[yellow]! {warning}[/yellow]")
-
-
 @app.command()
 def metric(
     config: ConfigOption,
@@ -159,7 +134,7 @@ def metric(
     cfg = load_config(config)
     interpreter = MetricInterpreter(cfg.director.model, cfg.director.temperature)
     spec, validation = asyncio.run(interpreter.interpret(description, eval_columns(cfg)))
-    _print_spec(spec, validation)
+    print_spec(console, spec, validation)
     if not yes and not typer.confirm("Use this metric for every experiment?"):
         console.print("Metric discarded.")
         return
@@ -184,32 +159,6 @@ def list_skills(
     console.print(table)
 
 
-def _print_brief(brief: ResearchBrief) -> None:
-    lines = [
-        f"[bold]Goal[/bold]\n{brief.goal}",
-        f"[bold]Business context[/bold]\n{brief.context}",
-        f"[bold]Metric[/bold]\n{brief.metric_name}"
-        + (f": {brief.metric_description}" if brief.metric_description else ""),
-        "[bold]Guardrails[/bold]\n" + "\n".join(f"- {item}" for item in brief.guardrails),
-        "[bold]Research directions[/bold]\n"
-        + "\n".join(f"- {item}" for item in brief.idea_hints),
-    ]
-    console.print(Panel("\n\n".join(lines), title="Research brief"))
-
-
-def _print_plan(director: ResearchDirector, ideas: list) -> None:
-    if director.last_skill_selection.selected:
-        console.print("\n[bold]Director consulted skills[/bold]")
-        for selected in director.last_skill_selection.selected:
-            console.print(f"  [cyan]{selected.name}[/cyan]: {selected.reason}")
-    table = Table(title="Proposed round 1")
-    for column in ("Experiment", "Hypothesis", "Skills"):
-        table.add_column(column)
-    for idea in ideas:
-        table.add_row(idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-")
-    console.print(table)
-
-
 @app.command()
 def start(
     config: Annotated[
@@ -223,9 +172,8 @@ def start(
     parallel: Annotated[int | None, typer.Option(min=1)] = None,
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
-    """Design the research assignment together, then start the agents."""
+    """Chat with the Research Director to design the run, then start the agents."""
     load_dotenv()
-    console.print(Panel("Define the goal, metric, baseline, and first research plan together."))
     if config and csv:
         raise typer.BadParameter("pass either --config or --csv, not both")
     if not config and not csv:
@@ -240,10 +188,9 @@ def start(
             raise typer.BadParameter("; ".join(preview.errors))
         console.print(
             f"Found {preview.rows} rows, {preview.skus} items, "
-            f"{preview.distinct_dates} dates."
+            f"{preview.distinct_dates} dates. Splitting into train, validation, and "
+            "hidden holdout."
         )
-        if not typer.confirm("Create chronological train, validation, and hidden holdout splits?"):
-            raise typer.Abort()
         task_name = name or typer.prompt("Task name")
         result = ingest_csv(csv, name=task_name, tasks_root=tasks_root)
         config = result.config_path
@@ -251,98 +198,42 @@ def start(
         raise typer.BadParameter(f"task config not found: {config}")
 
     cfg = load_config(config)
-    director = ResearchDirector(cfg)
-    interview = ResearchInterview(cfg, director._json_completion)
-    conversation = [
-        {
-            "role": "user",
-            "content": typer.prompt("What should this research improve?"),
-        }
-    ]
-    brief: ResearchBrief | None = None
-    while brief is None:
-        turn = asyncio.run(interview.next_turn(conversation))
-        console.print(f"\n[bold cyan]Research Director[/bold cyan]\n{turn.message}")
-        if turn.done:
-            brief = turn.brief
-            break
-        answer = typer.prompt("You (type /done to finish)")
-        conversation.append({"role": "assistant", "content": turn.message})
-        conversation.append({"role": "user", "content": answer})
-        if answer.strip().lower() == "/done":
-            turn = asyncio.run(interview.next_turn(conversation, force_finish=True))
-            brief = turn.brief
-    assert brief is not None
-    while True:
-        _print_brief(brief)
-        if typer.confirm("Use this research brief?"):
-            break
-        revision = typer.prompt("What should change?")
-        conversation.append({"role": "user", "content": revision})
-        turn = asyncio.run(interview.next_turn(conversation, force_finish=True))
-        if turn.brief is None:
-            raise RuntimeError("Research Director did not return a revised brief")
-        brief = turn.brief
-    apply_brief(cfg, brief)
-    cfg = load_config(config)
-
-    if brief.metric_description:
-        console.print("\n[bold]Verifying the custom metric[/bold]")
-        interpreter = MetricInterpreter(cfg.director.model, cfg.director.temperature)
-        spec, validation = asyncio.run(
-            interpreter.interpret(brief.metric_description, eval_columns(cfg))
+    console.print(
+        Panel(
+            "Design the goal, metric, baseline, and first research plan together.\n"
+            "Just talk; the Research Director saves decisions and starts the run "
+            "when you approve the plan.",
+            title="Research setup",
         )
-        _print_spec(spec, validation)
-        if typer.confirm("Use this verified metric?"):
-            adopt_spec(cfg, spec)
-            cfg = load_config(config)
-
-    baseline = cfg.resolve(cfg.workspace.seed) / "solution" / "train.py"
-    console.print(f"\n[bold]Baseline model[/bold]\n{baseline}")
-    if typer.confirm("Replace the seeded baseline with your own train.py?", default=False):
-        replacement = Path(typer.prompt("Path to train.py"))
-        baseline = replace_baseline(cfg, replacement)
-        console.print(f"Using {baseline}")
-    production = typer.prompt(
-        "Current production performance (optional, press Enter to skip)",
-        default="",
-        show_default=False,
     )
-    if production.strip():
-        append_context(cfg, f"Current production baseline reported by the team: {production}")
-        cfg = load_config(config)
-    console.print("Running the protected baseline evaluation...")
-    baseline_result = asyncio.run(validate_baseline(cfg))
-    if baseline_result.error:
-        console.print(f"[red]Baseline failed:[/red] {baseline_result.error}")
-        raise typer.Exit(1)
-    console.print(f"Validation: {json.dumps(baseline_result.metrics)}")
-    console.print(f"Hidden holdout: {json.dumps(baseline_result.holdout_metrics)}")
+    session = SetupSession(
+        config,
+        openrouter_client(),
+        console,
+        experiments=parallel or cfg.agents.count,
+    )
+    console.print("\nWhat should this research improve?")
+    try:
+        ideas = session.run(input_box(console))
+    except KeyboardInterrupt:
+        console.print("\nSetup cancelled. Nothing is running.")
+        raise typer.Exit(130) from None
+    except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
+        console.print(f"[bold red]Setup failed:[/bold red] {exc}")
+        raise typer.Exit(1) from None
 
-    director = ResearchDirector(cfg)
-    feedback = ""
-    count = parallel or cfg.agents.count
-    while True:
-        ideas = asyncio.run(
-            director.propose(
-                count=count,
-                round_number=1,
-                attempts=[],
-                notes=feedback,
+    try:
+        store = asyncio.run(
+            run_research(
+                load_config(config),
+                parallel=parallel,
+                max_experiments=max_experiments,
+                initial_ideas=ideas,
             )
         )
-        _print_plan(director, ideas)
-        if typer.confirm("Start research with this plan?"):
-            break
-        feedback = typer.prompt("What should the Director change?")
-    store = asyncio.run(
-        run_research(
-            cfg,
-            parallel=parallel,
-            max_experiments=max_experiments,
-            initial_ideas=ideas,
-        )
-    )
+    except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
+        console.print(f"[bold red]Research run failed:[/bold red] {exc}")
+        raise typer.Exit(1) from None
     console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
 
 

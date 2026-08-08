@@ -51,8 +51,11 @@ The easiest option is the interactive setup:
 uv run autoresearch start -c examples/demand_forecasting/task.yaml
 ```
 
-The Research Director asks questions until the goal is clear. You confirm the metric, baseline
-performance, guardrails, and first research plan before any agents start.
+This opens a streaming chat with the Research Director, similar to a coding agent. You see its
+thinking tokens live, type replies in a box, and there are no yes/no menus. It settles the goal,
+metric, and guardrails with you, uses the seeded baseline unless you give it your own script,
+runs the protected baseline evaluation, and starts the agents once you approve the round-1 plan.
+Bad input (like a wrong file path) comes back as a normal chat reply, not a crash.
 
 Check the baseline:
 

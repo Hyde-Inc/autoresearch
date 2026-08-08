@@ -1,0 +1,56 @@
+from types import SimpleNamespace
+
+from autoresearch.chat import accumulate_stream
+
+
+class Recorder:
+    def __init__(self) -> None:
+        self.reasoning: list[str] = []
+        self.content: list[str] = []
+
+    def on_reasoning(self, token: str) -> None:
+        self.reasoning.append(token)
+
+    def on_content(self, token: str) -> None:
+        self.content.append(token)
+
+
+def _chunk(**delta_fields) -> SimpleNamespace:
+    fields = {"content": None, "reasoning": None, "tool_calls": None, **delta_fields}
+    return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(**fields))])
+
+
+def _tool_delta(index: int, call_id: str | None, name: str | None, arguments: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def test_accumulate_stream_collects_reasoning_content_and_tool_calls() -> None:
+    listener = Recorder()
+    chunks = [
+        _chunk(reasoning="thinking about "),
+        _chunk(reasoning="the goal"),
+        _chunk(content="Here is "),
+        _chunk(content="the plan."),
+        _chunk(tool_calls=[_tool_delta(0, "call_1", "start_research", '{"ideas": ')]),
+        _chunk(tool_calls=[_tool_delta(0, None, None, "[]}")]),
+    ]
+    message = accumulate_stream(chunks, listener)
+    assert "".join(listener.reasoning) == "thinking about the goal"
+    assert message["content"] == "Here is the plan."
+    assert message["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "start_research", "arguments": '{"ideas": []}'},
+        }
+    ]
+
+
+def test_accumulate_stream_without_tools_or_content() -> None:
+    listener = Recorder()
+    message = accumulate_stream([_chunk(reasoning="hmm")], listener)
+    assert message == {"role": "assistant", "content": None}

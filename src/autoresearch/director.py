@@ -19,6 +19,20 @@ from .skills import (
 )
 
 
+def openrouter_client() -> OpenAI:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is required")
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        default_headers={
+            "HTTP-Referer": "https://github.com/Hyde-Inc/autoresearch",
+            "X-Title": "Parallel Autoresearch",
+        },
+    )
+
+
 def parse_json_object(content: str) -> dict:
     text = content.strip()
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
@@ -43,18 +57,8 @@ def parse_json_object(content: str) -> dict:
 
 class ResearchDirector:
     def __init__(self, config: TaskConfig):
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is required")
         self.config = config
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1",
-            default_headers={
-                "HTTP-Referer": "https://github.com/Hyde-Inc/autoresearch",
-                "X-Title": "Parallel Autoresearch",
-            },
-        )
+        self.client = openrouter_client()
         model = config.director.model
         self.model = model.removeprefix("openrouter/")
         seed = config.resolve(config.workspace.seed)
