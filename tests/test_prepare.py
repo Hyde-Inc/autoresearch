@@ -3,9 +3,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-import yaml
 
-from autoresearch.config import DEFAULT_MODEL, TaskConfig, load_config, load_project_config
+from autoresearch.config import DEFAULT_MODEL, TaskConfig, load_config
 from autoresearch.discover import read_repo_file, repo_inventory
 from autoresearch.prepare import prepare_workspace, write_baseline
 
@@ -35,23 +34,6 @@ def test_task_config_is_fully_optional() -> None:
     assert config.budget.rounds == 4
 
 
-def test_load_project_config_keeps_only_hyperparameters(tmp_path: Path) -> None:
-    repo = tmp_path
-    (repo / "autoresearch.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "budget": {"rounds": 2},
-                "guardrails": ["runtime_s<=120"],
-                "data": {"train": "should-be-ignored.parquet"},
-                "goal": "should be ignored too",
-            }
-        )
-    )
-    overlay = load_project_config(repo)
-    assert overlay == {"budget": {"rounds": 2}, "guardrails": ["runtime_s<=120"]}
-    assert load_project_config(tmp_path / "missing") == {}
-
-
 def test_repo_inventory_finds_data_code_and_docs(tmp_path: Path) -> None:
     inventory = repo_inventory(_repo(tmp_path))
     assert [item["path"] for item in inventory["data_files"]] == ["data/sales.parquet"]
@@ -68,7 +50,6 @@ def test_read_repo_file_blocks_escapes(tmp_path: Path) -> None:
 
 def test_prepare_workspace_builds_protected_task(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
-    (repo / "autoresearch.yaml").write_text(yaml.safe_dump({"budget": {"rounds": 2}}))
     prepared = prepare_workspace(
         repo,
         train_data="data/sales.parquet",
@@ -77,6 +58,7 @@ def test_prepare_workspace_builds_protected_task(tmp_path: Path) -> None:
         target_column="units_sold",
         validation_days=5,
         holdout_days=5,
+        overrides={"budget": {"rounds": 2}},
     )
     task_dir = repo / ".autoresearch" / "task"
     assert prepared.task_dir == task_dir

@@ -8,6 +8,7 @@ from rich.console import Console
 
 from autoresearch.config import load_config
 from autoresearch.interview import ResearchBrief, SetupSession, apply_brief, data_profile
+from autoresearch.slash import SessionSettings
 
 
 def _task(tmp_path: Path) -> Path:
@@ -58,7 +59,9 @@ def _console() -> Console:
 
 
 def _session(tmp_path: Path) -> SetupSession:
-    return SetupSession(object(), _console(), 2, config_path=_task(tmp_path))
+    return SetupSession(
+        object(), _console(), settings=SessionSettings(n_agents=2), config_path=_task(tmp_path)
+    )
 
 
 def test_data_profile_and_apply_brief(tmp_path: Path) -> None:
@@ -142,7 +145,7 @@ def test_unknown_tool_and_missing_pending_metric(tmp_path: Path) -> None:
 
 
 def test_repo_session_explores_project_itself(tmp_path: Path) -> None:
-    session = SetupSession(object(), _console(), 2, repo=_repo(tmp_path))
+    session = SetupSession(object(), _console(), repo=_repo(tmp_path))
     prompt = session.system_prompt()
     assert "data/sales.parquet" in prompt
     assert "models/baseline.py" in prompt
@@ -165,8 +168,21 @@ def test_repo_session_explores_project_itself(tmp_path: Path) -> None:
     assert seasonality["daily_total_autocorrelation"]["lag_7"] > 0.9
 
 
+def test_slash_commands_update_settings_and_prepend_notes(tmp_path: Path, monkeypatch) -> None:
+    session = SetupSession(object(), _console(), repo=_repo(tmp_path))
+    inputs = iter(["/goal reduce wmape", "/baseline models/baseline.py", "/n_agents 2", "go"])
+    monkeypatch.setattr("autoresearch.interview.input_box", lambda console: next(inputs))
+    message = session.next_user_message()
+    assert session.settings.goal == "reduce wmape"
+    assert session.settings.baseline_path == "models/baseline.py"
+    assert session.settings.n_agents == 2
+    assert message.startswith("[settings updated]")
+    assert "baseline model pinned to models/baseline.py" in message
+    assert message.endswith("go")
+
+
 def test_repo_session_requires_workspace_before_brief(tmp_path: Path) -> None:
-    session = SetupSession(object(), _console(), 1, repo=_repo(tmp_path))
+    session = SetupSession(object(), _console(), repo=_repo(tmp_path))
     result = session.execute(
         "finalize_brief",
         {"goal": "g", "context": "c", "guardrails": [], "idea_hints": [], "metric_name": "wmape"},
@@ -175,7 +191,9 @@ def test_repo_session_requires_workspace_before_brief(tmp_path: Path) -> None:
 
 
 def test_repo_session_prepares_workspace_and_writes_baseline(tmp_path: Path) -> None:
-    session = SetupSession(object(), _console(), 1, repo=_repo(tmp_path))
+    settings = SessionSettings(n_agents=2, rounds=3, timeout_s=300)
+    settings.guardrails.append("bias_pct within -8..8")
+    session = SetupSession(object(), _console(), settings=settings, repo=_repo(tmp_path))
     prepared = session.execute(
         "prepare_workspace",
         {
@@ -190,6 +208,11 @@ def test_repo_session_prepares_workspace_and_writes_baseline(tmp_path: Path) -> 
     assert prepared["ok"] is True
     assert session.config is not None
     assert session.config.data.id_column == "sku_id"
+    # Slash settings flow into the generated task config.
+    assert session.config.agents.count == 2
+    assert session.config.agents.timeout_s == 300
+    assert session.config.budget.rounds == 3
+    assert "bias_pct within -8..8" in session.config.guardrails
 
     bad = session.execute("write_baseline", {"code": "def broken(:\n"})
     assert "syntax error" in bad["error"]

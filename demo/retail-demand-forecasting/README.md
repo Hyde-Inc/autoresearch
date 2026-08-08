@@ -26,15 +26,17 @@ uv run python scripts/make_dataset.py
 Roughly a quarter of the SKUs are slow movers with intermittent demand (many
 zero-sale days); the rest have strong weekly seasonality and promo uplift.
 
-## Current model
+## Current models
 
 `models/seasonal_baseline.py` is the model currently used in production: a
 seasonal-naive forecaster that repeats the same weekday from the most recent
-week of history. Run it to backtest on the last 28 days and write next month's
-forecast:
+week of history. `models/arima.py` is the team's candidate upgrade: per-SKU
+ARIMA(1,0,1) with weekday regressors. Both backtest on the last 28 days and
+write next month's forecast:
 
 ```bash
 uv run python models/seasonal_baseline.py
+uv run python models/arima.py
 ```
 
 ## Project layout

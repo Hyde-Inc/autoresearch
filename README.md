@@ -44,8 +44,9 @@ OPENROUTER_API_KEY=sk-or-v1-your-key
 ## Run it on the demo project
 
 `demo/retail-demand-forecasting` looks like a real data science repo: two years of daily sales for
-60 SKUs (including intermittent slow movers), a README, and a production seasonal-naive model in
-`models/seasonal_baseline.py`. Generate its data, then start:
+60 SKUs (including intermittent slow movers), a README, a production seasonal-naive model in
+`models/seasonal_baseline.py`, and a candidate ARIMA model in `models/arima.py`. Generate its
+data, then start:
 
 ```bash
 uv run python demo/retail-demand-forecasting/scripts/make_dataset.py
@@ -53,30 +54,45 @@ uv run autoresearch start demo/retail-demand-forecasting
 ```
 
 This opens a streaming chat with the Research Director, similar to a coding agent. You see its
-thinking tokens live and type replies in a box; there are no yes/no menus. It reads the project,
-profiles the data, settles the goal and guardrails with you, builds the protected workspace,
-writes and evaluates the baseline, and starts the agents once you approve the round-1 plan. Bad
-input (like a wrong file path) comes back as a normal chat reply, not a crash.
+thinking tokens live and type replies in a box. Two things must be clear before research starts -
+the goal and the baseline. Set them with slash commands or just say them:
+
+```
+/goal reduce wmape
+/baseline models/arima.py
+go
+```
+
+The moment both are clear the director locks in: it builds the protected workspace, ports your
+pinned model as the incumbent baseline, evaluates it, and launches the first round of parallel
+researches. No approvals, no config files.
+
+After each round the director analyzes the results (worst SKUs, weekday bias, horizon decay) and
+proposes 2-5 new researches to run in parallel. You review them in the same chat: type `approve`
+to launch the round, give feedback to revise the proposal, or `stop` to end the run.
 
 To see the no-baseline path, delete `models/` from the demo repo and start again: the director
 runs EDA (seasonality, intermittency, promo/price drivers) and bootstraps a first model from its
 skills instead.
 
-## Configuration is optional
+## No YAML, just slash commands
 
-You do not write a task config. Everything is discovered in the setup chat and saved to
-`<repo>/.autoresearch/task/task.yaml`. To pin run hyperparameters, add an optional
-`autoresearch.yaml` to your repo root; every field has a default:
+There is nothing to configure up front: defaults come from code, and you edit them inline in the
+chat, Cursor/Claude style:
 
-```yaml
-director: { model: openrouter/moonshotai/kimi-k3, temperature: 0.35 }
-agents: { model: openrouter/moonshotai/kimi-k3, count: 3, timeout_s: 900 }
-budget: { rounds: 4, max_experiments: 12, train_timeout_s: 600 }
-guardrails: ["rmse<=baseline*1.10", "runtime_s<=600"]
-skills: [docs/forecasting-notes.md]
-```
+| command | what it does |
+| --- | --- |
+| `/goal <text>` | what the research must improve |
+| `/baseline <path>` | pin an existing model script as the baseline |
+| `/n_agents <1-5>` | parallel researches per round |
+| `/metric <name>` | wmape, mape, rmse, or bias_pct |
+| `/guardrail <expr>` | add a guardrail, e.g. `bias_pct within -8..8` |
+| `/rounds <n>` | maximum research rounds |
+| `/timeout <seconds>` | per-experiment coding agent timeout |
+| `/status`, `/help` | show settings / commands |
 
-Non-interactive commands work against the generated config:
+The agreed setup is saved internally to `<repo>/.autoresearch/task/task.yaml` so runs can be
+resumed and inspected; you never write or edit it. Non-interactive commands work against it:
 
 ```bash
 uv run autoresearch validate -c demo/retail-demand-forecasting/.autoresearch/task/task.yaml
@@ -89,7 +105,8 @@ uv run autoresearch resume -c demo/retail-demand-forecasting/.autoresearch/task/
 Without a repo, a CSV with `date`, `sku_name`, `sales`, and `selling_price` columns also works:
 
 ```bash
-uv run autoresearch start --csv sales.csv --name my-forecast
+uv run autoresearch ingest sales.csv --name my-forecast
+uv run autoresearch run -c tasks/my-forecast/task.yaml
 uv run autoresearch metric -c tasks/my-forecast/task.yaml \
   "Penalize under-forecasting twice as much as over-forecasting"
 ```
@@ -126,12 +143,12 @@ saved under `<repo>/.autoresearch/runs/`.
 ## Guardrails
 
 Guardrails prevent an agent from improving one number while making the model worse somewhere else.
+Add them in chat:
 
-```yaml
-guardrails:
-  - "rmse<=baseline*1.10"
-  - "bias_pct within -8..8"
-  - "runtime_s<=600"
+```
+/guardrail rmse<=baseline*1.10
+/guardrail bias_pct within -8..8
+/guardrail runtime_s<=600
 ```
 
 Validation and holdout actuals are never copied into the seed workspace or agent worktrees; the

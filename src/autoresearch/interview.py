@@ -26,13 +26,14 @@ from rich.table import Table
 
 from . import eda
 from .chat import StreamingChat, TurnRenderer, input_box
-from .config import DEFAULT_MODEL, TaskConfig, load_config, load_project_config
+from .config import DEFAULT_MODEL, TaskConfig, load_config
 from .discover import read_repo_file, render_inventory, repo_inventory
 from .metrics import MetricInterpreter, MetricSpec, MetricValidation, adopt_spec, eval_columns
 from .models import Idea
 from .orchestrator import validate_baseline
 from .prepare import prepare_workspace, write_baseline
 from .skills import ResearchSkill, load_skills
+from .slash import SessionSettings, handle_slash
 
 MAX_TOOL_ROUNDS = 16
 
@@ -280,14 +281,14 @@ class SetupSession:
         self,
         client,
         console: Console,
-        experiments: int,
+        settings: SessionSettings | None = None,
         config_path: Path | None = None,
         repo: Path | None = None,
     ):
         if config_path is None and repo is None:
             raise ValueError("provide a task config or a project repo")
         self.console = console
-        self.experiments = experiments
+        self.settings = settings or SessionSettings()
         self.config_path = config_path
         self.config = load_config(config_path) if config_path else None
         self.repo = (repo or self.config.root).resolve()
@@ -295,9 +296,8 @@ class SetupSession:
             model = self.config.director.model
             temperature = self.config.director.temperature
         else:
-            overlay = load_project_config(self.repo).get("director", {})
-            model = overlay.get("model", DEFAULT_MODEL)
-            temperature = float(overlay.get("temperature", 0.35))
+            model = DEFAULT_MODEL
+            temperature = 0.35
         self.chat = StreamingChat(client, model.removeprefix("openrouter/"), temperature)
         self.skills: list[ResearchSkill] = load_skills(self.config)
         self.pending_spec: MetricSpec | None = None
@@ -325,33 +325,46 @@ class SetupSession:
             "you can discover yourself with tools - explore first, then state what you found as "
             "facts the user can correct. If the user gives an unclear or invalid answer, say "
             "what went wrong and ask again; never stop the session.\n\n"
+            "The user edits run settings with slash commands (/goal, /baseline, /n_agents, "
+            "/metric, /guardrail, /rounds, /timeout). Changes arrive as [settings updated] "
+            "notes in the conversation. Treat them as final decisions: do not re-confirm them, "
+            "and never ask the user to approve something they already set.\n\n"
+            f"Current settings:\n{self.settings.describe()}\n\n"
         )
         if self.config is None:
             flow = (
-                "No task workspace exists yet. Your flow:\n"
+                "No task workspace exists yet. Two things must be clear before research can "
+                "start: the goal and the baseline model. Everything else you decide "
+                "yourself.\n\n"
+                "Your flow:\n"
                 "1. Explore the project yourself: read the README and model code with "
                 "read_file, profile candidate data files with explore_data. Identify the "
-                "training data, its id/date/target columns, and whether a model already "
-                "exists.\n"
-                "2. Ask the user only what the research should improve, and share what you "
-                "found in the project while you do.\n"
-                "3. Once the goal is clear, state your setup as assumptions (data file, "
+                "training data, its id/date/target columns, and what models already exist.\n"
+                "2. If the goal or baseline is still unclear after exploring, ask about that "
+                "one thing, sharing what you found in the project while you do. If a "
+                "settings note already pins them, they are decided.\n"
+                "3. The moment both goal and baseline are clear, LOCK IN and run the whole "
+                "launch sequence without asking for permission at any step:\n"
+                "   a. Call prepare_workspace, stating your setup choices (data file, "
                 "columns, validation and holdout horizon matched to the business forecast "
-                "horizon) and call prepare_workspace.\n"
-                "4. Call write_baseline. If the project has an existing model or training "
-                "script, port it faithfully so it becomes the incumbent baseline - the "
-                "research then has to beat the user's current approach. If the project has "
-                "no model, run the EDA you need (seasonality, intermittency, drivers) and "
-                "choose a simple, robust first model from your skills; tell the user why.\n"
-                "5. Call evaluate_baseline and interpret the numbers in one or two "
+                "horizon) as brief facts.\n"
+                "   b. Call write_baseline. Port the pinned baseline script faithfully so "
+                "the research has to beat the user's current approach. If no baseline is "
+                "pinned and none exists in the repo, run the EDA you need (seasonality, "
+                "intermittency, drivers) and choose a simple, robust first model from your "
+                "skills; tell the user why.\n"
+                "   c. Call evaluate_baseline and interpret the numbers in one or two "
                 "sentences. If evaluation errors, fix the code with write_baseline and "
                 "retry.\n"
-                "6. Present the brief (goal, business context, metric, guardrails, research "
-                "directions) in plain text; once the user agrees, call finalize_brief.\n"
-                f"7. Propose a round-1 plan of exactly {self.experiments} experiment(s), "
-                "each a single testable change, citing which skills informed it. Once the "
-                "user approves, call start_research with the ideas (fields: title, "
-                "hypothesis, instructions, category, skills_used).\n\n"
+                "   d. Call finalize_brief using the settings above (goal, metric, "
+                "guardrails) plus the business context you learned.\n"
+                f"   e. Propose exactly {self.settings.n_agents} round-1 experiment(s), "
+                "each a single testable change, citing which skills informed it, and call "
+                "start_research immediately with the ideas (fields: title, hypothesis, "
+                "instructions, category, skills_used). Announce the plan as you launch; do "
+                "not wait for approval - locking in was the approval.\n\n"
+                "After round 1 you will analyze results and propose the next round, which "
+                "the user reviews before it runs.\n\n"
                 f"Project inventory:\n{render_inventory(repo_inventory(self.repo))}\n\n"
             )
         else:
@@ -378,10 +391,10 @@ class SetupSession:
                 f"3. {baseline_state} Only if the user offers their own script, ask for its "
                 "path and call replace_baseline. Then call evaluate_baseline and interpret "
                 "the numbers for the user in one or two sentences.\n"
-                f"4. Propose a round-1 plan of exactly {self.experiments} experiment(s), each "
-                "a single testable change, citing which skills informed it. Once the user "
-                "approves, call start_research with the ideas (fields: title, hypothesis, "
-                "instructions, category, skills_used).\n\n"
+                f"4. Propose a round-1 plan of exactly {self.settings.n_agents} "
+                "experiment(s), each a single testable change, citing which skills informed "
+                "it. Once the user approves, call start_research with the ideas (fields: "
+                "title, hypothesis, instructions, category, skills_used).\n\n"
                 f"Current task config:\n{self.config.config_path.read_text()}\n"
                 f"Training data profile:\n{json.dumps(data_profile(self.config))}\n\n"
                 f"Agent task contract (TASK.md):\n{contract}\n\n"
@@ -458,6 +471,7 @@ class SetupSession:
             validation_days=int(validation_days),
             holdout_days=int(holdout_days),
             name=name,
+            overrides=self.settings.overrides(),
         )
         self.config_path = prepared.config_path
         self._reload()
@@ -569,7 +583,7 @@ class SetupSession:
             idea = Idea.model_validate(item)
             idea.skills_used = [name for name in idea.skills_used if name in known]
             parsed.append(idea)
-        self.final_ideas = parsed[: self.experiments]
+        self.final_ideas = parsed[: self.settings.n_agents]
         table = Table(title="Approved round 1")
         for column in ("Experiment", "Hypothesis", "Skills"):
             table.add_column(column)
@@ -578,10 +592,24 @@ class SetupSession:
         self.console.print(table)
         return {"ok": True, "experiments": len(self.final_ideas)}
 
-    def run(self, first_message: str) -> list[Idea]:
+    def next_user_message(self) -> str:
+        """Read input, applying slash commands locally until a chat message arrives."""
+        notes: list[str] = []
+        while True:
+            text = input_box(self.console)
+            result = handle_slash(text, self.settings, self.console)
+            if not result.handled:
+                if notes:
+                    return "[settings updated]\n" + "\n".join(notes) + "\n\n" + text
+                return text
+            if result.note:
+                notes.append(result.note)
+
+    def run(self) -> list[Idea]:
+        first = self.next_user_message()
         messages: list[dict] = [
             {"role": "system", "content": self.system_prompt()},
-            {"role": "user", "content": first_message},
+            {"role": "user", "content": first},
         ]
         tool_rounds = 0
         while True:
@@ -615,4 +643,4 @@ class SetupSession:
                     return self.final_ideas
                 continue
             tool_rounds = 0
-            messages.append({"role": "user", "content": input_box(self.console)})
+            messages.append({"role": "user", "content": self.next_user_message()})

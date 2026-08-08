@@ -8,10 +8,6 @@ from pydantic import BaseModel, Field, model_validator
 
 DEFAULT_MODEL = "openrouter/moonshotai/kimi-k3"
 
-PROJECT_CONFIG_NAME = "autoresearch.yaml"
-"""Optional repo-level file holding only run hyperparameters; everything else is
-discovered by the Research Director during setup."""
-
 
 class MetricConfig(BaseModel):
     name: str = "wmape"
@@ -97,17 +93,3 @@ def load_config(path: Path) -> TaskConfig:
         config.metric.name = spec.name
         config.metric.direction = spec.direction
     return config
-
-
-def load_project_config(repo: Path) -> dict:
-    """Read run hyperparameters from a project's optional autoresearch.yaml.
-
-    Only the tuning knobs (director, agents, budget, metric, guardrails, skills)
-    are honored; task structure is discovered during setup, not configured.
-    """
-    path = repo / PROJECT_CONFIG_NAME
-    if not path.exists():
-        return {}
-    raw = yaml.safe_load(path.read_text()) or {}
-    allowed = {"director", "agents", "budget", "metric", "guardrails", "skills", "name"}
-    return {key: value for key, value in raw.items() if key in allowed}

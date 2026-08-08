@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import shutil
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from rich.console import Console
 
@@ -15,6 +18,20 @@ from .store import RunStore
 from .worker import WorkerResult, _run, ensure_seed_repo, remove_worktree, run_worker
 
 console = Console()
+
+PROPOSALS_MIN = 2
+PROPOSALS_MAX = 5
+
+
+@dataclass
+class ReviewDecision:
+    """A human reviewer's verdict on the director's proposed round."""
+
+    action: Literal["approve", "revise", "stop"]
+    feedback: str | None = None
+
+
+ReviewCallback = Callable[[int, list[Idea]], ReviewDecision]
 
 
 def _better(candidate: float, incumbent: float, direction: str) -> bool:
@@ -77,6 +94,51 @@ async def _execute_attempt(
     return attempt, worker
 
 
+def _print_director_findings(director: ResearchDirector) -> None:
+    if director.last_analysis:
+        console.print("[bold]Director analyzed the data and errors[/bold]")
+        for line in director.last_analysis:
+            console.print(f"  {line}")
+    if director.last_skill_selection.selected:
+        console.print("[bold]Director consulted skills[/bold]")
+        for selected in director.last_skill_selection.selected:
+            console.print(f"  {selected.name}: {selected.reason}")
+
+
+async def _propose_round(
+    director: ResearchDirector,
+    store: RunStore,
+    round_number: int,
+    notes: str,
+    count: int,
+    review: ReviewCallback | None,
+) -> list[Idea]:
+    """Ask the director for the next round; with a reviewer, loop until they
+    approve or stop. Returns [] when the reviewer ends the run."""
+    feedback: str | None = None
+    previous: list[Idea] | None = None
+    while True:
+        ideas = await director.propose(
+            count=count if review is None else None,
+            count_range=None if review is None else (PROPOSALS_MIN, PROPOSALS_MAX),
+            round_number=round_number,
+            attempts=store.load_attempts(),
+            notes=notes,
+            store=store,
+            feedback=feedback,
+            previous=previous,
+        )
+        _print_director_findings(director)
+        if review is None:
+            return ideas
+        decision = await asyncio.to_thread(review, round_number, ideas)
+        if decision.action == "approve":
+            return ideas
+        if decision.action == "stop":
+            return []
+        feedback, previous = decision.feedback, ideas
+
+
 async def run_research(
     config: TaskConfig,
     *,
@@ -86,13 +148,20 @@ async def run_research(
     max_experiments: int | None = None,
     resume_store: RunStore | None = None,
     initial_ideas: list[Idea] | None = None,
+    review: ReviewCallback | None = None,
 ) -> RunStore:
     if goal:
         config.goal = goal
     if guardrails:
         config.guardrails.extend(guardrails)
     parallel = parallel or config.agents.count
-    maximum = max_experiments or config.budget.max_experiments
+    if max_experiments:
+        maximum = max_experiments
+    elif review is not None:
+        # The human reviewer is the budget; cap only at the theoretical maximum.
+        maximum = config.budget.rounds * PROPOSALS_MAX
+    else:
+        maximum = config.budget.max_experiments
     seed_template = config.resolve(config.workspace.seed)
     if not seed_template.exists():
         raise RuntimeError(f"seed workspace does not exist: {seed_template}; run prepare.py first")
@@ -154,21 +223,13 @@ async def run_research(
             if round_number == 1 and initial_ideas:
                 ideas = initial_ideas[:count]
             else:
-                ideas = await director.propose(
-                    count=count,
-                    round_number=round_number,
-                    attempts=store.load_attempts(),
-                    notes=notes,
-                    store=store,
+                ideas = await _propose_round(
+                    director, store, round_number, notes, count, review
                 )
-                if director.last_analysis:
-                    console.print("[bold]Director analyzed the data and errors[/bold]")
-                    for line in director.last_analysis:
-                        console.print(f"  {line}")
-                if director.last_skill_selection.selected:
-                    console.print("[bold]Director consulted skills[/bold]")
-                    for selected in director.last_skill_selection.selected:
-                        console.print(f"  {selected.name}: {selected.reason}")
+                if not ideas:
+                    console.print("[bold]Run ended at review.[/bold]")
+                    break
+                ideas = ideas[: maximum - completed]
             count = len(ideas)
             console.print(f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments")
             jobs = []

@@ -267,12 +267,21 @@ class ResearchDirector:
     async def propose(
         self,
         *,
-        count: int,
+        count: int | None = None,
+        count_range: tuple[int, int] | None = None,
         round_number: int,
         attempts: list[Attempt],
         notes: str,
         store: RunStore | None = None,
+        feedback: str | None = None,
+        previous: list[Idea] | None = None,
     ) -> list[Idea]:
+        """Propose experiments: exactly ``count``, or between ``count_range`` bounds.
+
+        ``feedback`` carries the human reviewer's reaction to ``previous`` ideas so
+        the director can revise instead of starting over.
+        """
+        assert (count is None) != (count_range is None), "pass count or count_range"
         self.last_analysis = []
         history = [
             {
@@ -315,6 +324,16 @@ class ResearchDirector:
             )
         spec = load_task_spec(self.config)
         metric_context = f" Definition: {spec.understanding}" if spec else ""
+        if count is not None:
+            ask = f"Need exactly {count} ideas."
+            minimum, maximum = count, count
+        else:
+            minimum, maximum = count_range
+            ask = (
+                f"Propose between {minimum} and {maximum} ideas - as many as there are "
+                "genuinely distinct, promising directions. A human reviewer will approve "
+                "them before they run in parallel."
+            )
         user = (
             f"Task: {self.config.description}\nGoal: {self.config.goal}\n"
             f"Business context: {self.config.context or 'not provided'}\n"
@@ -323,11 +342,19 @@ class ResearchDirector:
             f"Primary metric: {self.config.metric.name} "
             f"({self.config.metric.direction}).{metric_context}\n"
             f"Guardrails: {self.config.guardrails}\nRound: {round_number}\n"
-            f"Need {count} ideas.\nSuggested families (not mandatory): {self.config.idea_hints}\n"
+            f"{ask}\nSuggested families (not mandatory): {self.config.idea_hints}\n"
             f"Prior attempts: {json.dumps(history)}\nLab notes:\n{notes[-8000:]}\n\n"
             f"Skill selection: {selection_json(self.last_skill_selection)}\n\n"
             f"Selected skill guidance:\n{skill_context or 'No skill selected.'}"
         )
+        if feedback and previous:
+            proposed = json.dumps([idea.model_dump(mode="json") for idea in previous])
+            user += (
+                f"\n\nYou already proposed these ideas:\n{proposed}\n"
+                f"The human reviewer responded: {feedback}\n"
+                "Revise the proposal accordingly - keep what the reviewer liked, change or "
+                "replace what they pushed back on."
+            )
         if store is not None:
             frames = store.list_validation_frames()
             user += (
@@ -340,9 +367,9 @@ class ResearchDirector:
         ideas = [Idea.model_validate(item) for item in payload.get("ideas", [])]
         for idea in ideas:
             idea.skills_used = [name for name in idea.skills_used if name in selected_names]
-        if len(ideas) < count:
-            raise RuntimeError(f"director returned {len(ideas)} ideas; expected {count}")
-        return ideas[:count]
+        if len(ideas) < minimum:
+            raise RuntimeError(f"director returned {len(ideas)} ideas; expected at least {minimum}")
+        return ideas[:maximum]
 
     async def reflect(self, attempts: list[Attempt]) -> str:
         system = (

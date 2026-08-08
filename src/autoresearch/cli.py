@@ -12,14 +12,16 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .chat import input_box
-from .config import load_config, load_project_config
+from .config import load_config
 from .director import openrouter_client
 from .ingest import ingest_csv, preview_csv
 from .interview import SetupSession, print_spec
 from .metrics import MetricInterpreter, adopt_spec, eval_columns
-from .orchestrator import run_research, validate_baseline
+from .models import Idea
+from .orchestrator import ReviewDecision, run_research, validate_baseline
 from .report import build_report
 from .skills import load_skills
+from .slash import SessionSettings, print_help
 from .store import RunStore, latest_run
 
 app = typer.Typer(no_args_is_help=True, help="Parallel autonomous ML experimentation.")
@@ -74,7 +76,7 @@ def resume(
     parallel: Annotated[int | None, typer.Option(min=1)] = None,
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
-    """Resume the latest or selected run from its saved round state."""
+    """Resume the latest or selected run: review the next proposed round, then continue."""
     load_dotenv()
     cfg = load_config(config)
     store = _store_from(run_dir, config)
@@ -84,6 +86,7 @@ def resume(
             parallel=parallel,
             max_experiments=max_experiments,
             resume_store=store,
+            review=review_round,
         )
     )
     console.print(f"Run complete: [bold]{completed.run_dir}[/bold]")
@@ -159,6 +162,41 @@ def list_skills(
     console.print(table)
 
 
+_APPROVALS = {
+    "approve", "approved", "approve all", "go", "go ahead", "yes", "y", "ok", "okay",
+    "start", "run", "run it", "launch", "proceed", "do it", "ship it", "lgtm",
+    "looks good", "looks good to me", "sounds good",
+}
+_STOPS = {"stop", "quit", "exit", "end", "done", "no", "cancel", "abort"}
+
+
+def parse_review_reply(text: str) -> ReviewDecision:
+    """Whole-message approval/stop phrases decide; anything else is revision feedback."""
+    normalized = " ".join(text.lower().replace("!", "").replace(".", "").split())
+    if normalized in _APPROVALS:
+        return ReviewDecision("approve")
+    if normalized in _STOPS:
+        return ReviewDecision("stop")
+    return ReviewDecision("revise", feedback=text)
+
+
+def review_round(round_number: int, ideas: list[Idea]) -> ReviewDecision:
+    """Console review gate: show the proposed round, collect the human verdict."""
+    table = Table(title=f"Proposed round {round_number} ({len(ideas)} researches in parallel)")
+    for column in ("#", "Experiment", "Hypothesis", "Skills"):
+        table.add_column(column)
+    for index, idea in enumerate(ideas, 1):
+        table.add_row(
+            str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-"
+        )
+    console.print(table)
+    console.print(
+        "[bold]Review:[/bold] type [green]approve[/green] to launch, [red]stop[/red] to end "
+        "the run, or feedback to revise the proposal."
+    )
+    return parse_review_reply(input_box(console))
+
+
 @app.command()
 def start(
     repo: Annotated[
@@ -167,59 +205,28 @@ def start(
             exists=True, file_okay=False, help="Project repo to research (default: cwd)"
         ),
     ] = None,
-    config: Annotated[
-        Path | None, typer.Option("--config", "-c", exists=True, dir_okay=False)
-    ] = None,
-    csv: Annotated[
-        Path | None, typer.Option("--csv", exists=True, dir_okay=False)
-    ] = None,
-    name: Annotated[str | None, typer.Option("--name", "-n")] = None,
-    tasks_root: Annotated[Path, typer.Option(help="Task output directory")] = Path("tasks"),
-    parallel: Annotated[int | None, typer.Option(min=1)] = None,
-    max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
-    """Point the Research Director at a project, design the run in chat, then start it."""
+    """Point the Research Director at a project, lock in goal and baseline, and research."""
     load_dotenv()
-    if config and csv:
-        raise typer.BadParameter("pass either --config or --csv, not both")
-    if csv:
-        preview = preview_csv(csv)
-        if not preview.ok:
-            raise typer.BadParameter("; ".join(preview.errors))
-        console.print(
-            f"Found {preview.rows} rows, {preview.skus} items, "
-            f"{preview.distinct_dates} dates. Splitting into train, validation, and "
-            "hidden holdout."
-        )
-        task_name = name or typer.prompt("Task name")
-        result = ingest_csv(csv, name=task_name, tasks_root=tasks_root)
-        config = result.config_path
-
-    if config:
-        experiments = parallel or load_config(config).agents.count
-        session = SetupSession(
-            openrouter_client(), console, experiments=experiments, config_path=config
-        )
-    else:
-        repo = (repo or Path(".")).resolve()
-        overlay = load_project_config(repo)
-        experiments = parallel or int(overlay.get("agents", {}).get("count", 3))
-        session = SetupSession(
-            openrouter_client(), console, experiments=experiments, repo=repo
-        )
-        console.print(f"Project: [bold]{repo}[/bold]")
-
+    repo = (repo or Path(".")).resolve()
+    settings = SessionSettings()
+    session = SetupSession(openrouter_client(), console, settings=settings, repo=repo)
+    console.print(f"Project: [bold]{repo}[/bold]")
     console.print(
         Panel(
-            "The Research Director explores your project itself, then designs the goal, "
-            "metric, baseline, and first research plan with you.\n"
-            "Just talk; it saves decisions and starts the run when you approve the plan.",
+            "The Research Director explores your project itself. Set the two things it "
+            "needs with slash commands or just say them:\n"
+            "  [bold cyan]/goal[/bold cyan] reduce wmape        "
+            "[bold cyan]/baseline[/bold cyan] models/arima.py\n"
+            "Once both are clear it locks in, evaluates the baseline, and starts round 1. "
+            "After each round you review its next proposals before they run.",
             title="Research setup",
         )
     )
+    print_help(console)
     console.print("\nWhat should this research improve?")
     try:
-        ideas = session.run(input_box(console))
+        ideas = session.run()
     except KeyboardInterrupt:
         console.print("\nSetup cancelled. Nothing is running.")
         raise typer.Exit(130) from None
@@ -232,11 +239,14 @@ def start(
         store = asyncio.run(
             run_research(
                 load_config(session.config_path),
-                parallel=parallel,
-                max_experiments=max_experiments,
                 initial_ideas=ideas,
+                review=review_round,
             )
         )
+    except KeyboardInterrupt:
+        console.print("\nRun interrupted. Resume later with: autoresearch resume -c "
+                      f"{session.config_path}")
+        raise typer.Exit(130) from None
     except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
         console.print(f"[bold red]Research run failed:[/bold red] {exc}")
         raise typer.Exit(1) from None

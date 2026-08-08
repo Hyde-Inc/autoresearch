@@ -21,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from .config import TaskConfig, load_project_config
+from .config import TaskConfig
 from .discover import DATA_SUFFIXES, SKIP_DIRS
 from .eda import load_table
 from .ingest import _OPENCODE_JSON, _SEED_PYPROJECT, _TASK_MD_TEMPLATE, slugify
@@ -82,6 +82,7 @@ def prepare_workspace(
     validation_days: int,
     holdout_days: int,
     name: str | None = None,
+    overrides: dict | None = None,
 ) -> PreparedTask:
     repo = repo.resolve()
     data_path = (repo / train_data).resolve()
@@ -139,7 +140,7 @@ def prepare_workspace(
     )
     (seed / "solution").mkdir(exist_ok=True)
 
-    overlay = load_project_config(repo)
+    overlay = overrides or {}
     config = {
         "name": overlay.get("name", slug),
         "description": (
