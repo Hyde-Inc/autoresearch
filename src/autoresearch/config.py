@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 class MetricConfig(BaseModel):
     name: str = "wmape"
     direction: Literal["min", "max"] = "min"
+    definition: Path | None = None
 
 
 class ModelConfig(BaseModel):
@@ -57,6 +58,8 @@ class TaskConfig(BaseModel):
     data: DataConfig = DataConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
     idea_hints: list[str] = Field(default_factory=list)
+    context: str = ""
+    skills: list[Path] = Field(default_factory=list)
     config_path: Path | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
@@ -81,4 +84,10 @@ def load_config(path: Path) -> TaskConfig:
         raw = yaml.safe_load(handle)
     config = TaskConfig.model_validate(raw)
     config.config_path = path
+    if config.metric.definition:
+        from .metrics import load_spec
+
+        spec = load_spec(config.resolve(config.metric.definition))
+        config.metric.name = spec.name
+        config.metric.direction = spec.direction
     return config

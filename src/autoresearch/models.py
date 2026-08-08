@@ -11,6 +11,7 @@ class Idea(BaseModel):
     hypothesis: str
     instructions: str
     category: str = "other"
+    skills_used: list[str] = Field(default_factory=list)
 
 
 class Attempt(BaseModel):

@@ -11,6 +11,7 @@ import pandas as pd
 
 from .config import TaskConfig
 from .guardrails import check_guardrails
+from .metrics import compile_metric, load_task_spec
 
 
 @dataclass
@@ -62,7 +63,15 @@ def _validate_forecasts(
         raise ValueError("forecast values must all be finite")
     if (values < 0).any():
         raise ValueError("forecast values must be non-negative")
-    return forecasting_metrics(merged[data.target_column].to_numpy(dtype=float), values)
+    metrics = forecasting_metrics(merged[data.target_column].to_numpy(dtype=float), values)
+    spec = load_task_spec(config)
+    if spec is not None:
+        frame = merged.rename(columns={data.target_column: "actual"})
+        try:
+            metrics[spec.name] = compile_metric(spec.code)(frame)
+        except Exception as exc:
+            raise ValueError(f"custom metric '{spec.name}' failed: {exc}") from exc
+    return metrics
 
 
 async def _evaluate_split(

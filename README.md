@@ -11,7 +11,7 @@ It is inspired by [autoresearch](https://github.com/karpathy/autoresearch) and
 
 ## How it works
 
-1. A research director proposes experiments.
+1. A research director uses demand forecasting skills to propose experiments.
 2. Each OpenCode agent gets its own git worktree.
 3. Agents edit the model code and create forecasts.
 4. A protected evaluator checks WMAPE, MAPE, RMSE, bias, runtime, and hidden holdout results.
@@ -45,6 +45,15 @@ seasonality.
 
 ## Run it
 
+The easiest option is the interactive setup:
+
+```bash
+uv run autoresearch start -c examples/demand_forecasting/task.yaml
+```
+
+The Research Director asks questions until the goal is clear. You confirm the metric, baseline
+performance, guardrails, and first research plan before any agents start.
+
 Check the baseline:
 
 ```bash
@@ -63,6 +72,35 @@ uv run autoresearch run -c examples/demand_forecasting/task.yaml \
 ```
 
 The demo can try ideas based on ARIMA, XGBoost, Chronos, calibration, and ensembles.
+
+## Use your own sales data
+
+The CSV needs `date`, `sku_name`, `sales`, and `selling_price` columns.
+
+```bash
+uv run autoresearch start --csv sales.csv --name my-forecast
+```
+
+You can also run each setup step separately:
+
+```bash
+uv run autoresearch ingest sales.csv --name my-forecast
+uv run autoresearch metric -c tasks/my-forecast/task.yaml \
+  "Penalize under-forecasting twice as much as over-forecasting"
+```
+
+## Research Director skills
+
+The outer loop includes our demand forecasting playbooks. It chooses the relevant skills each
+round based on the data, past results, holdout gaps, bias, and guardrail failures. Skills cover
+model selection, leakage-safe tree features, intermittent demand, price and promotions, bias
+correction, ensembling, and Chronos.
+
+```bash
+uv run autoresearch skills
+```
+
+Add client-specific markdown skills with a `skills:` path list in `task.yaml`.
 
 ## View results
 

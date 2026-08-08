@@ -83,6 +83,7 @@ async def run_research(
     parallel: int | None = None,
     max_experiments: int | None = None,
     resume_store: RunStore | None = None,
+    initial_ideas: list[Idea] | None = None,
 ) -> RunStore:
     if goal:
         config.goal = goal
@@ -146,12 +147,20 @@ async def run_research(
             round_number += 1
             count = min(parallel, maximum - completed)
             notes = store.notes_file.read_text() if store.notes_file.exists() else ""
-            ideas = await director.propose(
-                count=count,
-                round_number=round_number,
-                attempts=store.load_attempts(),
-                notes=notes,
-            )
+            if round_number == 1 and initial_ideas:
+                ideas = initial_ideas[:count]
+            else:
+                ideas = await director.propose(
+                    count=count,
+                    round_number=round_number,
+                    attempts=store.load_attempts(),
+                    notes=notes,
+                )
+                if director.last_skill_selection.selected:
+                    console.print("[bold]Director consulted skills[/bold]")
+                    for selected in director.last_skill_selection.selected:
+                        console.print(f"  {selected.name}: {selected.reason}")
+            count = len(ideas)
             console.print(f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments")
             jobs = []
             for idea in ideas:
