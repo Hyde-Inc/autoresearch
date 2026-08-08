@@ -6,7 +6,7 @@ over-forecasting creates waste and under-forecasting creates stockouts.
 
 ## Data
 
-`data/sales_daily.parquet` holds two years of daily sales per SKU:
+`data/sales_daily.parquet` holds 14 months of daily sales for 24 SKUs:
 
 | column     | meaning                                    |
 | ---------- | ------------------------------------------ |

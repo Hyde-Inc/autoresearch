@@ -43,10 +43,10 @@ OPENROUTER_API_KEY=sk-or-v1-your-key
 
 ## Run it on the demo project
 
-`demo/retail-demand-forecasting` looks like a real data science repo: two years of daily sales for
-60 SKUs (including intermittent slow movers), a README, a production seasonal-naive model in
-`models/seasonal_baseline.py`, and a candidate ARIMA model in `models/arima.py`. Generate its
-data, then start:
+`demo/retail-demand-forecasting` looks like a real data science repo: 14 months of daily sales
+for 24 SKUs (including intermittent slow movers) - kept small so demo experiments train in
+seconds - a README, a production seasonal-naive model in `models/seasonal_baseline.py`, and a
+candidate ARIMA model in `models/arima.py`. Generate its data, then start:
 
 ```bash
 uv run python demo/retail-demand-forecasting/scripts/make_dataset.py
