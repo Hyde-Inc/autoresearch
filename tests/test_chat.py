@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
-from autoresearch.chat import accumulate_stream
+from prompt_toolkit.document import Document
+
+from autoresearch.chat import SlashCompleter, accumulate_stream
+from autoresearch.slash import COMMANDS
 
 
 class Recorder:
@@ -54,3 +57,19 @@ def test_accumulate_stream_without_tools_or_content() -> None:
     listener = Recorder()
     message = accumulate_stream([_chunk(reasoning="hmm")], listener)
     assert message == {"role": "assistant", "content": None}
+
+
+def _completions(text: str) -> list[str]:
+    completer = SlashCompleter(COMMANDS)
+    return [item.text for item in completer.get_completions(Document(text, len(text)), None)]
+
+
+def test_typing_slash_pops_the_full_command_menu() -> None:
+    assert _completions("/") == [usage.split()[0] for usage, _ in COMMANDS]
+
+
+def test_menu_filters_as_you_type_and_stays_out_of_plain_text() -> None:
+    assert _completions("/g") == ["/goal", "/guardrail"]
+    assert _completions("/GOAL") == ["/goal"]
+    assert _completions("reduce wmape") == []  # plain chat: no menu
+    assert _completions("/goal reduce") == []  # argument typing: menu closed

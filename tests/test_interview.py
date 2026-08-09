@@ -161,7 +161,7 @@ def test_execute_gate_runs_the_hand_edited_plan(tmp_path: Path, monkeypatch) -> 
     session.plan_path.write_text(text)
 
     inputs = iter(["execute"])
-    monkeypatch.setattr("autoresearch.interview.input_box", lambda console: next(inputs))
+    monkeypatch.setattr("autoresearch.interview.input_box", lambda console, **_: next(inputs))
     assert session._gate_user_message() is None
     assert [idea.title for idea in session.final_ideas] == ["Global XGBoost"]
     assert session.settings.goal == "cut wmape by 10%"
@@ -176,14 +176,14 @@ def test_gate_passes_feedback_through_and_recovers_from_broken_plans(
     session.execute("write_plan", _PLAN_IDEAS)
 
     inputs = iter(["make experiment 2 about promotions instead"])
-    monkeypatch.setattr("autoresearch.interview.input_box", lambda console: next(inputs))
+    monkeypatch.setattr("autoresearch.interview.input_box", lambda console, **_: next(inputs))
     assert session._gate_user_message() == "make experiment 2 about promotions instead"
     assert session.final_ideas is None
 
     # A broken plan reports the problem and keeps asking instead of crashing.
     session.plan_path.write_text("---\ngoal: x\n---\n\nno experiments\n")
     inputs = iter(["execute", "stop"])
-    monkeypatch.setattr("autoresearch.interview.input_box", lambda console: next(inputs))
+    monkeypatch.setattr("autoresearch.interview.input_box", lambda console, **_: next(inputs))
     assert session._gate_user_message() is None
     assert session.final_ideas == []
 
@@ -258,7 +258,7 @@ def test_survey_failure_falls_back_to_inventory(tmp_path: Path, monkeypatch) -> 
 def test_slash_commands_update_settings_and_prepend_notes(tmp_path: Path, monkeypatch) -> None:
     session = SetupSession(object(), _console(), repo=_repo(tmp_path))
     inputs = iter(["/goal reduce wmape", "/baseline models/baseline.py", "/n_agents 2", "go"])
-    monkeypatch.setattr("autoresearch.interview.input_box", lambda console: next(inputs))
+    monkeypatch.setattr("autoresearch.interview.input_box", lambda console, **_: next(inputs))
     message = session.next_user_message()
     assert session.settings.goal == "reduce wmape"
     assert session.settings.baseline_path == "models/baseline.py"

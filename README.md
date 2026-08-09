@@ -70,8 +70,9 @@ uv run autoresearch start demo/retail-demand-forecasting
 ```
 
 This opens a streaming chat with the Research Director, similar to a coding agent. You see its
-thinking tokens live and type replies in a box. Two things must be clear before research starts -
-the goal and the baseline. Set them with slash commands or just say them:
+thinking tokens live and type replies in a box. Typing `/` pops a completion menu of every
+command (Tab or arrows to pick). Two things must be clear before research starts - the goal and
+the baseline. Set them with slash commands or just say them:
 
 ```
 /goal reduce wmape

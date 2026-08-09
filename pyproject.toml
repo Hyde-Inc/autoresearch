@@ -8,6 +8,7 @@ dependencies = [
   "numpy>=2.0",
   "openai>=1.50",
   "pandas>=2.2",
+  "prompt-toolkit>=3.0.53",
   "pyarrow>=17",
   "pydantic>=2.8",
   "python-dotenv>=1.0",

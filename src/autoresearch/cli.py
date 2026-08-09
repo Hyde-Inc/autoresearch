@@ -208,7 +208,8 @@ def start(
     console.print(
         Panel(
             "The Research Director surveys your project itself. Set what it needs with "
-            "slash commands or just say it:\n"
+            "slash commands or just say it - type [bold cyan]/[/bold cyan] to see the "
+            "command menu:\n"
             "  [bold cyan]/goal[/bold cyan] reduce wmape        "
             "[bold cyan]/baseline[/bold cyan] models/arima.py\n"
             "Once goal, baseline, and metric are settled it evaluates the baseline, opens "

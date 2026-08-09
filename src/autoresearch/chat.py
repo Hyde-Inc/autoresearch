@@ -7,9 +7,14 @@ including tool calls, so the conversation history stays valid.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from openai import BadRequestError
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.styles import Style
 from rich.console import Console
 
 
@@ -116,14 +121,68 @@ class TurnRenderer:
         self.mode = None
 
 
-def input_box(console: Console) -> str:
-    """Bordered single-line prompt, Claude Code style. Re-asks on empty input."""
+class SlashCompleter(Completer):
+    """Pops the command menu the moment the line starts with ``/``."""
+
+    def __init__(self, commands: Sequence[tuple[str, str]]):
+        self.commands = commands
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        for usage, description in self.commands:
+            name = usage.split()[0]
+            if name.startswith(text.lower()):
+                yield Completion(
+                    name,
+                    start_position=-len(text),
+                    display=usage,
+                    display_meta=description,
+                )
+
+
+_PROMPT_STYLE = Style.from_dict(
+    {
+        "frame": "ansibrightblack",
+        "completion-menu.completion": "bg:ansibrightblack ansiwhite",
+        "completion-menu.completion.current": "bg:ansicyan ansiblack",
+        "completion-menu.meta.completion": "bg:ansibrightblack ansiwhite",
+        "completion-menu.meta.completion.current": "bg:ansicyan ansiblack",
+    }
+)
+_HISTORY = InMemoryHistory()
+
+
+def _read_line(console: Console, completions: Sequence[tuple[str, str]] | None) -> str:
+    if completions:
+        try:
+            session: PromptSession = PromptSession(
+                history=_HISTORY,
+                completer=SlashCompleter(completions),
+                complete_while_typing=True,
+                style=_PROMPT_STYLE,
+            )
+            return session.prompt([("class:frame", "\u2502 "), ("bold", "> ")])
+        except (EOFError, KeyboardInterrupt):
+            raise
+        except Exception:  # noqa: BLE001, S110 - no usable tty; fall back to plain input
+            pass
+    return console.input("[dim]\u2502[/dim] [bold]>[/bold] ")
+
+
+def input_box(console: Console, completions: Sequence[tuple[str, str]] | None = None) -> str:
+    """Bordered single-line prompt, Claude Code style, with a slash-command menu.
+
+    Typing ``/`` pops a completion menu of every command (when *completions* are
+    provided); Tab/arrows select. Re-asks on empty input.
+    """
     width = max(20, min(console.width, 100))
     while True:
         console.print()
         console.print("╭" + "─" * (width - 1), style="dim")
         try:
-            value = console.input("[dim]│[/dim] [bold]>[/bold] ")
+            value = _read_line(console, completions)
         finally:
             console.print("╰" + "─" * (width - 1), style="dim")
         if value.strip():

@@ -45,7 +45,14 @@ from .plans import (
 )
 from .prepare import prepare_workspace, write_baseline
 from .skills import ResearchSkill, load_skills
-from .slash import MAX_PARALLEL, MIN_PARALLEL, SessionSettings, handle_slash, parse_reply
+from .slash import (
+    COMMANDS,
+    MAX_PARALLEL,
+    MIN_PARALLEL,
+    SessionSettings,
+    handle_slash,
+    parse_reply,
+)
 from .survey import cached_survey, survey_repo
 
 MAX_TOOL_ROUNDS = 16
@@ -786,7 +793,7 @@ class SetupSession:
         """Read input, applying slash commands locally until a chat message arrives."""
         notes: list[str] = []
         while True:
-            text = input_box(self.console)
+            text = input_box(self.console, completions=COMMANDS)
             result = handle_slash(text, self.settings, self.console)
             if not result.handled:
                 if notes:

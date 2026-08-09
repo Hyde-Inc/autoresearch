@@ -83,7 +83,8 @@ class SlashResult:
     """Authoritative settings note to forward to the director, if any."""
 
 
-_HELP_ROWS = [
+# (usage, description) for the /help table and the input box's completion menu.
+COMMANDS = [
     ("/goal <text>", "What the research must improve, e.g. /goal reduce wmape"),
     ("/baseline <path>", "Pin an existing model script as the baseline, e.g. /baseline models/arima.py"),
     ("/n_agents <1-5>", "How many researches run in parallel each round"),
@@ -100,7 +101,7 @@ def print_help(console: Console) -> None:
     table = Table(title="Slash commands", show_header=False)
     table.add_column(style="bold cyan")
     table.add_column()
-    for command, description in _HELP_ROWS:
+    for command, description in COMMANDS:
         table.add_row(command, description)
     console.print(table)
 
