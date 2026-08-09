@@ -106,36 +106,77 @@ def test_replace_baseline_tool_returns_error_instead_of_crashing(tmp_path: Path)
     assert "baseline script not found" in result["error"]
 
 
-def test_start_research_tool_parses_ideas_and_filters_skills(tmp_path: Path) -> None:
-    session = _session(tmp_path)
-    result = session.execute(
-        "start_research",
+_PLAN_IDEAS = {
+    "ideas": [
         {
-            "ideas": [
-                {
-                    "title": "Global XGBoost",
-                    "hypothesis": "Trees beat naive.",
-                    "instructions": "Build lag features.",
-                    "category": "ml",
-                    "skills_used": ["tree-model-features", "made-up-skill"],
-                },
-                {
-                    "title": "Bias calibration",
-                    "hypothesis": "Calibration trims bias.",
-                    "instructions": "Fit residual correction.",
-                },
-                {
-                    "title": "Extra idea beyond budget",
-                    "hypothesis": "Should be trimmed.",
-                    "instructions": "n/a",
-                },
-            ]
+            "title": "Global XGBoost",
+            "hypothesis": "Trees beat naive.",
+            "instructions": "Build lag features.",
+            "category": "ml",
+            "skills_used": ["tree-model-features", "made-up-skill"],
         },
-    )
-    assert result == {"ok": True, "experiments": 2}
-    assert session.final_ideas is not None
-    assert [idea.title for idea in session.final_ideas] == ["Global XGBoost", "Bias calibration"]
-    assert session.final_ideas[0].skills_used == ["tree-model-features"]
+        {
+            "title": "Bias calibration",
+            "hypothesis": "Calibration trims bias.",
+            "instructions": "Fit residual correction.",
+        },
+        {
+            "title": "Extra idea beyond budget",
+            "hypothesis": "Should be trimmed.",
+            "instructions": "n/a",
+        },
+    ]
+}
+
+
+def test_write_plan_tool_writes_editable_file_without_launching(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    result = session.execute("write_plan", _PLAN_IDEAS)
+    assert result["ok"] is True
+    assert result["experiments"] == 2  # trimmed to n_agents
+    assert session.final_ideas is None  # nothing launches until the user says execute
+    assert session.plan_path is not None and session.plan_path.exists()
+    text = session.plan_path.read_text()
+    assert "## Experiment 1: Global XGBoost" in text
+    assert "made-up-skill" not in text  # unknown skills filtered
+    assert session.plan_path.parent == tmp_path / "plans"
+
+
+def test_execute_gate_runs_the_hand_edited_plan(tmp_path: Path, monkeypatch) -> None:
+    session = _session(tmp_path)
+    session.execute("write_plan", _PLAN_IDEAS)
+    # Human deletes the second experiment and edits the goal before executing.
+    text = session.plan_path.read_text()
+    text = text[: text.index("## Experiment 2:")]
+    text = text.replace("goal: Lower WMAPE.", "goal: cut wmape by 10%")
+    session.plan_path.write_text(text)
+
+    inputs = iter(["execute"])
+    monkeypatch.setattr("autoresearch.interview.input_box", lambda console: next(inputs))
+    assert session._gate_user_message() is None
+    assert [idea.title for idea in session.final_ideas] == ["Global XGBoost"]
+    assert session.settings.goal == "cut wmape by 10%"
+    assert load_config(session.config_path).goal == "cut wmape by 10%"
+    assert "status: executed" in session.plan_path.read_text()
+
+
+def test_gate_passes_feedback_through_and_recovers_from_broken_plans(
+    tmp_path: Path, monkeypatch
+) -> None:
+    session = _session(tmp_path)
+    session.execute("write_plan", _PLAN_IDEAS)
+
+    inputs = iter(["make experiment 2 about promotions instead"])
+    monkeypatch.setattr("autoresearch.interview.input_box", lambda console: next(inputs))
+    assert session._gate_user_message() == "make experiment 2 about promotions instead"
+    assert session.final_ideas is None
+
+    # A broken plan reports the problem and keeps asking instead of crashing.
+    session.plan_path.write_text("---\ngoal: x\n---\n\nno experiments\n")
+    inputs = iter(["execute", "stop"])
+    monkeypatch.setattr("autoresearch.interview.input_box", lambda console: next(inputs))
+    assert session._gate_user_message() is None
+    assert session.final_ideas == []
 
 
 def test_unknown_tool_and_missing_pending_metric(tmp_path: Path) -> None:

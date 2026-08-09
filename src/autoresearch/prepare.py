@@ -63,9 +63,12 @@ def _copy_project_code(repo: Path, seed: Path) -> None:
         skipped = set()
         for entry in names:
             path = Path(directory) / entry
-            if entry in SKIP_DIRS or entry == ".gitignore" or entry.startswith("."):
-                skipped.add(entry)
-            elif path.is_file() and path.suffix.lower() in DATA_SUFFIXES:
+            if (
+                entry in SKIP_DIRS
+                or entry == ".gitignore"
+                or entry.startswith(".")
+                or (path.is_file() and path.suffix.lower() in DATA_SUFFIXES)
+            ):
                 skipped.add(entry)
         return skipped
 

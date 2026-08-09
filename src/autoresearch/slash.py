@@ -16,6 +16,27 @@ from rich.table import Table
 MIN_PARALLEL = 1
 MAX_PARALLEL = 5
 
+_APPROVALS = {
+    "approve", "approved", "approve all", "go", "go ahead", "yes", "y", "ok", "okay",
+    "start", "run", "run it", "launch", "proceed", "do it", "ship it", "lgtm",
+    "looks good", "looks good to me", "sounds good", "execute", "execute it",
+    "execute the plan", "run the plan",
+}
+_STOPS = {"stop", "quit", "exit", "end", "done", "no", "cancel", "abort"}
+
+
+def parse_reply(text: str) -> str:
+    """Classify a review reply: 'approve', 'stop', or 'revise' (free-form feedback).
+
+    Whole-message approval/stop phrases decide; anything else is revision feedback.
+    """
+    normalized = " ".join(text.lower().replace("!", "").replace(".", "").split())
+    if normalized in _APPROVALS:
+        return "approve"
+    if normalized in _STOPS:
+        return "stop"
+    return "revise"
+
 
 @dataclass
 class SessionSettings:
@@ -167,7 +188,7 @@ def handle_slash(text: str, settings: SessionSettings, console: Console) -> Slas
                 "description, present the worked example and verification checks, and get an "
                 "explicit yes (re-run it if they want changes). Then during lock-in call "
                 "adopt_custom_metric so every experiment is scored with it. Do not call "
-                "start_research until it is adopted.",
+                "write_plan until it is adopted.",
             )
         if command == "guardrail":
             if not argument:

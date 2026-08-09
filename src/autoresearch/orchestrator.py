@@ -14,6 +14,15 @@ from .config import TaskConfig
 from .director import ResearchDirector
 from .harness import Evaluation, evaluate
 from .models import Attempt, Idea
+from .plans import (
+    PlanError,
+    append_results,
+    mark_executed,
+    next_plan_path,
+    parse_plan,
+    plans_dir_for_task,
+    render_plan,
+)
 from .store import RunStore
 from .worker import WorkerResult, _run, ensure_seed_repo, remove_worktree, run_worker
 
@@ -31,7 +40,7 @@ class ReviewDecision:
     feedback: str | None = None
 
 
-ReviewCallback = Callable[[int, list[Idea]], ReviewDecision]
+ReviewCallback = Callable[[int, list[Idea], Path], ReviewDecision]
 
 
 def _better(candidate: float, incumbent: float, direction: str) -> bool:
@@ -105,16 +114,30 @@ def _print_director_findings(director: ResearchDirector) -> None:
             console.print(f"  {selected.name}: {selected.reason}")
 
 
+def _apply_plan_overrides(config: TaskConfig, overrides: dict) -> None:
+    """Honor the safe frontmatter edits mid-run (goal, guardrails, timeout)."""
+    if overrides.get("goal"):
+        config.goal = str(overrides["goal"])
+    if overrides.get("guardrails"):
+        config.guardrails = [str(item) for item in overrides["guardrails"]]
+    if overrides.get("timeout_s"):
+        config.agents.timeout_s = max(60, int(overrides["timeout_s"]))
+
+
 async def _propose_round(
     director: ResearchDirector,
     store: RunStore,
+    config: TaskConfig,
     round_number: int,
     notes: str,
     count: int,
     review: ReviewCallback | None,
-) -> list[Idea]:
-    """Ask the director for the next round; with a reviewer, loop until they
-    approve or stop. Returns [] when the reviewer ends the run."""
+) -> tuple[list[Idea], Path]:
+    """Ask the director for the next round and write it as an editable plan file.
+
+    With a reviewer, loop until they approve (the possibly hand-edited file is
+    what runs) or stop. Returns ([], path) when the reviewer ends the run."""
+    plan_path = next_plan_path(plans_dir_for_task(config.root), round_number)
     feedback: str | None = None
     previous: list[Idea] | None = None
     while True:
@@ -129,14 +152,39 @@ async def _propose_round(
             previous=previous,
         )
         _print_director_findings(director)
+        plan_path.write_text(
+            render_plan(
+                round_number=round_number,
+                ideas=ideas,
+                goal=config.goal,
+                metric=config.metric.name,
+                guardrails=config.guardrails,
+                timeout_s=config.agents.timeout_s,
+                analysis=list(director.last_analysis),
+            )
+        )
         if review is None:
-            return ideas
-        decision = await asyncio.to_thread(review, round_number, ideas)
-        if decision.action == "approve":
-            return ideas
-        if decision.action == "stop":
-            return []
-        feedback, previous = decision.feedback, ideas
+            mark_executed(plan_path)
+            return ideas, plan_path
+        while True:
+            decision = await asyncio.to_thread(review, round_number, ideas, plan_path)
+            if decision.action == "stop":
+                return [], plan_path
+            if decision.action == "revise":
+                feedback, previous = decision.feedback, ideas
+                break
+            # Approve: the hand-edited plan file is the source of truth.
+            try:
+                parsed = parse_plan(plan_path)
+            except PlanError as exc:
+                console.print(
+                    f"[yellow]! {exc}[/yellow]\n"
+                    "Fix the plan file and approve again, or give feedback / stop."
+                )
+                continue
+            _apply_plan_overrides(config, parsed.overrides)
+            mark_executed(plan_path)
+            return parsed.ideas, plan_path
 
 
 async def run_research(
@@ -148,6 +196,7 @@ async def run_research(
     max_experiments: int | None = None,
     resume_store: RunStore | None = None,
     initial_ideas: list[Idea] | None = None,
+    initial_plan_path: Path | None = None,
     review: ReviewCallback | None = None,
 ) -> RunStore:
     if goal:
@@ -222,9 +271,10 @@ async def run_research(
             notes = store.notes_file.read_text() if store.notes_file.exists() else ""
             if round_number == 1 and initial_ideas:
                 ideas = initial_ideas[:count]
+                plan_path = initial_plan_path
             else:
-                ideas = await _propose_round(
-                    director, store, round_number, notes, count, review
+                ideas, plan_path = await _propose_round(
+                    director, store, config, round_number, notes, count, review
                 )
                 if not ideas:
                     console.print("[bold]Run ended at review.[/bold]")
@@ -281,6 +331,10 @@ async def run_research(
                         f"{config.metric.name}={attempt.metrics[config.metric.name]:.6f}"
                     )
                 store.save_attempt(attempt)
+            if plan_path is not None:
+                append_results(
+                    plan_path, [attempt for attempt, _ in results], config.metric.name
+                )
             reflection = await director.reflect([attempt for attempt, _ in results])
             store.append_note(f"Round {round_number}", reflection)
             for _, worker in results:

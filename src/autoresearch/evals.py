@@ -74,7 +74,7 @@ def worst_items(
     grouped["wmape"] = grouped["abs_error"] / grouped["actual_total"].clip(lower=1e-9)
     top = grouped.sort_values("abs_error", ascending=False).head(limit)
     return {
-        "total_items": int(len(grouped)),
+        "total_items": len(grouped),
         "worst": [
             {
                 "item": str(item),

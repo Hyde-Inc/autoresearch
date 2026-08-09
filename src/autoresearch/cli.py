@@ -21,7 +21,7 @@ from .models import Idea
 from .orchestrator import ReviewDecision, run_research, validate_baseline
 from .report import build_report
 from .skills import load_skills
-from .slash import SessionSettings, print_help
+from .slash import SessionSettings, parse_reply, print_help
 from .store import RunStore, latest_run
 
 app = typer.Typer(no_args_is_help=True, help="Parallel autonomous ML experimentation.")
@@ -162,26 +162,18 @@ def list_skills(
     console.print(table)
 
 
-_APPROVALS = {
-    "approve", "approved", "approve all", "go", "go ahead", "yes", "y", "ok", "okay",
-    "start", "run", "run it", "launch", "proceed", "do it", "ship it", "lgtm",
-    "looks good", "looks good to me", "sounds good",
-}
-_STOPS = {"stop", "quit", "exit", "end", "done", "no", "cancel", "abort"}
-
-
 def parse_review_reply(text: str) -> ReviewDecision:
     """Whole-message approval/stop phrases decide; anything else is revision feedback."""
-    normalized = " ".join(text.lower().replace("!", "").replace(".", "").split())
-    if normalized in _APPROVALS:
+    verdict = parse_reply(text)
+    if verdict == "approve":
         return ReviewDecision("approve")
-    if normalized in _STOPS:
+    if verdict == "stop":
         return ReviewDecision("stop")
     return ReviewDecision("revise", feedback=text)
 
 
-def review_round(round_number: int, ideas: list[Idea]) -> ReviewDecision:
-    """Console review gate: show the proposed round, collect the human verdict."""
+def review_round(round_number: int, ideas: list[Idea], plan_path: Path) -> ReviewDecision:
+    """Console review gate: show the proposed round and its editable plan file."""
     table = Table(title=f"Proposed round {round_number} ({len(ideas)} researches in parallel)")
     for column in ("#", "Experiment", "Hypothesis", "Skills"):
         table.add_column(column)
@@ -191,8 +183,13 @@ def review_round(round_number: int, ideas: list[Idea]) -> ReviewDecision:
         )
     console.print(table)
     console.print(
-        "[bold]Review:[/bold] type [green]approve[/green] to launch, [red]stop[/red] to end "
-        "the run, or feedback to revise the proposal."
+        Panel(
+            f"[bold]{plan_path}[/bold]\n"
+            "Edit the file freely - the edited file is exactly what runs.\n"
+            "Reply [green]execute[/green] to launch, [red]stop[/red] to end the run, or "
+            "give feedback to revise the plan.",
+            title=f"Round {round_number} plan written",
+        )
     )
     return parse_review_reply(input_box(console))
 
@@ -214,12 +211,15 @@ def start(
     console.print(f"Project: [bold]{repo}[/bold]")
     console.print(
         Panel(
-            "The Research Director explores your project itself. Set the two things it "
-            "needs with slash commands or just say them:\n"
+            "The Research Director surveys your project itself. Set what it needs with "
+            "slash commands or just say it:\n"
             "  [bold cyan]/goal[/bold cyan] reduce wmape        "
             "[bold cyan]/baseline[/bold cyan] models/arima.py\n"
-            "Once both are clear it locks in, evaluates the baseline, and starts round 1. "
-            "After each round you review its next proposals before they run.",
+            "Once goal, baseline, and metric are settled it evaluates the baseline and "
+            "writes the round-1 research plan to an editable markdown file in "
+            ".autoresearch/plans/. You edit it, type execute, and the round runs. Every "
+            "round gets its own plan file with results appended - a lab notebook of all "
+            "the research ever tried.",
             title="Research setup",
         )
     )
@@ -233,6 +233,9 @@ def start(
     except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
         console.print(f"[bold red]Setup failed:[/bold red] {exc}")
         raise typer.Exit(1) from None
+    if not ideas:
+        console.print("Setup ended without launching. Nothing is running.")
+        return
 
     assert session.config_path is not None
     try:
@@ -240,6 +243,7 @@ def start(
             run_research(
                 load_config(session.config_path),
                 initial_ideas=ideas,
+                initial_plan_path=session.plan_path,
                 review=review_round,
             )
         )

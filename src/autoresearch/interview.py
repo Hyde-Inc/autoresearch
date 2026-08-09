@@ -31,9 +31,18 @@ from .discover import read_repo_file, render_inventory, repo_inventory
 from .metrics import MetricInterpreter, MetricSpec, MetricValidation, adopt_spec, eval_columns
 from .models import Idea
 from .orchestrator import validate_baseline
+from .plans import (
+    PlanError,
+    mark_executed,
+    next_plan_path,
+    parse_plan,
+    plans_dir_for_task,
+    render_plan,
+)
 from .prepare import prepare_workspace, write_baseline
 from .skills import ResearchSkill, load_skills
-from .slash import SessionSettings, handle_slash
+from .slash import MAX_PARALLEL, MIN_PARALLEL, SessionSettings, handle_slash, parse_reply
+from .survey import cached_survey, survey_repo
 
 MAX_TOOL_ROUNDS = 16
 
@@ -240,9 +249,10 @@ TOOLS = [
         ["text"],
     ),
     _tool(
-        "start_research",
-        "Launch the autonomous research run with the approved round-1 experiment plan. Call "
-        "only after the user approved the plan.",
+        "write_plan",
+        "Write the round-1 research plan to an editable markdown file in the project's "
+        ".autoresearch/plans/ folder. The user reviews and edits that file, then replies "
+        "'execute' to launch; calling this again rewrites the same file with your revision.",
         {"ideas": _IDEA_SCHEMA},
         ["ideas"],
     ),
@@ -259,7 +269,7 @@ _TOOL_LABELS = {
     "replace_baseline": "installing your baseline script",
     "evaluate_baseline": "running the protected baseline evaluation",
     "record_context": "recording that in the task context",
-    "start_research": "preparing the research run",
+    "write_plan": "writing the research plan file",
 }
 
 _RUNTIME_CONTRACT = """\
@@ -300,10 +310,13 @@ class SetupSession:
         else:
             model = DEFAULT_MODEL
             temperature = 0.35
+        self.director_model = model
         self.chat = StreamingChat(client, model.removeprefix("openrouter/"), temperature)
         self.skills: list[ResearchSkill] = load_skills(self.config)
         self.pending_spec: MetricSpec | None = None
         self.final_ideas: list[Idea] | None = None
+        self.survey: str | None = cached_survey(self.repo)
+        self.plan_path: Path | None = None
 
     def _reload(self) -> None:
         assert self.config_path is not None
@@ -334,14 +347,21 @@ class SetupSession:
             f"Current settings:\n{self.settings.describe()}\n\n"
         )
         if self.config is None:
+            findings = f"Project inventory:\n{render_inventory(repo_inventory(self.repo))}"
+            if self.survey:
+                findings = (
+                    "Repository survey (a coding agent explored the project and wrote this "
+                    f"report):\n{self.survey}\n\n{findings}"
+                )
             flow = (
                 "No task workspace exists yet. Three things must be settled before research "
                 "can start: the goal, the baseline model, and the evaluation metric. "
                 "Everything else you decide yourself.\n\n"
                 "Your flow:\n"
-                "1. Explore the project yourself: read the README and model code with "
-                "read_file, profile candidate data files with explore_data. Identify the "
-                "training data, its id/date/target columns, and what models already exist.\n"
+                "1. Start from the repository survey below; verify anything load-bearing or "
+                "surprising with read_file and profile the data with explore_data. Identify "
+                "the training data, its id/date/target columns, and what models already "
+                "exist.\n"
                 "2. If the goal or baseline is still unclear after exploring, ask about that "
                 "one thing, sharing what you found in the project while you do. If a "
                 "settings note already pins them, they are decided.\n"
@@ -373,13 +393,18 @@ class SetupSession:
                 "guardrails) plus the business context you learned.\n"
                 f"   f. Propose exactly {self.settings.n_agents} round-1 experiment(s), "
                 "each a single testable change, citing which skills informed it, and call "
-                "start_research immediately with the ideas (fields: title, hypothesis, "
-                "instructions, category, skills_used). Announce the plan as you launch; do "
-                "not wait for approval - locking in was the approval.\n\n"
-                "Never call start_research until a requested custom metric has been adopted.\n\n"
-                "After round 1 you will analyze results and propose the next round, which "
-                "the user reviews before it runs.\n\n"
-                f"Project inventory:\n{render_inventory(repo_inventory(self.repo))}\n\n"
+                "write_plan with the ideas (fields: title, hypothesis, instructions, "
+                "category, skills_used). This saves the plan as an editable markdown file. "
+                "After calling it, tell the user in one short message where the plan file "
+                "is and that they can edit it freely, then reply 'execute' to launch, give "
+                "feedback to revise, or 'stop'. Do not launch anything yourself - the "
+                "launch happens when they say execute.\n\n"
+                "If the user gives feedback on the plan, revise the ideas and call "
+                "write_plan again; it rewrites the same file.\n"
+                "Never call write_plan until a requested custom metric has been adopted.\n\n"
+                "After round 1 you will analyze results and write the next round's plan, "
+                "which the user reviews the same way before it runs.\n\n"
+                f"{findings}\n\n"
             )
         else:
             seed = self.config.resolve(self.config.workspace.seed)
@@ -407,8 +432,10 @@ class SetupSession:
                 "the numbers for the user in one or two sentences.\n"
                 f"4. Propose a round-1 plan of exactly {self.settings.n_agents} "
                 "experiment(s), each a single testable change, citing which skills informed "
-                "it. Once the user approves, call start_research with the ideas (fields: "
-                "title, hypothesis, instructions, category, skills_used).\n\n"
+                "it, and call write_plan with the ideas (fields: title, hypothesis, "
+                "instructions, category, skills_used). Tell the user where the plan file "
+                "is; they edit it and reply 'execute' to launch, give feedback to revise "
+                "(call write_plan again), or 'stop'.\n\n"
                 f"Current task config:\n{self.config.config_path.read_text()}\n"
                 f"Training data profile:\n{json.dumps(data_profile(self.config))}\n\n"
                 f"Agent task contract (TASK.md):\n{contract}\n\n"
@@ -596,13 +623,13 @@ class SetupSession:
         self._reload()
         return {"ok": True}
 
-    def _tool_start_research(self, ideas: list[dict]) -> dict:
+    def _tool_write_plan(self, ideas: list[dict]) -> dict:
         config = self._require_config()
         if self.settings.metric_description and config.metric.definition is None:
             return {
                 "error": "a custom metric was requested but has not been adopted yet; call "
                 "define_custom_metric, get the user's confirmation, then adopt_custom_metric "
-                "before launching",
+                "before writing the plan",
             }
         if not ideas:
             return {"error": "provide at least one experiment idea"}
@@ -612,14 +639,95 @@ class SetupSession:
             idea = Idea.model_validate(item)
             idea.skills_used = [name for name in idea.skills_used if name in known]
             parsed.append(idea)
-        self.final_ideas = parsed[: self.settings.n_agents]
-        table = Table(title="Approved round 1")
-        for column in ("Experiment", "Hypothesis", "Skills"):
+        parsed = parsed[: self.settings.n_agents]
+        if self.plan_path is None:
+            self.plan_path = next_plan_path(plans_dir_for_task(config.root), round_number=1)
+        self.plan_path.write_text(
+            render_plan(
+                round_number=1,
+                ideas=parsed,
+                goal=self.settings.goal or config.goal,
+                metric=config.metric.name,
+                baseline=self.settings.baseline_path or "",
+                n_agents=len(parsed),
+                guardrails=config.guardrails,
+                timeout_s=self.settings.timeout_s,
+            )
+        )
+        table = Table(title=f"Proposed round 1 ({len(parsed)} researches in parallel)")
+        for column in ("#", "Experiment", "Hypothesis", "Skills"):
             table.add_column(column)
-        for idea in self.final_ideas:
-            table.add_row(idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-")
+        for index, idea in enumerate(parsed, 1):
+            table.add_row(
+                str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-"
+            )
         self.console.print(table)
-        return {"ok": True, "experiments": len(self.final_ideas)}
+        self.console.print(
+            Panel(
+                f"[bold]{self.plan_path}[/bold]\n"
+                "Edit the file freely - reword, delete, or add experiments. The edited file "
+                "is exactly what runs.\n"
+                "Reply [green]execute[/green] to launch, [red]stop[/red] to end, or give "
+                "feedback to revise the plan.",
+                title="Research plan written",
+            )
+        )
+        return {
+            "ok": True,
+            "plan_path": str(self.plan_path),
+            "experiments": len(parsed),
+            "next": "tell the user where the plan file is and wait for execute/feedback/stop",
+        }
+
+    def _apply_plan_overrides(self, overrides: dict) -> None:
+        """Fold the human's frontmatter edits back into settings and the task config."""
+        if overrides.get("goal"):
+            self.settings.goal = str(overrides["goal"])
+        if overrides.get("n_agents"):
+            self.settings.n_agents = max(
+                MIN_PARALLEL, min(int(overrides["n_agents"]), MAX_PARALLEL)
+            )
+        if overrides.get("guardrails"):
+            self.settings.guardrails = [str(item) for item in overrides["guardrails"]]
+        if overrides.get("timeout_s"):
+            self.settings.timeout_s = max(60, int(overrides["timeout_s"]))
+        config = self._require_config()
+        raw = yaml.safe_load(config.config_path.read_text())
+        if self.settings.goal:
+            raw["goal"] = self.settings.goal
+        raw["guardrails"] = self.settings.guardrails
+        agents = raw.get("agents") or {}
+        agents["count"] = self.settings.n_agents
+        agents["timeout_s"] = self.settings.timeout_s
+        raw["agents"] = agents
+        metric = overrides.get("metric")
+        current = raw.get("metric") or {}
+        if (
+            metric in {"wmape", "mape", "rmse", "bias_pct"}
+            and not current.get("definition")
+        ):
+            raw["metric"] = {"name": metric, "direction": "min"}
+        config.config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+        self._reload()
+
+    def ensure_survey(self) -> None:
+        """Have opencode survey the repo once; fall back to the static inventory."""
+        if self.config is not None or self.survey:
+            return
+        self.console.print(
+            "[dim]Sending a coding agent to survey the repository "
+            "(takes a minute or two on the first run)...[/dim]"
+        )
+        try:
+            self.survey = survey_repo(self.repo, self.director_model)
+        except Exception as exc:  # noqa: BLE001 - survey is best-effort
+            self.console.print(f"[dim]Survey skipped ({exc}); using a static inventory.[/dim]")
+            self.survey = None
+            return
+        if self.survey:
+            self.console.print("[dim]Survey saved to .autoresearch/survey.md[/dim]")
+        else:
+            self.console.print("[dim]opencode unavailable; using a static inventory.[/dim]")
 
     def next_user_message(self) -> str:
         """Read input, applying slash commands locally until a chat message arrives."""
@@ -634,7 +742,38 @@ class SetupSession:
             if result.note:
                 notes.append(result.note)
 
+    def _gate_user_message(self) -> str | None:
+        """Next message for the director, or None when the plan gate resolved the session.
+
+        Once a plan file exists, 'execute' parses the (possibly hand-edited) file and
+        ends setup with the final ideas; 'stop' ends with none; anything else is
+        feedback passed through to the director.
+        """
+        while True:
+            text = self.next_user_message()
+            if self.plan_path is None:
+                return text
+            verdict = parse_reply(text)
+            if verdict == "revise":
+                return text
+            if verdict == "stop":
+                self.final_ideas = []
+                return None
+            try:
+                parsed = parse_plan(self.plan_path)
+            except PlanError as exc:
+                self.console.print(
+                    f"[yellow]! {exc}[/yellow]\n"
+                    "Fix the plan file and type execute again, or give feedback to revise it."
+                )
+                continue
+            self._apply_plan_overrides(parsed.overrides)
+            mark_executed(self.plan_path)
+            self.final_ideas = parsed.ideas
+            return None
+
     def run(self) -> list[Idea]:
+        self.ensure_survey()
         first = self.next_user_message()
         messages: list[dict] = [
             {"role": "system", "content": self.system_prompt()},
@@ -668,8 +807,9 @@ class SetupSession:
                             "content": json.dumps(result),
                         }
                     )
-                if self.final_ideas is not None:
-                    return self.final_ideas
                 continue
             tool_rounds = 0
-            messages.append({"role": "user", "content": self.next_user_message()})
+            reply = self._gate_user_message()
+            if reply is None:
+                return self.final_ideas or []
+            messages.append({"role": "user", "content": reply})
