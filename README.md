@@ -67,6 +67,18 @@ The moment both are clear the director locks in: it builds the protected workspa
 pinned model as the incumbent baseline, evaluates it, and launches the first round of parallel
 researches. No approvals, no config files.
 
+Different teams score forecasts differently, so the metric is a first-class step too. Pass a
+standard name or describe your own objective in plain English:
+
+```
+/metric penalize under-forecasting twice as much as over-forecasting
+```
+
+The director restates the metric, shows a hand-worked example with the exact grader code it will
+use, and self-checks that the code reproduces the worked number. You confirm with `yes` (or ask
+for changes), and from then on every experiment is scored and promoted on that metric. A custom
+metric must be confirmed before the run can launch.
+
 After each round the director analyzes the results (worst SKUs, weekday bias, horizon decay) and
 proposes 2-5 new researches to run in parallel. You review them in the same chat: type `approve`
 to launch the round, give feedback to revise the proposal, or `stop` to end the run.
@@ -85,7 +97,7 @@ chat, Cursor/Claude style:
 | `/goal <text>` | what the research must improve |
 | `/baseline <path>` | pin an existing model script as the baseline |
 | `/n_agents <1-5>` | parallel researches per round |
-| `/metric <name>` | wmape, mape, rmse, or bias_pct |
+| `/metric <name\|description>` | wmape, mape, rmse, bias_pct - or describe a custom metric in plain English |
 | `/guardrail <expr>` | add a guardrail, e.g. `bias_pct within -8..8` |
 | `/rounds <n>` | maximum research rounds |
 | `/timeout <seconds>` | per-experiment coding agent timeout |

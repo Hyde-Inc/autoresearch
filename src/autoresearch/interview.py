@@ -69,7 +69,9 @@ def apply_brief(config: TaskConfig, brief: ResearchBrief) -> None:
     raw["context"] = brief.context
     raw["guardrails"] = brief.guardrails
     raw["idea_hints"] = brief.idea_hints
-    if brief.metric_name and not brief.metric_description:
+    current = raw.get("metric") or {}
+    # Never clobber an already-adopted custom metric (it carries a definition path).
+    if not current.get("definition") and brief.metric_name and not brief.metric_description:
         raw["metric"] = {"name": brief.metric_name, "direction": "min"}
     config.config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
 
@@ -333,9 +335,9 @@ class SetupSession:
         )
         if self.config is None:
             flow = (
-                "No task workspace exists yet. Two things must be clear before research can "
-                "start: the goal and the baseline model. Everything else you decide "
-                "yourself.\n\n"
+                "No task workspace exists yet. Three things must be settled before research "
+                "can start: the goal, the baseline model, and the evaluation metric. "
+                "Everything else you decide yourself.\n\n"
                 "Your flow:\n"
                 "1. Explore the project yourself: read the README and model code with "
                 "read_file, profile candidate data files with explore_data. Identify the "
@@ -343,26 +345,38 @@ class SetupSession:
                 "2. If the goal or baseline is still unclear after exploring, ask about that "
                 "one thing, sharing what you found in the project while you do. If a "
                 "settings note already pins them, they are decided.\n"
-                "3. The moment both goal and baseline are clear, LOCK IN and run the whole "
-                "launch sequence without asking for permission at any step:\n"
+                "3. Settle the metric BEFORE locking in. The standard metrics (wmape, mape, "
+                "rmse, bias_pct) need no confirmation. But if the user asked for a custom "
+                "metric (see the settings note) or the goal implies an asymmetric or "
+                "weighted objective - for example penalizing under-forecasting more than "
+                "over-forecasting - call define_custom_metric with a faithful description, "
+                "show the plain-English restatement, the hand-worked example, and the "
+                "verification checks, and get an explicit yes. Re-run define_custom_metric if "
+                "they want changes. Do not move on until a requested custom metric is "
+                "confirmed by the user.\n"
+                "4. The moment goal, baseline, and metric are settled, LOCK IN and run the "
+                "whole launch sequence without asking for permission at any step:\n"
                 "   a. Call prepare_workspace, stating your setup choices (data file, "
                 "columns, validation and holdout horizon matched to the business forecast "
                 "horizon) as brief facts.\n"
-                "   b. Call write_baseline. Port the pinned baseline script faithfully so "
+                "   b. If the user confirmed a custom metric, call adopt_custom_metric now so "
+                "the baseline and every experiment are scored with it.\n"
+                "   c. Call write_baseline. Port the pinned baseline script faithfully so "
                 "the research has to beat the user's current approach. If no baseline is "
                 "pinned and none exists in the repo, run the EDA you need (seasonality, "
                 "intermittency, drivers) and choose a simple, robust first model from your "
                 "skills; tell the user why.\n"
-                "   c. Call evaluate_baseline and interpret the numbers in one or two "
+                "   d. Call evaluate_baseline and interpret the numbers in one or two "
                 "sentences. If evaluation errors, fix the code with write_baseline and "
                 "retry.\n"
-                "   d. Call finalize_brief using the settings above (goal, metric, "
+                "   e. Call finalize_brief using the settings above (goal, metric, "
                 "guardrails) plus the business context you learned.\n"
-                f"   e. Propose exactly {self.settings.n_agents} round-1 experiment(s), "
+                f"   f. Propose exactly {self.settings.n_agents} round-1 experiment(s), "
                 "each a single testable change, citing which skills informed it, and call "
                 "start_research immediately with the ideas (fields: title, hypothesis, "
                 "instructions, category, skills_used). Announce the plan as you launch; do "
                 "not wait for approval - locking in was the approval.\n\n"
+                "Never call start_research until a requested custom metric has been adopted.\n\n"
                 "After round 1 you will analyze results and propose the next round, which "
                 "the user reviews before it runs.\n\n"
                 f"Project inventory:\n{render_inventory(repo_inventory(self.repo))}\n\n"
@@ -532,9 +546,18 @@ class SetupSession:
         return {"ok": True, "saved_to": str(self.config_path)}
 
     def _tool_define_custom_metric(self, description: str) -> dict:
-        config = self._require_config()
-        interpreter = MetricInterpreter(config.director.model, config.director.temperature)
-        spec, validation = asyncio.run(interpreter.interpret(description, eval_columns(config)))
+        # Runnable before the workspace exists so the metric can be confirmed up front.
+        # The worked-example verification does not need the real data; columns are advisory.
+        if self.config is not None:
+            model = self.config.director.model
+            temperature = self.config.director.temperature
+            columns = eval_columns(self.config)
+        else:
+            model = DEFAULT_MODEL
+            temperature = 0.35
+            columns = ["actual", "forecast"]
+        interpreter = MetricInterpreter(model, temperature)
+        spec, validation = asyncio.run(interpreter.interpret(description, columns))
         self.pending_spec = spec
         print_spec(self.console, spec, validation)
         return {
@@ -574,7 +597,13 @@ class SetupSession:
         return {"ok": True}
 
     def _tool_start_research(self, ideas: list[dict]) -> dict:
-        self._require_config()
+        config = self._require_config()
+        if self.settings.metric_description and config.metric.definition is None:
+            return {
+                "error": "a custom metric was requested but has not been adopted yet; call "
+                "define_custom_metric, get the user's confirmation, then adopt_custom_metric "
+                "before launching",
+            }
         if not ideas:
             return {"error": "provide at least one experiment idea"}
         known = {skill.name for skill in self.skills}

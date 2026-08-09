@@ -22,7 +22,7 @@ class ModelConfig(BaseModel):
 
 class AgentConfig(ModelConfig):
     count: int = Field(default=3, ge=1)
-    timeout_s: int = Field(default=900, ge=1)
+    timeout_s: int = Field(default=1200, ge=1)
 
 
 class BudgetConfig(BaseModel):

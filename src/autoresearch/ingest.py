@@ -380,7 +380,7 @@ def ingest_csv(
         "secondary_metrics": ["mape", "rmse", "bias_pct", "runtime_s"],
         "guardrails": ["runtime_s<=600"],
         "director": {"model": DEFAULT_MODEL, "temperature": 0.35},
-        "agents": {"model": DEFAULT_MODEL, "count": 3, "timeout_s": 900},
+        "agents": {"model": DEFAULT_MODEL, "count": 3, "timeout_s": 1200},
         "budget": {"max_experiments": 12, "train_timeout_s": 600, "rounds": 4},
         "data": {
             "train": "seed/data/train.parquet",
