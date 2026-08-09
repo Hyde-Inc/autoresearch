@@ -25,18 +25,20 @@ editable plan files.
    from the agents, then writes the baseline itself: if your repo already has a model, it ports
    it faithfully so the research has to beat your current approach; if there is no model, it
    picks a first model from the EDA and its demand forecasting skills.
-4. Each research session gets its own folder under `.autoresearch/plans/`. The director writes
-   its round-1 proposal there as `round-1.md` - like a coding agent's plan mode. You edit the
-   file freely (reword hypotheses, delete or add experiments, change frontmatter), then type
-   `execute`. The edited file is exactly what runs.
+4. Each research session gets its own numbered, goal-named folder under the visible `research/`
+   directory, e.g. `research/001-reduce-wmape/`. The director writes its round-1 proposal there
+   as `round-1-plan.md` and pops it open in your editor - like a coding agent's plan mode. You
+   edit the file freely (reword hypotheses, delete or add experiments, change frontmatter), then
+   type `execute`. The edited file is exactly what runs.
 5. Each OpenCode agent gets its own git worktree and edits only `solution/`. A protected
    evaluator checks WMAPE, MAPE, RMSE, bias, runtime, and hidden holdout results, and the best
    valid experiment is promoted.
-6. After the round, the findings land next to the plan as `round-1-findings.md` (per-experiment
-   scores plus the director's reflection), and the director writes `round-2.md` (2-5 parallel
-   researches) after studying the errors of past attempts (worst SKUs, weekday bias, horizon
-   decay) and the data itself. Each approval starts the next round, and the session folder
-   becomes a lab notebook of all the research tried and how it scored.
+6. After the round, the findings open on your screen as `round-1-findings.md` (per-experiment
+   scores plus the director's reflection), and the director writes `round-2-plan.md` (2-5
+   parallel researches) after studying the errors of past attempts (worst SKUs, weekday bias,
+   horizon decay) and the data itself. Each approval starts the next round. The session's
+   `README.md` indexes every round with its status, so the folder reads like a lab notebook of
+   all the research tried and how it scored.
 
 ## Setup
 
@@ -78,9 +80,9 @@ go
 
 The moment both are clear the director locks in: it builds the protected workspace, ports your
 pinned model as the incumbent baseline, evaluates it, and writes the round-1 research plan to a
-new session folder, e.g. `.autoresearch/plans/2026-08-09-1151/round-1.md`. Open that file, edit
-anything, and reply `execute` to launch the round - or give feedback to have the plan
-rewritten, or `stop`.
+new session folder, e.g. `research/001-reduce-wmape/round-1-plan.md` - the file opens in your
+editor automatically. Edit anything, and reply `execute` to launch the round - or give feedback
+to have the plan rewritten, or `stop`.
 
 Different teams score forecasts differently, so the metric is a first-class step too. Pass a
 standard name or describe your own objective in plain English:
@@ -94,10 +96,12 @@ use, and self-checks that the code reproduces the worked number. You confirm wit
 for changes), and from then on every experiment is scored and promoted on that metric. A custom
 metric must be confirmed before the run can launch.
 
-After each round a findings file (`round-N-findings.md`) lands next to the plan with
-per-experiment scores and the director's reflection, and the director writes the next round's
-plan (2-5 parallel researches) after analyzing what failed and why. The gate is the same every
-time: edit the plan file if you want, then `execute`, feedback, or `stop`.
+After each round a findings file (`round-N-findings.md`) lands next to the plan - and opens on
+your screen - with per-experiment scores and the director's reflection, and the director writes
+the next round's plan (2-5 parallel researches) after analyzing what failed and why. The gate is
+the same every time: edit the plan file if you want, then `execute`, feedback, or `stop`. Files
+auto-open via the `cursor`/`code` CLI or the OS default; set `AUTORESEARCH_NO_OPEN=1` to turn
+that off.
 
 To see the no-baseline path, delete `models/` from the demo repo and start again: the director
 runs EDA (seasonality, intermittency, promo/price drivers) and bootstraps a first model from its

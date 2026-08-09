@@ -12,6 +12,7 @@ from rich.console import Console
 
 from .config import TaskConfig
 from .director import ResearchDirector
+from .editor import open_in_editor
 from .harness import Evaluation, evaluate
 from .models import Attempt, Idea
 from .plans import (
@@ -21,6 +22,7 @@ from .plans import (
     parse_plan,
     plan_path,
     plans_dir_for_task,
+    refresh_session_readme,
     render_plan,
     write_findings,
 )
@@ -166,9 +168,11 @@ async def _propose_round(
                 analysis=list(director.last_analysis),
             )
         )
+        refresh_session_readme(session_dir)
         if review is None:
             mark_executed(plan_file)
             return ideas, plan_file
+        open_in_editor(plan_file)
         while True:
             decision = await asyncio.to_thread(review, round_number, ideas, plan_file)
             if decision.action == "stop":
@@ -251,7 +255,7 @@ async def run_research(
         completed = 0
         round_number = 0
     if session_dir is None:
-        session_dir = new_session_dir(plans_dir_for_task(config.root))
+        session_dir = new_session_dir(plans_dir_for_task(config.root), config.goal)
     if not resume_store:
         store.save_state(
             {
@@ -292,7 +296,9 @@ async def run_research(
                     break
                 ideas = ideas[: maximum - completed]
             count = len(ideas)
-            console.print(f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments")
+            console.print(
+                f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments"
+            )
             jobs = []
             for idea in ideas:
                 attempt_id = uuid.uuid4().hex[:8]
@@ -345,12 +351,15 @@ async def run_research(
             reflection = await director.reflect([attempt for attempt, _ in results])
             store.append_note(f"Round {round_number}", reflection)
             if plan_file is not None:
-                write_findings(
+                findings_file = write_findings(
                     plan_file,
                     [attempt for attempt, _ in results],
                     config.metric.name,
                     reflection,
                 )
+                if findings_file is not None and review is not None:
+                    console.print(f"[dim]Findings written to {findings_file}[/dim]")
+                    open_in_editor(findings_file)
             for _, worker in results:
                 await remove_worktree(repo, worker)
             store.save_state(

@@ -32,7 +32,7 @@ def _config(tmp_path: Path):
     path = task_root / "task.yaml"
     path.write_text(yaml.safe_dump({"name": "t", "goal": "reduce wmape"}))
     config = load_config(path)
-    session_dir = new_session_dir(plans_dir_for_task(config.root), name="session")
+    session_dir = new_session_dir(plans_dir_for_task(config.root), config.goal)
     return config, session_dir
 
 
@@ -69,8 +69,8 @@ def test_review_approve_runs_the_plan_file(tmp_path: Path) -> None:
     assert director.calls[0]["count"] is None
     # The plan file lives in the session folder and is marked executed.
     assert plan_file == seen["plan_path"]
-    assert plan_file == session_dir / "round-2.md"
-    assert session_dir.parent == tmp_path / "repo" / ".autoresearch" / "plans"
+    assert plan_file == session_dir / "round-2-plan.md"
+    assert session_dir == tmp_path / "repo" / "research" / "001-reduce-wmape"
     assert "status: executed" in plan_file.read_text()
 
 
@@ -104,7 +104,13 @@ def test_review_feedback_revises_then_approves(tmp_path: Path) -> None:
 
     ideas, plan_file = asyncio.run(
         _propose_round(
-            director, store, config, session_dir, 3, "", 3,
+            director,
+            store,
+            config,
+            session_dir,
+            3,
+            "",
+            3,
             review=lambda r, i, p: next(decisions),
         )
     )
@@ -112,7 +118,7 @@ def test_review_feedback_revises_then_approves(tmp_path: Path) -> None:
     assert director.calls[1]["feedback"] == "drop the ensemble"
     assert [idea.title for idea in director.calls[1]["previous"]] == ["first"]
     # The revision rewrote the same plan file rather than creating a second one.
-    assert len(list(plan_file.parent.glob("*.md"))) == 1
+    assert len(list(plan_file.parent.glob("round-*-plan.md"))) == 1
 
 
 def test_review_stop_ends_run(tmp_path: Path) -> None:
@@ -121,7 +127,13 @@ def test_review_stop_ends_run(tmp_path: Path) -> None:
     director = StubDirector([[_idea("a"), _idea("b")]])
     ideas, _ = asyncio.run(
         _propose_round(
-            director, store, config, session_dir, 2, "", 3,
+            director,
+            store,
+            config,
+            session_dir,
+            2,
+            "",
+            3,
             review=lambda r, i, p: ReviewDecision("stop"),
         )
     )

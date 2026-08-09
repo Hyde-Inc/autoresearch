@@ -127,9 +127,7 @@ def ingest(
 @app.command()
 def metric(
     config: ConfigOption,
-    description: Annotated[
-        str, typer.Argument(help="Plain-English evaluation metric")
-    ],
+    description: Annotated[str, typer.Argument(help="Plain-English evaluation metric")],
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
     """Create and verify a custom metric from plain English."""
@@ -178,13 +176,11 @@ def review_round(round_number: int, ideas: list[Idea], plan_path: Path) -> Revie
     for column in ("#", "Experiment", "Hypothesis", "Skills"):
         table.add_column(column)
     for index, idea in enumerate(ideas, 1):
-        table.add_row(
-            str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-"
-        )
+        table.add_row(str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-")
     console.print(table)
     console.print(
         Panel(
-            f"[bold]{plan_path}[/bold]\n"
+            f"[bold]{plan_path}[/bold] (opened in your editor)\n"
             "Edit the file freely - the edited file is exactly what runs.\n"
             "Reply [green]execute[/green] to launch, [red]stop[/red] to end the run, or "
             "give feedback to revise the plan.",
@@ -216,10 +212,10 @@ def start(
             "  [bold cyan]/goal[/bold cyan] reduce wmape        "
             "[bold cyan]/baseline[/bold cyan] models/arima.py\n"
             "Once goal, baseline, and metric are settled it evaluates the baseline, opens "
-            "a session folder under .autoresearch/plans/, and writes the round-1 plan "
-            "there as an editable markdown file. You edit it, type execute, and the round "
-            "runs. Each round adds a plan file and a findings file to the session folder "
-            "- a lab notebook of all the research ever tried.",
+            "a session folder like research/001-reduce-wmape/, and pops the round-1 plan "
+            "open in your editor. You edit it, type execute, and the round runs. Each "
+            "round adds round-N-plan.md and round-N-findings.md there, indexed by the "
+            "session's README.md - a lab notebook of all the research ever tried.",
             title="Research setup",
         )
     )
@@ -249,8 +245,9 @@ def start(
             )
         )
     except KeyboardInterrupt:
-        console.print("\nRun interrupted. Resume later with: autoresearch resume -c "
-                      f"{session.config_path}")
+        console.print(
+            f"\nRun interrupted. Resume later with: autoresearch resume -c {session.config_path}"
+        )
         raise typer.Exit(130) from None
     except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
         console.print(f"[bold red]Research run failed:[/bold red] {exc}")
@@ -284,12 +281,17 @@ def leaderboard(
     metric = state.get("primary_metric", "wmape")
     table = Table(title=f"{state.get('task', 'Autoresearch')} leaderboard")
     for column in (
-        "Rank", "ID", "Experiment", "Skills", metric.upper(), "RMSE", "Holdout", "Promoted"
+        "Rank",
+        "ID",
+        "Experiment",
+        "Skills",
+        metric.upper(),
+        "RMSE",
+        "Holdout",
+        "Promoted",
     ):
         table.add_column(column)
-    for rank, item in enumerate(
-        store.leaderboard(metric, state.get("metric_direction", "min")), 1
-    ):
+    for rank, item in enumerate(store.leaderboard(metric, state.get("metric_direction", "min")), 1):
         table.add_row(
             str(rank),
             item.id,

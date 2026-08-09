@@ -7,3 +7,5 @@ __pycache__/
 runs/
 .autoresearch-stop
 sandbox/
+# lab notebooks written by demo runs; real users commit their own research/
+demo/*/research/

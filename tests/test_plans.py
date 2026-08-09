@@ -10,6 +10,7 @@ from autoresearch.plans import (
     parse_plan,
     plan_path,
     plans_dir_for_task,
+    refresh_session_readme,
     render_plan,
     write_findings,
 )
@@ -52,24 +53,43 @@ def test_render_parse_roundtrip(tmp_path: Path) -> None:
     assert parsed.overrides["timeout_s"] == 1200
 
 
-def test_session_folders_are_unique_and_hold_round_files(tmp_path: Path) -> None:
-    first = new_session_dir(tmp_path, name="2026-08-09-1200")
-    second = new_session_dir(tmp_path, name="2026-08-09-1200")
-    assert first != second and first.is_dir() and second.is_dir()
-    assert first.parent == tmp_path and second.parent == tmp_path
-    assert plan_path(first, 1).name == "round-1.md"
-    assert plan_path(first, 2).name == "round-2.md"
-    plan = plan_path(first, 1)
-    assert findings_path(plan).name == "round-1-findings.md"
+def test_session_folders_are_numbered_and_named_after_the_goal(tmp_path: Path) -> None:
+    first = new_session_dir(tmp_path, "Reduce WMAPE!")
+    second = new_session_dir(tmp_path, "Reduce WMAPE!")
+    third = new_session_dir(tmp_path)
+    assert first.name == "001-reduce-wmape"
+    assert second.name == "002-reduce-wmape"
+    assert third.name == "003-research"
+    assert first.parent == tmp_path and second.is_dir() and third.is_dir()
+    assert plan_path(first, 1).name == "round-1-plan.md"
+    assert plan_path(first, 2).name == "round-2-plan.md"
+    assert findings_path(plan_path(first, 1)).name == "round-1-findings.md"
 
 
-def test_plans_dir_lives_next_to_repo_tasks(tmp_path: Path) -> None:
+def test_plans_dir_is_visible_research_folder(tmp_path: Path) -> None:
     repo_task = tmp_path / "repo" / ".autoresearch" / "task"
     repo_task.mkdir(parents=True)
-    assert plans_dir_for_task(repo_task) == tmp_path / "repo" / ".autoresearch" / "plans"
+    assert plans_dir_for_task(repo_task) == tmp_path / "repo" / "research"
     standalone = tmp_path / "tasks" / "my-task"
     standalone.mkdir(parents=True)
-    assert plans_dir_for_task(standalone) == standalone / "plans"
+    assert plans_dir_for_task(standalone) == standalone / "research"
+
+
+def test_session_readme_indexes_rounds_with_status_and_links(tmp_path: Path) -> None:
+    session = new_session_dir(tmp_path, "reduce wmape")
+    idea = _idea("Global XGBoost")
+    plan = plan_path(session, 1)
+    plan.write_text(render_plan(round_number=1, ideas=[idea], goal="reduce wmape", metric="wmape"))
+    readme = refresh_session_readme(session)
+    text = readme.read_text()
+    assert "# Research session: reduce wmape" in text
+    assert "[round-1-plan.md](round-1-plan.md)" in text
+    assert "awaiting your review" in text
+    attempt = Attempt(id="a1", round=1, idea=idea, status="passed", metrics={"wmape": 0.1})
+    write_findings(plan, [attempt], "wmape", reflection="done")
+    text = readme.read_text()  # write_findings refreshes the README in place
+    assert "completed" in text
+    assert "[round-1-findings.md](round-1-findings.md)" in text
 
 
 def test_human_edits_survive(tmp_path: Path) -> None:

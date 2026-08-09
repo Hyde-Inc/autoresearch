@@ -28,6 +28,7 @@ from . import eda
 from .chat import StreamingChat, TurnRenderer, input_box
 from .config import DEFAULT_MODEL, TaskConfig, load_config
 from .discover import read_repo_file, render_inventory, repo_inventory
+from .editor import open_in_editor
 from .metrics import MetricInterpreter, MetricSpec, MetricValidation, adopt_spec, eval_columns
 from .models import Idea
 from .orchestrator import validate_baseline
@@ -38,6 +39,7 @@ from .plans import (
     parse_plan,
     plan_path,
     plans_dir_for_task,
+    refresh_session_readme,
     render_plan,
 )
 from .prepare import prepare_workspace, write_baseline
@@ -190,7 +192,14 @@ TOOLS = [
             "holdout_days": {"type": "integer", "minimum": 1},
             "name": {"type": "string", "description": "Optional task name"},
         },
-        ["train_data", "id_column", "date_column", "target_column", "validation_days", "holdout_days"],
+        [
+            "train_data",
+            "id_column",
+            "date_column",
+            "target_column",
+            "validation_days",
+            "holdout_days",
+        ],
     ),
     _tool(
         "write_baseline",
@@ -252,8 +261,9 @@ TOOLS = [
     _tool(
         "write_plan",
         "Write the round-1 research plan to an editable markdown file in the project's "
-        ".autoresearch/plans/ folder. The user reviews and edits that file, then replies "
-        "'execute' to launch; calling this again rewrites the same file with your revision.",
+        "research/ folder (it opens in the user's editor). The user reviews and edits that "
+        "file, then replies 'execute' to launch; calling this again rewrites the same file "
+        "with your revision.",
         {"ideas": _IDEA_SCHEMA},
         ["ideas"],
     ),
@@ -448,9 +458,7 @@ class SetupSession:
             + "Use record_context whenever the user shares a useful business fact such as "
             "current production performance.\n\n"
             "Guardrail expressions look like: rmse<=baseline*1.10, bias_pct within -8..8, "
-            "runtime_s<=600.\n\n"
-            + _RUNTIME_CONTRACT
-            + f"\n\nYour skill library:\n{skill_text}"
+            "runtime_s<=600.\n\n" + _RUNTIME_CONTRACT + f"\n\nYour skill library:\n{skill_text}"
         )
 
     def execute(self, name: str, arguments: dict) -> dict:
@@ -643,7 +651,9 @@ class SetupSession:
             parsed.append(idea)
         parsed = parsed[: self.settings.n_agents]
         if self.plan_path is None:
-            self.session_dir = new_session_dir(plans_dir_for_task(config.root))
+            self.session_dir = new_session_dir(
+                plans_dir_for_task(config.root), self.settings.goal or config.goal
+            )
             self.plan_path = plan_path(self.session_dir, round_number=1)
         self.plan_path.write_text(
             render_plan(
@@ -657,6 +667,8 @@ class SetupSession:
                 timeout_s=self.settings.timeout_s,
             )
         )
+        refresh_session_readme(self.session_dir)
+        opened = open_in_editor(self.plan_path)
         table = Table(title=f"Proposed round 1 ({len(parsed)} researches in parallel)")
         for column in ("#", "Experiment", "Hypothesis", "Skills"):
             table.add_column(column)
@@ -665,9 +677,11 @@ class SetupSession:
                 str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-"
             )
         self.console.print(table)
+        opened_note = "Opened in your editor.\n" if opened else ""
         self.console.print(
             Panel(
                 f"[bold]{self.plan_path}[/bold]\n"
+                f"{opened_note}"
                 "Edit the file freely - reword, delete, or add experiments. The edited file "
                 "is exactly what runs.\n"
                 "Reply [green]execute[/green] to launch, [red]stop[/red] to end, or give "
@@ -705,10 +719,7 @@ class SetupSession:
         raw["agents"] = agents
         metric = overrides.get("metric")
         current = raw.get("metric") or {}
-        if (
-            metric in {"wmape", "mape", "rmse", "bias_pct"}
-            and not current.get("definition")
-        ):
+        if metric in {"wmape", "mape", "rmse", "bias_pct"} and not current.get("definition"):
             raw["metric"] = {"name": metric, "direction": "min"}
         config.config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
         self._reload()
