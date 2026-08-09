@@ -44,6 +44,9 @@ async def run_opencode(
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        # opencode emits one JSON event per line and single events (tool results,
+        # snapshots) can far exceed asyncio's 64 KiB default line limit.
+        limit=16 * 1024 * 1024,
     )
     session_id: str | None = None
     error: str | None = None
@@ -70,4 +73,9 @@ async def run_opencode(
             process.kill()
             await process.wait()
         error = f"opencode exceeded {timeout_s}s timeout"
+    finally:
+        # Never leave an opencode agent running if the read loop failed.
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
     return OpenCodeResult(process.returncode or 0, session_id, error)

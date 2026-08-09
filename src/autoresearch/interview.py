@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -329,6 +330,8 @@ class SetupSession:
         self.survey: str | None = cached_survey(self.repo)
         self.session_dir: Path | None = None
         self.plan_path: Path | None = None
+        self._survey_thread: threading.Thread | None = None
+        self._survey_outcome: dict = {}
 
     def _reload(self) -> None:
         assert self.config_path is not None
@@ -365,15 +368,22 @@ class SetupSession:
                     "Repository survey (a coding agent explored the project and wrote this "
                     f"report):\n{self.survey}\n\n{findings}"
                 )
+            elif self.survey_pending:
+                findings = (
+                    "A coding agent is surveying the repository in the background; its "
+                    "report will appear in this context once ready. Do not wait for it or "
+                    "mention it - work from the inventory below and your read/EDA tools.\n\n"
+                    f"{findings}"
+                )
             flow = (
                 "No task workspace exists yet. Three things must be settled before research "
                 "can start: the goal, the baseline model, and the evaluation metric. "
                 "Everything else you decide yourself.\n\n"
                 "Your flow:\n"
-                "1. Start from the repository survey below; verify anything load-bearing or "
-                "surprising with read_file and profile the data with explore_data. Identify "
-                "the training data, its id/date/target columns, and what models already "
-                "exist.\n"
+                "1. Start from the repository findings below; verify anything load-bearing "
+                "or surprising with read_file and profile the data with explore_data. "
+                "Identify the training data, its id/date/target columns, and what models "
+                "already exist.\n"
                 "2. If the goal or baseline is still unclear after exploring, ask about that "
                 "one thing, sharing what you found in the project while you do. If a "
                 "settings note already pins them, they are decided.\n"
@@ -452,6 +462,11 @@ class SetupSession:
                 f"Training data profile:\n{json.dumps(data_profile(self.config))}\n\n"
                 f"Agent task contract (TASK.md):\n{contract}\n\n"
             )
+            if self.survey:
+                flow += (
+                    "Repository survey (a coding agent explored the original project):\n"
+                    f"{self.survey}\n\n"
+                )
         return (
             style
             + flow
@@ -724,24 +739,48 @@ class SetupSession:
         config.config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
         self._reload()
 
-    def ensure_survey(self) -> None:
-        """Have opencode survey the repo once; fall back to the static inventory."""
-        if self.config is not None or self.survey:
+    @property
+    def survey_pending(self) -> bool:
+        return self._survey_thread is not None
+
+    def start_survey(self) -> None:
+        """Send a coding agent to survey the repo in the background, Cursor-subagent
+        style: the chat opens immediately and the findings merge in when ready."""
+        if self.config is not None or self.survey or self._survey_thread:
             return
+
+        def work() -> None:
+            try:
+                self._survey_outcome["text"] = survey_repo(self.repo, self.director_model)
+            except Exception as exc:  # noqa: BLE001 - survey is best-effort
+                self._survey_outcome["error"] = str(exc)
+
+        self._survey_thread = threading.Thread(target=work, name="repo-survey", daemon=True)
+        self._survey_thread.start()
         self.console.print(
-            "[dim]Sending a coding agent to survey the repository "
-            "(takes a minute or two on the first run)...[/dim]"
+            "[dim]A coding agent is surveying the repository in the background - "
+            "start typing, its findings will be folded in when ready.[/dim]"
         )
-        try:
-            self.survey = survey_repo(self.repo, self.director_model)
-        except Exception as exc:  # noqa: BLE001 - survey is best-effort
-            self.console.print(f"[dim]Survey skipped ({exc}); using a static inventory.[/dim]")
-            self.survey = None
-            return
+
+    def poll_survey(self) -> bool:
+        """Collect a finished background survey. Returns True when new findings landed."""
+        if self._survey_thread is None or self._survey_thread.is_alive():
+            return False
+        self._survey_thread = None
+        self.survey = self._survey_outcome.get("text")
         if self.survey:
-            self.console.print("[dim]Survey saved to .autoresearch/survey.md[/dim]")
-        else:
-            self.console.print("[dim]opencode unavailable; using a static inventory.[/dim]")
+            self.console.print(
+                "[dim]Repo survey ready - report added to the director's context "
+                "(saved to .autoresearch/survey.md).[/dim]"
+            )
+            return True
+        error = self._survey_outcome.get("error")
+        reason = f"survey failed ({error})" if error else "the agent produced no report"
+        self.console.print(
+            f"[dim]Repo survey skipped: {reason}; the director continues with the "
+            "static inventory and its own tools.[/dim]"
+        )
+        return False
 
     def next_user_message(self) -> str:
         """Read input, applying slash commands locally until a chat message arrives."""
@@ -787,7 +826,7 @@ class SetupSession:
             return None
 
     def run(self) -> list[Idea]:
-        self.ensure_survey()
+        self.start_survey()
         first = self.next_user_message()
         messages: list[dict] = [
             {"role": "system", "content": self.system_prompt()},
@@ -795,6 +834,8 @@ class SetupSession:
         ]
         tool_rounds = 0
         while True:
+            if self.poll_survey():
+                messages[0] = {"role": "system", "content": self.system_prompt()}
             renderer = TurnRenderer(self.console)
             message = self.chat.turn(messages, renderer, tools=TOOLS)
             renderer.finish()

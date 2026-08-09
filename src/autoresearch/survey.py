@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -61,6 +62,14 @@ def _copy_repo(repo: Path, destination: Path) -> None:
         ignore=shutil.ignore_patterns(*SKIP_DIRS, ".*"),
         dirs_exist_ok=True,
     )
+    # Anchor opencode's project-root detection inside the sandbox: without a
+    # .git here it walks up and can end up surveying (and writing into) the
+    # wrong repository.
+    subprocess.run(
+        ["git", "init", "-q", str(destination)],
+        check=False,
+        capture_output=True,
+    )
 
 
 async def _survey(repo: Path, model: str, timeout_s: int, log_path: Path) -> str | None:
@@ -70,6 +79,8 @@ async def _survey(repo: Path, model: str, timeout_s: int, log_path: Path) -> str
         result = await run_opencode(workspace, _PROMPT, model, timeout_s, log_path)
         report = workspace / "SURVEY.md"
         if not report.is_file():
+            report = next(workspace.rglob("SURVEY.md"), None)
+        if report is None or not report.is_file():
             return None
         text = report.read_text().strip()
         if result.error and not text:

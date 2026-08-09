@@ -17,8 +17,9 @@ editable plan files.
 
 1. In a streamed chat you settle what to optimize: the goal, the baseline, and the metric
    (standard or custom, verified with a hand-worked example).
-2. An OpenCode agent surveys a throwaway copy of your repo - models, data files and columns,
-   evaluation conventions - and writes a findings report the director works from (cached at
+2. An OpenCode agent surveys a throwaway copy of your repo in the background - models, data
+   files and columns, evaluation conventions - while you chat; the chat opens instantly and
+   the findings fold into the director's context the moment they are ready (cached at
    `.autoresearch/survey.md`). The director verifies anything load-bearing with its own
    read/EDA tools instead of asking you where things live.
 3. It splits your history into train / validation / hidden holdout and seals the actuals away

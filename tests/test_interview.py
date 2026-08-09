@@ -1,4 +1,5 @@
 import io
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -215,6 +216,43 @@ def test_repo_session_explores_project_itself(tmp_path: Path) -> None:
         },
     )
     assert seasonality["daily_total_autocorrelation"]["lag_7"] > 0.9
+
+
+def test_survey_runs_in_background_and_folds_into_prompt(tmp_path: Path, monkeypatch) -> None:
+    release = threading.Event()
+
+    def slow_survey(repo, model):
+        release.wait(5)
+        return "# Repository survey\nmodels/baseline.py is the incumbent"
+
+    monkeypatch.setattr("autoresearch.interview.survey_repo", slow_survey)
+    session = SetupSession(object(), _console(), repo=_repo(tmp_path))
+    session.start_survey()
+    # The chat is usable immediately: survey pending, prompt says to work without it.
+    assert session.survey_pending
+    assert session.poll_survey() is False
+    prompt = session.system_prompt()
+    assert "surveying the repository in the background" in prompt
+    assert "Project inventory" in prompt
+    # When the agent finishes, one poll folds the report into the prompt.
+    release.set()
+    session._survey_thread.join(timeout=5)
+    assert session.poll_survey() is True
+    assert not session.survey_pending
+    assert "models/baseline.py is the incumbent" in session.system_prompt()
+
+
+def test_survey_failure_falls_back_to_inventory(tmp_path: Path, monkeypatch) -> None:
+    def boom(repo, model):
+        raise RuntimeError("opencode exploded")
+
+    monkeypatch.setattr("autoresearch.interview.survey_repo", boom)
+    session = SetupSession(object(), _console(), repo=_repo(tmp_path))
+    session.start_survey()
+    session._survey_thread.join(timeout=5)
+    assert session.poll_survey() is False
+    assert session.survey is None
+    assert "Project inventory" in session.system_prompt()
 
 
 def test_slash_commands_update_settings_and_prepend_notes(tmp_path: Path, monkeypatch) -> None:

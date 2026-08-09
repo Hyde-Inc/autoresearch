@@ -22,6 +22,9 @@ def test_survey_runs_opencode_on_a_copy_and_caches(tmp_path: Path, monkeypatch) 
         seen["cwd"] = cwd
         seen["had_autoresearch"] = (cwd / ".autoresearch").exists()
         seen["had_model"] = (cwd / "models" / "arima.py").exists()
+        # The sandbox must be a git repo so opencode anchors its project root
+        # here instead of escaping to a parent repository.
+        seen["had_git"] = (cwd / ".git").is_dir()
         (cwd / "SURVEY.md").write_text("# Repository survey\n\n## Models\nmodels/arima.py\n")
         return OpenCodeResult(0, "s1", None)
 
@@ -30,6 +33,7 @@ def test_survey_runs_opencode_on_a_copy_and_caches(tmp_path: Path, monkeypatch) 
     assert report is not None and "models/arima.py" in report
     # The agent worked on a throwaway copy, never the real repo...
     assert seen["cwd"] != repo
+    assert seen["had_git"] is True
     assert seen["had_model"] is True
     # ...and the copy excludes .autoresearch (protected splits live there).
     assert seen["had_autoresearch"] is False
