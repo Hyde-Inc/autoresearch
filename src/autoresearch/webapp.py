@@ -130,6 +130,10 @@ class StartRunRequest(BaseModel):
     goal: str | None = None
     parallel: int | None = None
     max_experiments: int | None = None
+    rounds: int | None = None
+    round_timeout_s: int | None = None
+    cost_limit_usd: float | None = None
+    tracks: list[str] = []
     guardrails: list[str] = []
 
 
@@ -166,6 +170,15 @@ def create_app(runs_root: Path, project_root: Path | None = None) -> FastAPI:
                         continue
                     state = _load_state(run_dir)
                     attempts = _load_attempts(run_dir)
+                    metric = state.get("primary_metric", "wmape")
+                    baseline = (state.get("baseline") or {}).get(metric)
+                    best = (state.get("incumbent") or {}).get(metric)
+                    improvement = (
+                        (baseline - best) / baseline
+                        if baseline and best is not None and baseline > 0
+                        else None
+                    )
+                    promoted = sum(1 for a in attempts if a.get("promoted"))
                     runs.append(
                         {
                             "run": run_dir.name,
@@ -174,7 +187,14 @@ def create_app(runs_root: Path, project_root: Path | None = None) -> FastAPI:
                             "completed": state.get("completed", len(attempts)),
                             "attempts": len(attempts),
                             "goal": state.get("goal", ""),
-                            "primary_metric": state.get("primary_metric", "wmape"),
+                            "primary_metric": metric,
+                            "created_at": state.get("created_at"),
+                            "run_config": state.get("run_config"),
+                            "total_cost_usd": state.get("total_cost_usd"),
+                            "baseline_metric": baseline,
+                            "best_metric": best,
+                            "improvement": improvement,
+                            "promoted": promoted,
                         }
                     )
                 if runs:
@@ -356,8 +376,16 @@ def create_app(runs_root: Path, project_root: Path | None = None) -> FastAPI:
             command += ["--goal", request.goal]
         if request.parallel:
             command += ["--parallel", str(request.parallel)]
+        if request.rounds:
+            command += ["--rounds", str(request.rounds)]
+        if request.round_timeout_s:
+            command += ["--round-timeout", str(request.round_timeout_s)]
+        if request.cost_limit_usd is not None:
+            command += ["--cost-limit", str(request.cost_limit_usd)]
         if request.max_experiments:
             command += ["--max-experiments", str(request.max_experiments)]
+        for focus in request.tracks:
+            command += ["--track", focus]
         for guardrail in request.guardrails:
             command += ["--guardrail", guardrail]
         log_file = project_root / "dashboard-run.log"

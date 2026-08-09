@@ -44,7 +44,18 @@ def run(
     guardrail: Annotated[
         list[str] | None, typer.Option("--guardrail", help="Additional guardrail expression")
     ] = None,
-    parallel: Annotated[int | None, typer.Option(min=1)] = None,
+    parallel: Annotated[int | None, typer.Option(min=1, help="Number of parallel agents")] = None,
+    rounds: Annotated[int | None, typer.Option(min=1, help="Number of sequential rounds")] = None,
+    round_timeout: Annotated[
+        int | None, typer.Option(min=1, help="Per-round time budget in seconds")
+    ] = None,
+    cost_limit: Annotated[
+        float | None, typer.Option(min=0, help="Total cost limit in USD")
+    ] = None,
+    track: Annotated[
+        list[str] | None,
+        typer.Option("--track", help="Per-agent focus (repeat once per agent)"),
+    ] = None,
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
     """Start a new autonomous research run."""
@@ -57,6 +68,10 @@ def run(
             guardrails=guardrail,
             parallel=parallel,
             max_experiments=max_experiments,
+            rounds=rounds,
+            round_timeout_s=round_timeout,
+            cost_limit_usd=cost_limit,
+            tracks=track,
         )
     )
     console.print(f"Run complete: [bold]{store.run_dir}[/bold]")

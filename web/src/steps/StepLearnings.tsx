@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import { SessionsSidebar } from "../components/SessionsSidebar";
 import type { Attempt, Note, RunState } from "../lib/api";
 import { api, fmtNum, fmtPct } from "../lib/api";
 import { StepShell } from "./StepShell";
@@ -7,11 +8,12 @@ import { StepShell } from "./StepShell";
 interface Props {
   task: string | null;
   run: string | null;
+  onSelectRun: (run: string) => void;
   onBack: () => void;
   onDone: () => void;
 }
 
-export function StepLearnings({ task, run, onBack, onDone }: Props): React.ReactElement {
+export function StepLearnings({ task, run, onSelectRun, onBack, onDone }: Props): React.ReactElement {
   const [report, setReport] = useState<string>("");
   const [notes, setNotes] = useState<Note[]>([]);
   const [state, setState] = useState<RunState>({});
@@ -32,17 +34,24 @@ export function StepLearnings({ task, run, onBack, onDone }: Props): React.React
     baseline != null && best != null && baseline > 0 ? (baseline - best) / baseline : null;
   const promoted = attempts.filter((a) => a.promoted);
 
+  const withSidebar = (content: React.ReactNode): React.ReactElement => (
+    <div style={{ maxWidth: 1400, width: "100%", margin: "0 auto", display: "grid", gridTemplateColumns: "260px 1fr", gap: 14, alignItems: "start" }}>
+      <SessionsSidebar taskName={task} selectedRun={run} onSelect={onSelectRun} />
+      <div style={{ minWidth: 0 }}>{content}</div>
+    </div>
+  );
+
   if (!task || !run) {
-    return (
-      <StepShell title="Learnings from the run" description="" onBack={onBack}>
+    return withSidebar(
+      <StepShell title="Learnings from the run" description="Pick a session on the left, or run the agents to generate findings." onBack={onBack}>
         <div className="ae-card ae-card--padded" style={{ textAlign: "center", color: "var(--ae-text-muted)", padding: 40 }}>
-          Run the agents first — the director's findings and the improvement summary will appear here.
+          No session selected yet — the director's findings and the improvement summary will appear here.
         </div>
-      </StepShell>
+      </StepShell>,
     );
   }
 
-  return (
+  return withSidebar(
     <StepShell
       title="Learnings from the run"
       description={
@@ -54,7 +63,6 @@ export function StepLearnings({ task, run, onBack, onDone }: Props): React.React
       onBack={onBack}
       onNext={onDone}
       nextLabel="Review & merge →"
-      wide
     >
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
         <Stat label={`Baseline ${metric}`} value={fmtPct(baseline)} />
@@ -114,7 +122,7 @@ export function StepLearnings({ task, run, onBack, onDone }: Props): React.React
           </div>
         </div>
       </div>
-    </StepShell>
+    </StepShell>,
   );
 }
 

@@ -1,44 +1,45 @@
 {
-  "name": "mape",
+  "name": "asymmetric_wmape",
   "direction": "min",
-  "description": "I want the evaluation metric to be MAPE \nwhich is mean absolute percentage error",
-  "understanding": "Mean Absolute Percentage Error (MAPE) measures the average magnitude of forecast errors as a percentage of the actual values. For each row, compute |actual - forecast| / |actual|, then average these values across all rows and express as a percentage. Rows where actual equals zero are excluded from the calculation to avoid division by zero. Formula: MAPE = (1/n) * Σ(|actual_i - forecast_i| / |actual_i|) * 100.",
+  "description": "I want a mixture wmape with more impact on overwmape",
+  "understanding": "This metric is a weighted MAPE (WMAPE) that penalizes over-forecasting (forecast > actual) more heavily than under-forecasting. Specifically, it computes a weighted sum of absolute errors divided by the weighted sum of actuals, but applies a multiplier of 2.0 to errors where the forecast exceeds the actual (over-forecast) and a multiplier of 1.0 to errors where the forecast is below the actual (under-forecast). The formula is: sum(w_i * |actual_i - forecast_i|) / sum(actual_i), where w_i = 2.0 if forecast_i > actual_i, else 1.0. This assumption (2× penalty for over-forecasting) is the most standard interpretation of 'more impact on over-WMAPE'.",
   "example": {
     "rows": [
       {
         "sku_name": "A",
         "date": "2024-01-01",
         "actual": 100,
-        "forecast": 110
+        "forecast": 120
       },
       {
-        "sku_name": "A",
-        "date": "2024-01-02",
+        "sku_name": "B",
+        "date": "2024-01-01",
         "actual": 200,
         "forecast": 180
       },
       {
-        "sku_name": "B",
+        "sku_name": "C",
         "date": "2024-01-01",
         "actual": 50,
         "forecast": 60
       },
       {
-        "sku_name": "B",
-        "date": "2024-01-02",
-        "actual": 400,
-        "forecast": 360
+        "sku_name": "D",
+        "date": "2024-01-01",
+        "actual": 150,
+        "forecast": 130
       }
     ],
     "steps": [
-      "Row 1: |100 - 110| / |100| = 10 / 100 = 0.10",
-      "Row 2: |200 - 180| / |200| = 20 / 200 = 0.10",
-      "Row 3: |50  -  60| / |50|  = 10 /  50 = 0.20",
-      "Row 4: |400 - 360| / |400| = 40 / 400 = 0.10",
-      "Mean of [0.10, 0.10, 0.20, 0.10] = 0.50 / 4 = 0.125",
-      "MAPE = 0.125 * 100 = 12.5"
+      "Row A: forecast(120) > actual(100) → over-forecast, w=2.0, weighted_error = 2.0 * |100-120| = 2.0 * 20 = 40",
+      "Row B: forecast(180) < actual(200) → under-forecast, w=1.0, weighted_error = 1.0 * |200-180| = 1.0 * 20 = 20",
+      "Row C: forecast(60) > actual(50)  → over-forecast, w=2.0, weighted_error = 2.0 * |50-60|  = 2.0 * 10 = 20",
+      "Row D: forecast(130) < actual(150) → under-forecast, w=1.0, weighted_error = 1.0 * |150-130| = 1.0 * 20 = 20",
+      "Sum of weighted errors = 40 + 20 + 20 + 20 = 100",
+      "Sum of actuals = 100 + 200 + 50 + 150 = 500",
+      "asymmetric_wmape = 100 / 500 = 0.200000"
     ],
-    "value": 12.5
+    "value": 0.2
   },
-  "code": "def metric(df: pd.DataFrame) -> float:\n    import numpy as np\n    import pandas as pd\n\n    # Exclude rows where actual is zero to avoid division by zero\n    valid = df[df['actual'] != 0].copy()\n\n    if len(valid) == 0:\n        return float('nan')\n\n    ape = np.abs(valid['actual'] - valid['forecast']) / np.abs(valid['actual'])\n    mape = float(ape.mean() * 100)\n    return mape\n"
+  "code": "def metric(df: pd.DataFrame) -> float:\n    import numpy as np\n    import pandas as pd\n\n    actuals = df['actual'].to_numpy(dtype=float)\n    forecasts = df['forecast'].to_numpy(dtype=float)\n\n    errors = np.abs(actuals - forecasts)\n\n    # Over-forecast penalty weight = 2.0, under-forecast = 1.0\n    weights = np.where(forecasts > actuals, 2.0, 1.0)\n\n    weighted_errors = weights * errors\n\n    sum_actuals = np.sum(actuals)\n\n    if sum_actuals == 0.0:\n        return 0.0\n\n    return float(np.sum(weighted_errors) / sum_actuals)\n"
 }

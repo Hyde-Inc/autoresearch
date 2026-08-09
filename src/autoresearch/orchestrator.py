@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -12,6 +13,7 @@ from .director import ResearchDirector
 from .harness import Evaluation, evaluate
 from .models import Attempt, Idea
 from .store import RunStore
+from .usage import log_usage
 from .worker import WorkerResult, _run, ensure_seed_repo, remove_worktree, run_worker
 
 console = Console()
@@ -86,15 +88,34 @@ async def run_research(
     guardrails: list[str] | None = None,
     parallel: int | None = None,
     max_experiments: int | None = None,
+    rounds: int | None = None,
+    round_timeout_s: int | None = None,
+    cost_limit_usd: float | None = None,
+    tracks: list[str] | None = None,
     resume_store: RunStore | None = None,
 ) -> RunStore:
     if goal:
         config.goal = goal
     if guardrails:
         config.guardrails.extend(guardrails)
-    parallel = min(parallel or config.agents.count, DEMO_MAX_PARALLEL)
-    max_rounds = min(config.budget.rounds, DEMO_MAX_ROUNDS)
-    maximum = max_experiments or config.budget.max_experiments
+    tracks = [t for t in (tracks or [])]
+    parallel = min(len(tracks) or parallel or config.agents.count, DEMO_MAX_PARALLEL)
+    tracks = tracks[:parallel]
+    max_rounds = min(rounds or config.budget.rounds, DEMO_MAX_ROUNDS)
+    # Rounds (not experiments) is the primary budget control; derive the experiment
+    # ceiling from rounds unless an explicit cap was passed.
+    maximum = max_experiments or (parallel * max_rounds)
+    if round_timeout_s:
+        # A per-round time budget: agents in a round run in parallel, so bounding each
+        # agent's wall-clock effectively bounds the round.
+        config.agents.timeout_s = round_timeout_s
+    run_config = {
+        "agents": parallel,
+        "rounds": max_rounds,
+        "round_timeout_s": config.agents.timeout_s,
+        "cost_limit_usd": cost_limit_usd,
+        "tracks": tracks,
+    }
     seed_template = config.resolve(config.workspace.seed)
     if not seed_template.exists():
         raise RuntimeError(f"seed workspace does not exist: {seed_template}; run prepare.py first")
@@ -109,12 +130,17 @@ async def run_research(
         incumbent_ref = prior.get("incumbent_ref", "main")
         completed = int(prior.get("completed", len(store.load_attempts())))
         round_number = int(prior.get("round", 0))
+        created_at = prior.get("created_at", datetime.now(UTC).isoformat())
+        total_cost = float(prior.get("total_cost_usd", 0.0))
+        run_config = prior.get("run_config", run_config)
     else:
         store = RunStore.create(config.resolve(config.workspace.runs), config.name)
         shutil.copy2(config.config_path, store.run_dir / "task.yaml")
         repo = store.run_dir / "repo"
         shutil.copytree(seed_template, repo)
         await ensure_seed_repo(repo)
+        created_at = datetime.now(UTC).isoformat()
+        total_cost = 0.0
         baseline_eval = await validate_baseline(config)
         if baseline_eval.error:
             raise RuntimeError(f"baseline evaluation failed: {baseline_eval.error}")
@@ -125,20 +151,28 @@ async def run_research(
         incumbent_ref = "main"
         completed = 0
         round_number = 0
+
+    def persist(status: str) -> None:
         store.save_state(
             {
                 "task": config.name,
-                "status": "running",
+                "status": status,
                 "goal": config.goal,
                 "primary_metric": config.metric.name,
                 "metric_direction": config.metric.direction,
                 "baseline": baseline,
-                "incumbent": baseline,
-                "incumbent_ref": "main",
-                "completed": 0,
-                "round": 0,
+                "incumbent": incumbent,
+                "incumbent_ref": incumbent_ref,
+                "round": round_number,
+                "completed": completed,
+                "created_at": created_at,
+                "run_config": run_config,
+                "total_cost_usd": round(total_cost, 4),
             }
         )
+
+    if not resume_store:
+        persist("running")
     console.print(
         f"[bold]Baseline[/bold] {config.metric.name}={baseline[config.metric.name]:.6f}, "
         f"holdout={baseline[f'holdout_{config.metric.name}']:.6f}"
@@ -150,12 +184,14 @@ async def run_research(
                 break
             round_number += 1
             count = min(parallel, maximum - completed)
+            round_tracks = tracks[:count] if tracks else None
             notes = store.notes_file.read_text() if store.notes_file.exists() else ""
             ideas = await director.propose(
                 count=count,
                 round_number=round_number,
                 attempts=store.load_attempts(),
                 notes=notes,
+                tracks=round_tracks,
             )
             console.print(f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments")
             jobs = []
@@ -207,27 +243,26 @@ async def run_research(
                         f"{config.metric.name}={attempt.metrics[config.metric.name]:.6f}"
                     )
                 store.save_attempt(attempt)
+            for attempt, _ in results:
+                if attempt.log_path:
+                    total_cost += log_usage(Path(attempt.log_path))[1]
             reflection = await director.reflect([attempt for attempt, _ in results])
             store.append_note(f"Round {round_number}", reflection)
             for _, worker in results:
                 await remove_worktree(repo, worker)
-            store.save_state(
-                {
-                    "task": config.name,
-                    "status": "running",
-                    "goal": config.goal,
-                    "primary_metric": config.metric.name,
-                    "metric_direction": config.metric.direction,
-                    "baseline": baseline,
-                    "incumbent": incumbent,
-                    "incumbent_ref": incumbent_ref,
-                    "round": round_number,
-                    "completed": completed,
-                }
-            )
+            persist("running")
+            if cost_limit_usd is not None and total_cost >= cost_limit_usd:
+                store.append_note(
+                    "Budget",
+                    f"Stopped after round {round_number}: cost ${total_cost:.2f} reached the "
+                    f"${cost_limit_usd:.2f} limit.",
+                )
+                console.print(
+                    f"[yellow]Cost limit reached[/yellow]: ${total_cost:.2f} >= ${cost_limit_usd:.2f}"
+                )
+                break
     finally:
-        state = store.load_state()
-        state["status"] = "stopped" if Path(".autoresearch-stop").exists() else "completed"
-        store.save_state(state)
+        stopped = Path(".autoresearch-stop").exists()
+        persist("stopped" if stopped else "completed")
         Path(".autoresearch-stop").unlink(missing_ok=True)
     return store

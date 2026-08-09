@@ -5,7 +5,7 @@ description: Forecast daily sales for 80 items from an uploaded sales history ([
   a later hidden 28-day holdout.
 goal: Reduce forecast error on sales while keeping runtime and holdout stable.
 metric:
-  name: mape
+  name: asymmetric_wmape
   direction: min
   definition: eval/custom_metric.json
 secondary_metrics:

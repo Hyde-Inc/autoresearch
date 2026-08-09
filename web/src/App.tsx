@@ -162,16 +162,23 @@ export default function App(): React.ReactElement {
             <StepRun
               config={config}
               taskName={taskName}
+              run={run}
+              onSelectRun={setRun}
               onBack={() => goto(2)}
               onDone={() => goto(4)}
-              onRun={(_t, r) => setRun(r)}
             />
           ) : (
             <NeedTask />
           ))}
 
         {active === 4 && (
-          <StepLearnings task={taskName} run={run} onBack={() => goto(3)} onDone={() => goto(5)} />
+          <StepLearnings
+            task={taskName}
+            run={run}
+            onSelectRun={setRun}
+            onBack={() => goto(3)}
+            onDone={() => goto(5)}
+          />
         )}
 
         {active === 5 && (

@@ -21,6 +21,14 @@ export interface Attempt {
   duration_s: number | null;
 }
 
+export interface RunConfig {
+  agents: number;
+  rounds: number;
+  round_timeout_s: number;
+  cost_limit_usd: number | null;
+  tracks: string[];
+}
+
 export interface RunState {
   task?: string;
   status?: string;
@@ -31,6 +39,9 @@ export interface RunState {
   incumbent?: Record<string, number>;
   round?: number;
   completed?: number;
+  created_at?: string;
+  run_config?: RunConfig;
+  total_cost_usd?: number;
 }
 
 export interface RunSummary {
@@ -41,6 +52,13 @@ export interface RunSummary {
   attempts: number;
   goal: string;
   primary_metric: string;
+  created_at?: string | null;
+  run_config?: RunConfig | null;
+  total_cost_usd?: number | null;
+  baseline_metric?: number | null;
+  best_metric?: number | null;
+  improvement?: number | null;
+  promoted?: number;
 }
 
 export interface TaskRuns {
@@ -192,6 +210,10 @@ export const api = {
     goal?: string;
     parallel?: number;
     max_experiments?: number;
+    rounds?: number;
+    round_timeout_s?: number;
+    cost_limit_usd?: number | null;
+    tracks?: string[];
   }) =>
     fetch("/api/start", {
       method: "POST",

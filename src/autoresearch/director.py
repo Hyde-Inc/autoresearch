@@ -84,12 +84,27 @@ class ResearchDirector:
         )
         spec = load_task_spec(self.config)
         metric_context = f" Definition: {spec.understanding}" if spec else ""
+        if tracks:
+            count = len(tracks)
+            track_lines = "\n".join(
+                f"  Agent {i + 1} track: {focus.strip() or 'open — any modeling approach'}"
+                for i, focus in enumerate(tracks)
+            )
+            track_instr = (
+                f"\nThere are {count} parallel agents, each with a dedicated research track. "
+                f"Return EXACTLY {count} ideas IN ORDER — the i-th idea is for the i-th agent and "
+                f"MUST stay strictly within that agent's track:\n{track_lines}\n"
+                "Set each idea's 'category' to a short label naming its track. Within a track, "
+                "make each round's idea a distinct, improved variation informed by prior results."
+            )
+        else:
+            track_instr = f"\nNeed {count} ideas."
         user = (
             f"Task: {self.config.description}\nGoal: {self.config.goal}\n"
             f"Primary metric: {self.config.metric.name} "
             f"({self.config.metric.direction}).{metric_context}\n"
-            f"Guardrails: {self.config.guardrails}\nRound: {round_number}\n"
-            f"Need {count} ideas.\nSuggested families (not mandatory): {self.config.idea_hints}\n"
+            f"Guardrails: {self.config.guardrails}\nRound: {round_number}.{track_instr}\n"
+            f"Suggested families (not mandatory): {self.config.idea_hints}\n"
             f"Prior attempts: {json.dumps(history)}\nLab notes:\n{notes[-8000:]}"
         )
         payload = await self._json_completion(system, user)
