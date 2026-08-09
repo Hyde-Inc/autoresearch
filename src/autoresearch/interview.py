@@ -34,8 +34,9 @@ from .orchestrator import validate_baseline
 from .plans import (
     PlanError,
     mark_executed,
-    next_plan_path,
+    new_session_dir,
     parse_plan,
+    plan_path,
     plans_dir_for_task,
     render_plan,
 )
@@ -316,6 +317,7 @@ class SetupSession:
         self.pending_spec: MetricSpec | None = None
         self.final_ideas: list[Idea] | None = None
         self.survey: str | None = cached_survey(self.repo)
+        self.session_dir: Path | None = None
         self.plan_path: Path | None = None
 
     def _reload(self) -> None:
@@ -641,7 +643,8 @@ class SetupSession:
             parsed.append(idea)
         parsed = parsed[: self.settings.n_agents]
         if self.plan_path is None:
-            self.plan_path = next_plan_path(plans_dir_for_task(config.root), round_number=1)
+            self.session_dir = new_session_dir(plans_dir_for_task(config.root))
+            self.plan_path = plan_path(self.session_dir, round_number=1)
         self.plan_path.write_text(
             render_plan(
                 round_number=1,

@@ -16,12 +16,13 @@ from .harness import Evaluation, evaluate
 from .models import Attempt, Idea
 from .plans import (
     PlanError,
-    append_results,
     mark_executed,
-    next_plan_path,
+    new_session_dir,
     parse_plan,
+    plan_path,
     plans_dir_for_task,
     render_plan,
+    write_findings,
 )
 from .store import RunStore
 from .worker import WorkerResult, _run, ensure_seed_repo, remove_worktree, run_worker
@@ -128,16 +129,18 @@ async def _propose_round(
     director: ResearchDirector,
     store: RunStore,
     config: TaskConfig,
+    session_dir: Path,
     round_number: int,
     notes: str,
     count: int,
     review: ReviewCallback | None,
 ) -> tuple[list[Idea], Path]:
-    """Ask the director for the next round and write it as an editable plan file.
+    """Ask the director for the next round and write it as an editable plan file
+    in the session folder.
 
     With a reviewer, loop until they approve (the possibly hand-edited file is
     what runs) or stop. Returns ([], path) when the reviewer ends the run."""
-    plan_path = next_plan_path(plans_dir_for_task(config.root), round_number)
+    plan_file = plan_path(session_dir, round_number)
     feedback: str | None = None
     previous: list[Idea] | None = None
     while True:
@@ -152,7 +155,7 @@ async def _propose_round(
             previous=previous,
         )
         _print_director_findings(director)
-        plan_path.write_text(
+        plan_file.write_text(
             render_plan(
                 round_number=round_number,
                 ideas=ideas,
@@ -164,18 +167,18 @@ async def _propose_round(
             )
         )
         if review is None:
-            mark_executed(plan_path)
-            return ideas, plan_path
+            mark_executed(plan_file)
+            return ideas, plan_file
         while True:
-            decision = await asyncio.to_thread(review, round_number, ideas, plan_path)
+            decision = await asyncio.to_thread(review, round_number, ideas, plan_file)
             if decision.action == "stop":
-                return [], plan_path
+                return [], plan_file
             if decision.action == "revise":
                 feedback, previous = decision.feedback, ideas
                 break
             # Approve: the hand-edited plan file is the source of truth.
             try:
-                parsed = parse_plan(plan_path)
+                parsed = parse_plan(plan_file)
             except PlanError as exc:
                 console.print(
                     f"[yellow]! {exc}[/yellow]\n"
@@ -183,8 +186,8 @@ async def _propose_round(
                 )
                 continue
             _apply_plan_overrides(config, parsed.overrides)
-            mark_executed(plan_path)
-            return parsed.ideas, plan_path
+            mark_executed(plan_file)
+            return parsed.ideas, plan_file
 
 
 async def run_research(
@@ -197,6 +200,7 @@ async def run_research(
     resume_store: RunStore | None = None,
     initial_ideas: list[Idea] | None = None,
     initial_plan_path: Path | None = None,
+    session_dir: Path | None = None,
     review: ReviewCallback | None = None,
 ) -> RunStore:
     if goal:
@@ -225,6 +229,9 @@ async def run_research(
         incumbent_ref = prior.get("incumbent_ref", "main")
         completed = int(prior.get("completed", len(store.load_attempts())))
         round_number = int(prior.get("round", 0))
+        # Continue the same session folder so the notebook stays in one place.
+        if session_dir is None and prior.get("session_dir"):
+            session_dir = Path(prior["session_dir"])
     else:
         store = RunStore.create(config.resolve(config.workspace.runs), config.name)
         shutil.copy2(config.config_path, store.run_dir / "task.yaml")
@@ -243,6 +250,9 @@ async def run_research(
         incumbent_ref = "main"
         completed = 0
         round_number = 0
+    if session_dir is None:
+        session_dir = new_session_dir(plans_dir_for_task(config.root))
+    if not resume_store:
         store.save_state(
             {
                 "task": config.name,
@@ -255,6 +265,7 @@ async def run_research(
                 "incumbent_ref": "main",
                 "completed": 0,
                 "round": 0,
+                "session_dir": str(session_dir),
             }
         )
     console.print(
@@ -271,10 +282,10 @@ async def run_research(
             notes = store.notes_file.read_text() if store.notes_file.exists() else ""
             if round_number == 1 and initial_ideas:
                 ideas = initial_ideas[:count]
-                plan_path = initial_plan_path
+                plan_file = initial_plan_path
             else:
-                ideas, plan_path = await _propose_round(
-                    director, store, config, round_number, notes, count, review
+                ideas, plan_file = await _propose_round(
+                    director, store, config, session_dir, round_number, notes, count, review
                 )
                 if not ideas:
                     console.print("[bold]Run ended at review.[/bold]")
@@ -331,12 +342,15 @@ async def run_research(
                         f"{config.metric.name}={attempt.metrics[config.metric.name]:.6f}"
                     )
                 store.save_attempt(attempt)
-            if plan_path is not None:
-                append_results(
-                    plan_path, [attempt for attempt, _ in results], config.metric.name
-                )
             reflection = await director.reflect([attempt for attempt, _ in results])
             store.append_note(f"Round {round_number}", reflection)
+            if plan_file is not None:
+                write_findings(
+                    plan_file,
+                    [attempt for attempt, _ in results],
+                    config.metric.name,
+                    reflection,
+                )
             for _, worker in results:
                 await remove_worktree(repo, worker)
             store.save_state(
@@ -351,6 +365,7 @@ async def run_research(
                     "incumbent_ref": incumbent_ref,
                     "round": round_number,
                     "completed": completed,
+                    "session_dir": str(session_dir),
                 }
             )
     finally:

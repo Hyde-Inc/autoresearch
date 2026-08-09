@@ -215,11 +215,11 @@ def start(
             "slash commands or just say it:\n"
             "  [bold cyan]/goal[/bold cyan] reduce wmape        "
             "[bold cyan]/baseline[/bold cyan] models/arima.py\n"
-            "Once goal, baseline, and metric are settled it evaluates the baseline and "
-            "writes the round-1 research plan to an editable markdown file in "
-            ".autoresearch/plans/. You edit it, type execute, and the round runs. Every "
-            "round gets its own plan file with results appended - a lab notebook of all "
-            "the research ever tried.",
+            "Once goal, baseline, and metric are settled it evaluates the baseline, opens "
+            "a session folder under .autoresearch/plans/, and writes the round-1 plan "
+            "there as an editable markdown file. You edit it, type execute, and the round "
+            "runs. Each round adds a plan file and a findings file to the session folder "
+            "- a lab notebook of all the research ever tried.",
             title="Research setup",
         )
     )
@@ -244,6 +244,7 @@ def start(
                 load_config(session.config_path),
                 initial_ideas=ideas,
                 initial_plan_path=session.plan_path,
+                session_dir=session.session_dir,
                 review=review_round,
             )
         )

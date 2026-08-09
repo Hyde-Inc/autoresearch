@@ -1,17 +1,19 @@
 """Research plans as editable markdown files, Cursor plan-mode style.
 
-Every round the director writes its proposal to ``<repo>/.autoresearch/plans/``
-as a markdown file with YAML frontmatter (the run parameters) and one section
-per experiment. The human edits the file freely - reword hypotheses, delete or
-add experiments, change frontmatter - and the edited file is what actually
-runs. After the round, results are appended, so the folder is a permanent lab
-notebook of every research idea ever tried and how it scored.
+Every research session gets its own folder under ``<repo>/.autoresearch/plans/``.
+Inside it, each round produces two markdown files: ``round-N.md``, the plan the
+director proposes (YAML frontmatter with the run parameters plus one section
+per experiment) which the human edits freely before typing ``execute``; and
+``round-N-findings.md``, written after the round with per-experiment results
+and the director's reflection. The session folder is a permanent lab notebook
+of every research idea ever tried and how it scored.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -43,15 +45,25 @@ def plans_dir_for_task(task_root: Path) -> Path:
     return directory
 
 
-def next_plan_path(directory: Path, round_number: int) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    taken = [
-        int(match.group(1))
-        for item in directory.glob("*.md")
-        if (match := re.match(r"(\d{3})-", item.name))
-    ]
-    number = max(taken, default=0) + 1
-    return directory / f"{number:03d}-round-{round_number}.md"
+def new_session_dir(plans_root: Path, name: str | None = None) -> Path:
+    """Create a fresh folder for one research session's plans and findings."""
+    plans_root.mkdir(parents=True, exist_ok=True)
+    base = name or datetime.now().astimezone().strftime("%Y-%m-%d-%H%M%S")
+    directory = plans_root / base
+    suffix = 2
+    while directory.exists():
+        directory = plans_root / f"{base}-{suffix}"
+        suffix += 1
+    directory.mkdir(parents=True)
+    return directory
+
+
+def plan_path(session_dir: Path, round_number: int) -> Path:
+    return session_dir / f"round-{round_number}.md"
+
+
+def findings_path(plan_file: Path) -> Path:
+    return plan_file.with_name(f"{plan_file.stem}-findings.md")
 
 
 def render_plan(
@@ -200,12 +212,18 @@ def mark_executed(path: Path) -> None:
     _set_status(path, "executed")
 
 
-def append_results(path: Path, attempts: list[Attempt], metric_name: str) -> None:
-    """Record how the round went inside its plan file: the lab-notebook entry."""
-    if not path.exists():
-        return
-    _set_status(path, "completed")
-    lines = ["", "## Results", ""]
+def write_findings(
+    plan_file: Path,
+    attempts: list[Attempt],
+    metric_name: str,
+    reflection: str = "",
+) -> Path | None:
+    """Write the round's findings next to its plan file: the lab-notebook entry."""
+    if not plan_file.exists():
+        return None
+    _set_status(plan_file, "completed")
+    round_label = plan_file.stem.replace("-", " ").capitalize()
+    lines = [f"# {round_label} findings", ""]
     header = f"| experiment | status | {metric_name} | holdout | promoted | note |"
     lines += [header, "|" + "---|" * 6]
     for attempt in attempts:
@@ -220,5 +238,8 @@ def append_results(path: Path, attempts: list[Attempt], metric_name: str) -> Non
             f"| {note[:160]} |"
         )
     lines.append("")
-    with path.open("a") as handle:
-        handle.write("\n".join(lines))
+    if reflection.strip():
+        lines += ["## Director's reflection", "", reflection.strip(), ""]
+    destination = findings_path(plan_file)
+    destination.write_text("\n".join(lines))
+    return destination

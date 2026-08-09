@@ -139,7 +139,13 @@ def test_write_plan_tool_writes_editable_file_without_launching(tmp_path: Path) 
     text = session.plan_path.read_text()
     assert "## Experiment 1: Global XGBoost" in text
     assert "made-up-skill" not in text  # unknown skills filtered
-    assert session.plan_path.parent == tmp_path / "plans"
+    # The plan lives in a fresh session folder under the plans root.
+    assert session.plan_path.name == "round-1.md"
+    assert session.session_dir == session.plan_path.parent
+    assert session.session_dir.parent == tmp_path / "plans"
+    # A second write_plan call (revision) reuses the same file and folder.
+    session.execute("write_plan", _PLAN_IDEAS)
+    assert len(list(session.session_dir.glob("*.md"))) == 1
 
 
 def test_execute_gate_runs_the_hand_edited_plan(tmp_path: Path, monkeypatch) -> None:

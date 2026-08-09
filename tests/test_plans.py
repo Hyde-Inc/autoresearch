@@ -5,11 +5,13 @@ import pytest
 from autoresearch.models import Attempt, Idea
 from autoresearch.plans import (
     PlanError,
-    append_results,
-    next_plan_path,
+    findings_path,
+    new_session_dir,
     parse_plan,
+    plan_path,
     plans_dir_for_task,
     render_plan,
+    write_findings,
 )
 
 
@@ -24,7 +26,7 @@ def _idea(title: str, skills: list[str] | None = None) -> Idea:
 
 
 def _write(tmp_path: Path, ideas: list[Idea], **kwargs) -> Path:
-    path = next_plan_path(tmp_path, kwargs.pop("round_number", 1))
+    path = plan_path(tmp_path, kwargs.pop("round_number", 1))
     path.write_text(render_plan(round_number=1, ideas=ideas, **kwargs))
     return path
 
@@ -50,12 +52,15 @@ def test_render_parse_roundtrip(tmp_path: Path) -> None:
     assert parsed.overrides["timeout_s"] == 1200
 
 
-def test_sequential_numbering(tmp_path: Path) -> None:
-    first = next_plan_path(tmp_path, 1)
-    first.write_text("x")
-    second = next_plan_path(tmp_path, 2)
-    assert first.name == "001-round-1.md"
-    assert second.name == "002-round-2.md"
+def test_session_folders_are_unique_and_hold_round_files(tmp_path: Path) -> None:
+    first = new_session_dir(tmp_path, name="2026-08-09-1200")
+    second = new_session_dir(tmp_path, name="2026-08-09-1200")
+    assert first != second and first.is_dir() and second.is_dir()
+    assert first.parent == tmp_path and second.parent == tmp_path
+    assert plan_path(first, 1).name == "round-1.md"
+    assert plan_path(first, 2).name == "round-2.md"
+    plan = plan_path(first, 1)
+    assert findings_path(plan).name == "round-1-findings.md"
 
 
 def test_plans_dir_lives_next_to_repo_tasks(tmp_path: Path) -> None:
@@ -103,7 +108,7 @@ def test_malformed_plans_raise_fixable_errors(tmp_path: Path) -> None:
         parse_plan(tmp_path / "absent.md")
 
 
-def test_append_results_marks_completed_and_stays_parseable(tmp_path: Path) -> None:
+def test_write_findings_creates_separate_file_and_completes_plan(tmp_path: Path) -> None:
     idea = _idea("Global XGBoost")
     path = _write(tmp_path, [idea], goal="reduce wmape", metric="wmape")
     attempt = Attempt(
@@ -115,11 +120,16 @@ def test_append_results_marks_completed_and_stays_parseable(tmp_path: Path) -> N
         holdout_metrics={"wmape": 0.117},
         promoted=True,
     )
-    append_results(path, [attempt], "wmape")
-    text = path.read_text()
-    assert "status: completed" in text
+    findings = write_findings(path, [attempt], "wmape", reflection="XGBoost won; scale it.")
+    assert findings == findings_path(path)
+    text = findings.read_text()
+    assert text.startswith("# Round 1 findings")
     assert "0.101000" in text
     assert "| yes |" in text
-    # The results section must not break re-parsing of the experiments.
+    assert "XGBoost won; scale it." in text
+    # The plan file itself is marked completed and still parses.
+    assert "status: completed" in path.read_text()
     parsed = parse_plan(path)
     assert [item.title for item in parsed.ideas] == ["Global XGBoost"]
+    # A missing plan file is a no-op, not a crash.
+    assert write_findings(tmp_path / "absent.md", [attempt], "wmape") is None
