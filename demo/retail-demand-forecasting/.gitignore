@@ -1,0 +1,5 @@
+data/
+forecasts/
+.autoresearch/
+uv.lock
+__pycache__/

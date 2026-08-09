@@ -46,6 +46,7 @@ def build_report(run_dir: Path) -> str:
                 "",
                 item.idea.hypothesis,
                 "",
+                f"- Research skills: {', '.join(item.idea.skills_used) or 'none'}",
                 f"- Validation metrics: {item.metrics}",
                 f"- Hidden holdout metrics: {item.holdout_metrics}",
                 "",
@@ -56,6 +57,8 @@ def build_report(run_dir: Path) -> str:
         result = item.metrics.get(metric)
         suffix = f", {metric}={result:.6f}" if result is not None else ""
         lines.append(f"- `{item.id}` {item.idea.title}: **{item.status}**{suffix}")
+        if item.idea.skills_used:
+            lines.append(f"  - Skills: {', '.join(item.idea.skills_used)}")
         if item.error:
             lines.append(f"  - Error: {item.error}")
         for failure in item.guardrail_failures:

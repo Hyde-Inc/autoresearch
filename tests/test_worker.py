@@ -1,15 +1,15 @@
 import asyncio
-import shutil
 from pathlib import Path
 
 from autoresearch.worker import _run, ensure_seed_repo
 
 
 def test_seed_copy_supports_worktrees(tmp_path: Path) -> None:
-    source = Path("examples/demand_forecasting/seed")
     repo = tmp_path / "repo"
     tree = tmp_path / "worktree"
-    shutil.copytree(source, repo)
+    (repo / "solution").mkdir(parents=True)
+    (repo / "solution" / "train.py").write_text("print('baseline')\n")
+    (repo / "pyproject.toml").write_text("[project]\nname='seed'\nversion='0'\n")
     asyncio.run(ensure_seed_repo(repo))
     code, output = asyncio.run(
         _run("git", "worktree", "add", "-b", "autoresearch/test", str(tree), "main", cwd=repo)

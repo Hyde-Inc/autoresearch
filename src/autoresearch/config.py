@@ -6,14 +6,17 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+DEFAULT_MODEL = "openrouter/moonshotai/kimi-k3"
+
 
 class MetricConfig(BaseModel):
     name: str = "wmape"
     direction: Literal["min", "max"] = "min"
+    definition: Path | None = None
 
 
 class ModelConfig(BaseModel):
-    model: str
+    model: str = DEFAULT_MODEL
     temperature: float = 0.2
 
 
@@ -45,18 +48,20 @@ class WorkspaceConfig(BaseModel):
 
 
 class TaskConfig(BaseModel):
-    name: str
-    description: str
-    goal: str
+    name: str = "autoresearch-task"
+    description: str = ""
+    goal: str = ""
     metric: MetricConfig = MetricConfig()
     secondary_metrics: list[str] = Field(default_factory=lambda: ["mape", "rmse", "bias_pct"])
     guardrails: list[str] = Field(default_factory=list)
-    director: ModelConfig
-    agents: AgentConfig
+    director: ModelConfig = ModelConfig()
+    agents: AgentConfig = AgentConfig()
     budget: BudgetConfig = BudgetConfig()
     data: DataConfig = DataConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
     idea_hints: list[str] = Field(default_factory=list)
+    context: str = ""
+    skills: list[Path] = Field(default_factory=list)
     config_path: Path | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
@@ -79,6 +84,12 @@ def load_config(path: Path) -> TaskConfig:
     path = path.expanduser().resolve()
     with path.open() as handle:
         raw = yaml.safe_load(handle)
-    config = TaskConfig.model_validate(raw)
+    config = TaskConfig.model_validate(raw or {})
     config.config_path = path
+    if config.metric.definition:
+        from .metrics import load_spec
+
+        spec = load_spec(config.resolve(config.metric.definition))
+        config.metric.name = spec.name
+        config.metric.direction = spec.direction
     return config

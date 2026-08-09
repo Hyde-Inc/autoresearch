@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import TaskConfig
+from .metrics import load_task_spec
 from .models import Idea
 from .opencode import OpenCodeResult, run_opencode
 from .store import RunStore
@@ -76,6 +77,18 @@ async def run_worker(
         f"## Hypothesis\n{idea.hypothesis}\n\n"
         f"## Instructions\n{idea.instructions}\n"
     )
+    if idea.skills_used:
+        experiment += f"\n## Research skills used\n{', '.join(idea.skills_used)}\n"
+    if config.context:
+        experiment += f"\n## Business context\n{config.context}\n"
+    spec = load_task_spec(config)
+    if spec is not None:
+        experiment += (
+            f"\n## Evaluation metric: {spec.name} ({spec.direction}imize)\n"
+            f"{spec.understanding}\n\n"
+            "The protected evaluator scores forecasts with exactly this code:\n\n"
+            f"```python\n{spec.code}\n```\n"
+        )
     (worktree / "EXPERIMENT.md").write_text(experiment)
     prompt = (
         "You are an autonomous ML research engineer. Read TASK.md and EXPERIMENT.md. "
