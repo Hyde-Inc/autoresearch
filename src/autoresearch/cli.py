@@ -16,6 +16,7 @@ from .chat import input_box
 from .config import load_config
 from .costs import format_cost
 from .director import openrouter_client
+from .doctor import run_checks
 from .foundry import FoundryError, parse_dataset_reference, read_dataset
 from .ingest import Preview, apply_column_mapping, ingest_frame, preview_frame
 from .interview import SetupSession, print_spec
@@ -468,6 +469,33 @@ def status(
     """Show run state and experiment counts."""
     store = _store_from(run_dir)
     console.print_json(json.dumps(store.load_state()))
+
+
+@app.command()
+def doctor(
+    no_api: Annotated[
+        bool, typer.Option("--no-api", help="Skip the live OpenRouter key check")
+    ] = False,
+) -> None:
+    """Check that tools and credentials needed to run research are in place."""
+    _load_env()
+    symbols = {"ok": "[green]✓[/green]", "warn": "[yellow]![/yellow]", "fail": "[red]✗[/red]"}
+    table = Table(title="autoresearch doctor", show_edge=False)
+    table.add_column("")
+    table.add_column("Check")
+    table.add_column("Detail")
+    checks = run_checks(check_api=not no_api)
+    for check in checks:
+        table.add_row(symbols[check.status], check.name, check.detail)
+    console.print(table)
+    failures = [c for c in checks if c.status == "fail"]
+    if failures:
+        console.print(
+            f"\n[red]{len(failures)} problem(s) must be fixed before a run.[/red] "
+            "See the setup steps in the README."
+        )
+        raise typer.Exit(1)
+    console.print("\n[green]Ready to run.[/green]")
 
 
 @app.command()
