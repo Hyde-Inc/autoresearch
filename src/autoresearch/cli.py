@@ -215,6 +215,60 @@ def _repo_rid_from_git(repo: Path) -> str:
     return match.group(1) if match else ""
 
 
+@app.command(name="foundry-build")
+def foundry_build_cmd(
+    config: ConfigOption,
+    message: Annotated[
+        str, typer.Option("--message", "-m", help="Commit message for the pushed change")
+    ] = "autoresearch: trigger training build",
+    no_push: Annotated[
+        bool, typer.Option("--no-push", help="Skip git push; build the already-published code")
+    ] = False,
+    timeout_s: Annotated[
+        int | None, typer.Option(min=1, help="Override the build timeout (seconds)")
+    ] = None,
+) -> None:
+    """Push the transforms repo and trigger a Foundry build of the forecasts dataset.
+
+    This is the manual 'train on Foundry' step: it publishes the current transform
+    code and runs a build on Foundry compute, then reports the result.
+    """
+    from .foundry_build import FoundryBuildError, create_build, push_repo, wait_for_build
+
+    _load_env()
+    cfg = load_config(config)
+    if cfg.runtime != "foundry" or cfg.foundry is None:
+        raise typer.BadParameter("config is not runtime: foundry (run foundry-setup first)")
+    fdry = cfg.foundry
+    target = fdry.datasets.forecasts
+    if not target:
+        raise typer.BadParameter("foundry.datasets.forecasts RID is unset; run foundry-setup first")
+    repo_dir = cfg.resolve(fdry.repo_dir)
+
+    try:
+        if not no_push:
+            console.print(f"[bold]Pushing[/bold] {repo_dir} → Foundry branch [cyan]{fdry.branch}[/cyan]")
+            sha = push_repo(repo_dir, branch=fdry.branch, message=message)
+            console.print(f"  pushed{f' commit {sha[:8]}' if sha else ' (nothing new to commit)'}")
+        console.print(f"[bold]Triggering build[/bold] of forecasts [dim]{target}[/dim]")
+        build_rid = create_build([target], branch=fdry.branch)
+        console.print(f"  build {build_rid}")
+
+        def on_status(status: str, elapsed: float) -> None:
+            console.print(f"  [{elapsed:6.0f}s] {status}")
+
+        result = wait_for_build(
+            build_rid,
+            timeout_s=timeout_s or fdry.build_timeout_s,
+            poll_s=fdry.poll_s,
+            on_status=on_status,
+        )
+        console.print(f"[green]Build {result.status}[/green] — forecasts written to {target}")
+    except (FoundryBuildError, FoundryError) as exc:
+        console.print(f"[red]Foundry build failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
 @app.command()
 def resume(
     config: ConfigOption,
