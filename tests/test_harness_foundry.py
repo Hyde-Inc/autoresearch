@@ -10,7 +10,12 @@ import pytest
 from autoresearch import foundry, harness_foundry
 from autoresearch.config import TaskConfig
 from autoresearch.foundry_setup import read_gradle_properties, scaffold
-from autoresearch.harness_foundry import _evaluate_sync, _score_split, _start_build
+from autoresearch.harness_foundry import (
+    _ensure_output_branch,
+    _evaluate_sync,
+    _score_split,
+    _start_build,
+)
 from autoresearch.orchestrator import _main_ref
 from autoresearch.worker import _entry_path, _prompt_rules, _task_doc, _verify_build
 
@@ -125,6 +130,69 @@ class TestStartBuild:
         monkeypatch.setattr(harness_foundry, "create_build", raise_other)
         with pytest.raises(foundry.FoundryError, match="PermissionDenied"):
             _start_build(foundry_config(tmp_path), "master", expect_new_code=True, on_progress=None)
+
+
+class TestBuildTimeout:
+    def test_overrunning_build_is_cancelled_on_foundry(self, monkeypatch) -> None:
+        from autoresearch import foundry_build
+
+        cancelled: list[str] = []
+        monkeypatch.setattr(
+            foundry_build, "get_build", lambda rid: {"status": "RUNNING", "jobRids": []}
+        )
+        monkeypatch.setattr(
+            foundry_build, "cancel_build", lambda rid: cancelled.append(rid)
+        )
+        monkeypatch.setattr(foundry_build.time, "sleep", lambda _s: None)
+        with pytest.raises(foundry_build.FoundryBuildError, match="exceeded the 0s timeout"):
+            foundry_build.wait_for_build("ri.build.slow", timeout_s=0, poll_s=1)
+        assert cancelled == ["ri.build.slow"]
+
+    def test_cancel_failure_still_raises_timeout(self, monkeypatch) -> None:
+        from autoresearch import foundry_build
+
+        def cancel_fails(rid: str) -> None:
+            raise foundry.FoundryError("no permission to cancel")
+
+        monkeypatch.setattr(
+            foundry_build, "get_build", lambda rid: {"status": "RUNNING", "jobRids": []}
+        )
+        monkeypatch.setattr(foundry_build, "cancel_build", cancel_fails)
+        monkeypatch.setattr(foundry_build.time, "sleep", lambda _s: None)
+        with pytest.raises(foundry_build.FoundryBuildError, match="cancel request failed"):
+            foundry_build.wait_for_build("ri.build.slow", timeout_s=0, poll_s=1)
+
+
+class TestEnsureOutputBranch:
+    def test_seeds_missing_branch_from_main_transaction(self, tmp_path, monkeypatch) -> None:
+        # A fresh branch must be seeded with master's transaction so Foundry
+        # reports UpToDate (not "output missing") until the branch publishes -
+        # otherwise the first build runs the fallback (baseline) job spec.
+        created: list[tuple] = []
+        branches = {"master": {"name": "master", "transactionRid": "ri.txn.1"}}
+        monkeypatch.setattr(
+            harness_foundry.foundry, "get_branch", lambda rid, name: branches.get(name)
+        )
+        monkeypatch.setattr(
+            harness_foundry.foundry,
+            "create_branch",
+            lambda rid, name, transaction_rid=None: created.append((rid, name, transaction_rid)),
+        )
+        _ensure_output_branch(foundry_config(tmp_path), "autoresearch/exp-1")
+        assert created == [("ri.f", "autoresearch/exp-1", "ri.txn.1")]
+
+    def test_existing_branch_untouched(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(
+            harness_foundry.foundry,
+            "get_branch",
+            lambda rid, name: {"name": name, "transactionRid": "ri.txn.2"},
+        )
+        monkeypatch.setattr(
+            harness_foundry.foundry,
+            "create_branch",
+            lambda *a, **k: pytest.fail("must not create an existing branch"),
+        )
+        _ensure_output_branch(foundry_config(tmp_path), "autoresearch/exp-1")
 
 
 class TestEvaluateSync:

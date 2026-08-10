@@ -209,7 +209,9 @@ def foundry_setup(
         "runtime": "foundry",
         "metric": {"name": "wmape", "direction": "min"},
         "data": {"id_column": "sku_id", "date_column": "date", "target_column": "units_sold"},
-        "agents": {"count": 3},
+        # Foundry sessions are slower per iteration (publish + build), so cap
+        # the per-session and per-experiment budgets to keep spend predictable.
+        "agents": {"count": 3, "timeout_s": 900, "budget_s": 1800},
         "budget": {"rounds": 3, "max_experiments": 9},
         "workspace": {
             "seed": str(repo),

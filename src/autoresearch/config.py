@@ -75,7 +75,8 @@ class FoundryRuntimeConfig(BaseModel):
     project_folder_rid: str = ""
     """Explicit project folder RID (overrides resolution from repo_rid)."""
     datasets: FoundryDatasets = FoundryDatasets()
-    build_timeout_s: int = Field(default=3600, ge=1)
+    build_timeout_s: int = Field(default=900, ge=1)
+    """Builds that outlive this are cancelled on Foundry, not just abandoned."""
     poll_s: int = Field(default=15, ge=1)
 
 

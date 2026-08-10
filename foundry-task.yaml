@@ -10,6 +10,8 @@ data:
   target_column: units_sold
 agents:
   count: 3
+  timeout_s: 900
+  budget_s: 1800
 budget:
   rounds: 3
   max_experiments: 9
