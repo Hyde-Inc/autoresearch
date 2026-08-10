@@ -7,7 +7,7 @@ from typing import Annotated
 
 import pandas as pd
 import typer
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -31,6 +31,16 @@ console = Console()
 ConfigOption = Annotated[
     Path, typer.Option("--config", "-c", exists=True, dir_okay=False, help="Task YAML")
 ]
+
+
+def _load_env() -> None:
+    """Load .env by searching upward from the *current directory*.
+
+    ``load_dotenv()``'s default searches from the installed package's own
+    directory, which works in a repo checkout (the .venv sits next to .env)
+    but silently finds nothing when the CLI is installed globally as a tool.
+    """
+    load_dotenv(find_dotenv(usecwd=True))
 
 
 def _store_from(run_dir: Path | None, config: Path | None = None) -> RunStore:
@@ -57,7 +67,7 @@ def run(
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
     """Start a new autonomous research run."""
-    load_dotenv()
+    _load_env()
     cfg = load_config(config)
     store = asyncio.run(
         run_research(
@@ -79,7 +89,7 @@ def resume(
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
     """Resume the latest or selected run: review the next proposed round, then continue."""
-    load_dotenv()
+    _load_env()
     cfg = load_config(config)
     store = _store_from(run_dir, config)
     completed = asyncio.run(
@@ -122,7 +132,7 @@ def ingest(
     ] = None,
 ) -> None:
     """Turn a sales history (local CSV or Foundry dataset) into a protected forecasting task."""
-    load_dotenv()
+    _load_env()
     try:
         rid = parse_dataset_reference(source)
     except FoundryError as exc:
@@ -188,7 +198,7 @@ def metric(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
     """Create and verify a custom metric from plain English."""
-    load_dotenv()
+    _load_env()
     cfg = load_config(config)
     interpreter = MetricInterpreter(cfg.director.model, cfg.director.temperature)
     spec, validation = asyncio.run(interpreter.interpret(description, eval_columns(cfg)))
@@ -260,7 +270,7 @@ def start(
     ] = None,
 ) -> None:
     """Point the Research Director at a project, lock in goal and baseline, and research."""
-    load_dotenv()
+    _load_env()
     repo = (repo or Path(".")).resolve()
     settings = SessionSettings()
     session = SetupSession(openrouter_client(), console, settings=settings, repo=repo)

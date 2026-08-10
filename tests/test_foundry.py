@@ -110,10 +110,51 @@ def test_read_dataset_maps_http_errors(
 def test_read_dataset_reports_unreachable_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FOUNDRY_HOSTNAME", "stack.palantirfoundry.com")
     monkeypatch.setenv("FOUNDRY_TOKEN", "token-123")
+    monkeypatch.setattr("autoresearch.foundry.time.sleep", lambda seconds: None)
 
     def fake_urlopen(request, timeout=0):
         raise urllib.error.URLError("nodename nor servname provided")
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    with pytest.raises(FoundryError, match="could not reach stack.palantirfoundry.com"):
+    with pytest.raises(FoundryError, match="interrupted.*after 3 attempts"):
         read_dataset(RID)
+
+
+def test_read_dataset_retries_after_interrupted_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import http.client
+
+    monkeypatch.setenv("FOUNDRY_HOSTNAME", "stack.palantirfoundry.com")
+    monkeypatch.setenv("FOUNDRY_TOKEN", "token-123")
+    sleeps: list[float] = []
+    monkeypatch.setattr("autoresearch.foundry.time.sleep", sleeps.append)
+    frame = pd.DataFrame({"date": ["2025-01-01"], "sku_name": ["a"], "sales": [3.0]})
+    attempts: list[int] = []
+
+    def flaky_urlopen(request, timeout=0):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise http.client.IncompleteRead(b"partial", 310799)
+        return _FakeResponse(_arrow_bytes(frame))
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky_urlopen)
+    result = read_dataset(RID)
+    pd.testing.assert_frame_equal(result, frame)
+    assert len(attempts) == 3
+    assert sleeps == [2, 4]
+
+
+def test_read_dataset_does_not_retry_client_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FOUNDRY_HOSTNAME", "stack.palantirfoundry.com")
+    monkeypatch.setenv("FOUNDRY_TOKEN", "token-123")
+    attempts: list[int] = []
+
+    def denied_urlopen(request, timeout=0):
+        attempts.append(1)
+        raise urllib.error.HTTPError(request.full_url, 403, "forbidden", {}, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", denied_urlopen)
+    with pytest.raises(FoundryError, match="no permission"):
+        read_dataset(RID)
+    assert len(attempts) == 1

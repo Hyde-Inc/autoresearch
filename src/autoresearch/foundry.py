@@ -110,8 +110,13 @@ def read_dataset(
     columns: list[str] | None = None,
     row_limit: int | None = None,
     timeout_s: int = 300,
+    retries: int = 3,
 ) -> pd.DataFrame:
-    """Download a Foundry dataset as a DataFrame via the readTable endpoint."""
+    """Download a Foundry dataset as a DataFrame via the readTable endpoint.
+
+    Transient network failures (dropped connections mid-stream, timeouts,
+    5xx responses) are retried with a short backoff; 4xx responses fail fast.
+    """
     hostname, token = _credentials()
     params: list[tuple[str, str]] = [("format", "ARROW")]
     if branch:
@@ -124,14 +129,32 @@ def read_dataset(
         f"https://{hostname}/api/v2/datasets/{rid}/readTable?"
         f"{urllib.parse.urlencode(params)}"
     )
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
-            payload = response.read()
-    except urllib.error.HTTPError as exc:
-        raise FoundryError(_describe_http_error(exc, rid)) from exc
-    except urllib.error.URLError as exc:
-        raise FoundryError(f"could not reach {hostname}: {exc.reason}") from exc
+
+    payload: bytes | None = None
+    last_error = "download failed"
+    for attempt in range(retries):
+        if attempt:
+            time.sleep(2**attempt)  # 2s, 4s
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_s) as response:
+                payload = response.read()
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise FoundryError(_describe_http_error(exc, rid)) from exc
+            last_error = _describe_http_error(exc, rid)
+        except (
+            urllib.error.URLError,
+            http.client.IncompleteRead,
+            http.client.HTTPException,
+            TimeoutError,
+            ConnectionError,
+        ) as exc:
+            reason = getattr(exc, "reason", None) or exc
+            last_error = f"download from {hostname} was interrupted: {reason}"
+    if payload is None:
+        raise FoundryError(f"{last_error} (after {retries} attempts)")
 
     try:
         table = pa.ipc.open_stream(payload).read_all()
