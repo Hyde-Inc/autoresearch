@@ -109,6 +109,112 @@ def run(
     console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
 
 
+@app.command(name="foundry-setup")
+def foundry_setup(
+    repo: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, help="Path to the Foundry transforms repo"),
+    ],
+    project_folder_rid: Annotated[
+        str, typer.Option(help="Project folder RID (else resolved from the repo's git remote)")
+    ] = "",
+    branch: Annotated[str, typer.Option(help="Foundry branch to write/build on")] = "master",
+    n_skus: Annotated[int, typer.Option(min=2)] = 10,
+    n_days: Annotated[int, typer.Option(min=60)] = 210,
+    validation_days: Annotated[int, typer.Option(min=1)] = 28,
+    holdout_days: Annotated[int, typer.Option(min=1)] = 28,
+    write_config: Annotated[
+        Path, typer.Option(help="Where to write the runtime: foundry task.yaml")
+    ] = Path("foundry-task.yaml"),
+) -> None:
+    """Phase 0: generate synthetic demand, split it, and upload the datasets to Foundry.
+
+    Also writes a task.yaml wired for ``runtime: foundry`` so ``autoresearch run``
+    trains on Foundry.
+    """
+    import yaml
+
+    from . import foundry_setup as setup
+    from .foundry import resolve_parent_folder
+
+    _load_env()
+    repo = repo.resolve()
+    repo_rid = _repo_rid_from_git(repo)
+    project = project_folder_rid or (resolve_parent_folder(repo_rid) if repo_rid else "")
+    if not project:
+        raise typer.BadParameter(
+            "could not resolve the project folder; pass --project-folder-rid"
+        )
+
+    console.print("[bold]Generating synthetic demand history[/bold]")
+    history = setup.generate_history(n_skus=n_skus, n_days=n_days)
+    frames = setup.chronological_split(
+        history, validation_days=validation_days, holdout_days=holdout_days
+    )
+    summary = Table(title="Chronological split", show_edge=False)
+    summary.add_column("Split")
+    summary.add_column("Rows", justify="right")
+    for key in ("sales_train", "validation_actuals", "holdout_actuals", "forecast_request"):
+        summary.add_row(key, f"{len(frames[key]):,}")
+    console.print(summary)
+
+    console.print(f"[bold]Provisioning datasets under[/bold] {project}")
+    try:
+        result = setup.provision(frames, project_folder_rid=project, branch=branch)
+    except FoundryError as exc:
+        console.print(f"[red]Foundry setup failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    table = Table(title="Foundry datasets", show_edge=False)
+    table.add_column("Dataset")
+    table.add_column("RID")
+    for key, rid in setup.result_as_config(result).items():
+        table.add_row(key, rid)
+    console.print(table)
+
+    task = {
+        "name": "foundry-demand-forecasting",
+        "goal": "Reduce validation WMAPE on the Foundry demand dataset.",
+        "runtime": "foundry",
+        "metric": {"name": "wmape", "direction": "min"},
+        "data": {"id_column": "sku_id", "date_column": "date", "target_column": "units_sold"},
+        "agents": {"count": 1},
+        "budget": {"rounds": 3, "max_experiments": 6},
+        "workspace": {
+            "allowed_paths": ["transforms-python/src/myproject/datasets/forecast.py"]
+        },
+        "foundry": {
+            "repo_dir": str(repo),
+            "branch": branch,
+            "repo_rid": repo_rid,
+            "project_folder_rid": project,
+            "datasets": setup.result_as_config(result),
+        },
+    }
+    write_config = write_config.resolve()
+    write_config.write_text(yaml.safe_dump(task, sort_keys=False))
+    console.print(f"\n[green]Wrote task config:[/green] {write_config}")
+    console.print(
+        "Next: push the repo + baseline transform, then "
+        f"[bold]autoresearch run -c {write_config}[/bold]"
+    )
+
+
+def _repo_rid_from_git(repo: Path) -> str:
+    """Best-effort: read the Stemma repo RID from the git remote URL."""
+    import re
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    match = re.search(r"(ri\.stemma\.main\.repository\.[0-9a-fA-F-]+)", result.stdout)
+    return match.group(1) if match else ""
+
+
 @app.command()
 def resume(
     config: ConfigOption,

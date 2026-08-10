@@ -54,7 +54,7 @@ editable plan files.
 
 ## Setup
 
-You need Python 3.12, `uv`, `git`, OpenCode, and an OpenRouter API key.
+You need Python 3.12+, `uv`, `git`, OpenCode, and an OpenRouter API key.
 
 ```bash
 brew install anomalyco/tap/opencode
@@ -66,6 +66,47 @@ Add your key to `.env`:
 
 ```bash
 OPENROUTER_API_KEY=sk-or-v1-your-key
+# optional - only needed to ingest from a Palantir Foundry dataset:
+FOUNDRY_HOSTNAME=yourstack.palantirfoundry.com
+FOUNDRY_TOKEN=your-foundry-token
+```
+
+`.env` is discovered by searching upward from the directory you run in, so it works both from a
+repo checkout and when the CLI is installed globally.
+
+### Install as a global command (optional)
+
+To run `autoresearch` from any repo (not just this checkout), install it as a `uv` tool:
+
+```bash
+uv tool install .            # from this repo
+# or straight from git, without cloning:
+uv tool install "git+<repo-url>"
+```
+
+This puts `autoresearch` on your PATH (via `~/.local/bin`). The installed tool is a snapshot: after
+you change the source, rerun `uv tool install . --reinstall` to update it - or use
+`uv run autoresearch ...` from the repo, which always runs the working-tree code.
+
+### Check your setup
+
+```bash
+autoresearch doctor          # or: uv run autoresearch doctor
+```
+
+`doctor` verifies the external tools it shells out to (`git`, `uv`, `opencode`), reports which
+`.env` was loaded, and pings OpenRouter to confirm your key is valid and show remaining credit. It
+also reports optional Foundry credentials. Pass `--no-api` to skip the live network check. It exits
+non-zero if anything required is missing, so it doubles as an onboarding gate for a new engineer:
+
+```text
+ ✓  python      3.12.12
+ ✓  git         git version 2.39.5
+ ✓  uv          uv 0.11.7
+ ✓  opencode    1.18.15
+ ✓  .env        /path/to/your/repo/.env
+ ✓  openrouter  key valid; used $12.40 of $50
+ !  foundry     not configured (only needed for Foundry ingestion)
 ```
 
 
@@ -124,26 +165,30 @@ that off.
 While a round runs, the terminal shows one live dashboard with a row per agent:
 
 ```
-Round 1 · baseline wmape 0.1039 · 3 agents
+Round 1 · baseline wmape 0.1039 · 3 agents · spend $0.42
 
   #  Experiment                 Phase            Current action               Elapsed
  >1  Global XGBoost             Editing          write solution/train.py        01:42
   2  Intermittent-demand route  Testing          running local backtest         01:37
   3  ARIMA + promo              Protected eval   validation + holdout splits    01:31
 
-Selected: read solution/train.py → edit features.py → running uv test
+Selected: read solution/train.py → edit features.py → running uv test · spend $0.18
 Log: runs/t/.../logs/aaa11111.jsonl
-[1-9/↑↓] select   [x] cancel selected   [q] stop round   [?] help
+[1-9/↑↓] select   [c] chat   [x] cancel selected   [q] stop round   [?] help
 ```
 
 Phases are factual - `Setting up`, `Exploring`, `Editing`, `Testing`, `Committing`,
 `Protected eval`, then `Passed` / `Failed` / `Rejected` / `Cancelled` - and the current
 action comes straight from the agent's streamed events (which file it read or edited,
-which command it ran). The selected row shows a short trail of recent actions and the
-path to its full JSONL log.
+which command it ran). The header shows the round's running model spend; the selected row
+shows a short trail of recent actions, that agent's spend, and the path to its full JSONL log.
 
 Interruption is first-class:
 
+- `c` opens a chat with the Research Director about the running agents without pausing them.
+  It builds a fresh snapshot of each agent's phase, elapsed time, and recent actions so you can
+  ask "what is agent 2 doing?" or "why did agent 3 fail?" mid-round; the table resumes when you
+  leave the chat.
 - `x` cancels the selected agent only. Its subprocesses are killed, the attempt is
   recorded as `cancelled` with its partial log kept, its worktree is removed, and the
   other agents keep running.
@@ -221,11 +266,15 @@ uv run autoresearch run -c demo/retail-demand-forecasting/.autoresearch/task/tas
 uv run autoresearch resume -c demo/retail-demand-forecasting/.autoresearch/task/task.yaml
 ```
 
+`run`, `resume`, and `start` accept `--max-cost <usd>` to cap model spend (see
+[Cost tracking](#cost-tracking)).
 
 
-## Use a raw sales CSV
 
-Without a repo, a CSV with `date`, `sku_name`, `sales`, and `selling_price` columns also works:
+## Ingest data: a raw sales CSV or a Foundry dataset
+
+Without a repo, `ingest` turns a sales history into a protected forecasting task. The standard
+schema is `date`, `sku_name`, `sales`, and `selling_price`:
 
 ```bash
 uv run autoresearch ingest sales.csv --name my-forecast
@@ -233,6 +282,45 @@ uv run autoresearch run -c tasks/my-forecast/task.yaml
 uv run autoresearch metric -c tasks/my-forecast/task.yaml \
   "Penalize under-forecasting twice as much as over-forecasting"
 ```
+
+If your columns are named differently, map them onto the standard schema:
+
+```bash
+uv run autoresearch ingest sales.csv --name my-forecast \
+  --date-column day --id-column item_id --target-column units --price-column unit_price
+```
+
+You can also read directly from a **Palantir Foundry** dataset (needs `FOUNDRY_HOSTNAME` and
+`FOUNDRY_TOKEN` in `.env`; the token needs the `api:datasets-read` scope). Pass a
+`foundry://` reference or a bare dataset RID, plus an optional `--branch`:
+
+```bash
+uv run autoresearch ingest foundry://ri.foundry.main.dataset.<uuid> \
+  --name pan-india-demo --branch sk/my_branch \
+  --date-column date --id-column fsn --target-column units --price-column fsp
+```
+
+### Data-quality gate
+
+Before it writes anything, `ingest` shows a per-column quality report - how many rows are
+null, blank, or the wrong type - and how many rows would be dropped during cleaning, then asks
+you to confirm:
+
+```text
+                Data quality
+  Column         Unusable rows   % of source
+  date                       0          0.0%
+  sku_name                   0          0.0%
+  sales                     12          0.4%
+  selling_price            847         31.8%
+847 of 2664 rows (31.8%) dropped during cleaning
+Proceed with ingestion using the cleaned data? [y/N]
+```
+
+- `--max-drop-pct <pct>` (default `30`) hard-fails the ingest if more than that fraction of rows
+  would be thrown away, so a mis-mapped column can't silently produce a tiny, unrepresentative
+  task.
+- `--yes` / `-y` skips the confirmation prompt for scripts and CI.
 
 
 
@@ -259,6 +347,25 @@ seasonality, intermittency, promo/price drivers) and error analysis over every s
 validation forecasts (`analyze_errors`, `worst_items`). What it consulted is printed with each
 round.
 
+## Cost tracking
+
+Every model turn's paid cost and token counts are recorded in each agent's JSONL log, so the CLI
+knows exactly what each experiment spent (training and evaluation run locally and cost nothing).
+Spend surfaces everywhere you look at a run:
+
+- the live dashboard header (round total) and the selected agent's row (per-agent spend),
+- the `leaderboard` (a `Cost` column) and the `report` (total spend plus per-experiment cost),
+- the saved run `state.json` (`cost_usd`), and a `Total model spend` line printed at the end of a run.
+
+Cap spend with `--max-cost` on `run`, `resume`, or `start`:
+
+```bash
+uv run autoresearch run -c tasks/my-forecast/task.yaml --max-cost 5
+```
+
+The cap is checked before each new round begins: once total spend reaches the budget the run stops
+cleanly (it does not kill agents mid-round, so a round already in flight can slightly overshoot).
+
 ## View results
 
 ```bash
@@ -271,6 +378,139 @@ uv run autoresearch stop
 
 Results, patches, agent logs, metrics, per-attempt validation forecasts, and research notes are
 saved under `<repo>/runs/`.
+
+## CLI command reference
+
+Every command. Prefix with `uv run` when working from the repo checkout, or call `autoresearch`
+directly if you installed it globally (`uv tool install .`). Run `autoresearch --help` or
+`autoresearch <command> --help` for the authoritative flag list.
+
+### `autoresearch start [REPO]`
+Interactive setup + research on a project. `REPO` defaults to the current directory. Surveys the
+repo, settles goal/baseline/metric in chat, then runs rounds behind the plan-file review gate.
+
+```bash
+autoresearch start .
+autoresearch start path/to/project --max-cost 5
+```
+
+- `--max-cost <usd>` — stop before a new round once model spend hits this.
+
+### `autoresearch ingest SOURCE --name NAME`
+Turn a sales history (local CSV or Foundry dataset) into a protected task under `tasks/`.
+
+```bash
+autoresearch ingest sales.csv --name my-forecast
+autoresearch ingest foundry://ri.foundry.main.dataset.<uuid> --name pan-india \
+  --branch sk/my_branch --date-column date --id-column fsn \
+  --target-column units --price-column fsp
+```
+
+- `--name, -n` — task name (required).
+- `--tasks-root <dir>` — output directory (default `tasks`).
+- `--branch <name>` — Foundry branch to read.
+- `--id-column / --date-column / --target-column / --price-column` — map source columns onto the
+  standard `sku_name / date / sales / selling_price` schema.
+- `--validation-days <n>` / `--holdout-days <n>` — override the split horizons.
+- `--max-drop-pct <pct>` — refuse ingest if more than this % of rows drop (default `30`).
+- `--overwrite` — replace an existing task of the same name.
+- `--yes, -y` — skip the data-quality confirmation prompt.
+
+### `autoresearch run -c TASK_YAML`
+Start a new non-interactive research run from a task config (no review gate).
+
+```bash
+autoresearch run -c tasks/my-forecast/task.yaml --parallel 3 --max-cost 5
+```
+
+- `--goal <text>` — override the configured goal.
+- `--guardrail <expr>` — add a guardrail (repeatable).
+- `--parallel <n>` — parallel experiments per round.
+- `--max-experiments <n>` — cap total experiments.
+- `--max-cost <usd>` — spend cap (checked before each new round).
+
+### `autoresearch resume -c TASK_YAML`
+Resume the latest (or a chosen) run: review the next proposed round, then continue. Keeps the
+promoted incumbent, baseline, and notes.
+
+```bash
+autoresearch resume -c tasks/my-forecast/task.yaml
+autoresearch resume -c tasks/my-forecast/task.yaml --run-dir runs/my-forecast/20260810-093424
+```
+
+- `--run-dir <dir>` — resume a specific run instead of the latest.
+- `--parallel <n>`, `--max-experiments <n>`, `--max-cost <usd>` — as for `run`.
+
+### `autoresearch metric -c TASK_YAML "DESCRIPTION"`
+Create and verify a custom metric from plain English (shows a hand-worked example and self-checks
+the grader code).
+
+```bash
+autoresearch metric -c tasks/my-forecast/task.yaml \
+  "Penalize under-forecasting twice as much as over-forecasting"
+```
+
+- `--yes, -y` — adopt without confirmation.
+
+### `autoresearch validate -c TASK_YAML`
+Run the seed/baseline solution through the protected evaluator and print validation + holdout
+metrics.
+
+```bash
+autoresearch validate -c tasks/my-forecast/task.yaml
+```
+
+### `autoresearch doctor`
+Check that required tools (`git`, `uv`, `opencode`) and credentials (OpenRouter, optional Foundry)
+are in place. Exits non-zero if anything required is missing.
+
+```bash
+autoresearch doctor
+autoresearch doctor --no-api    # skip the live OpenRouter key check
+```
+
+### `autoresearch skills [-c TASK_YAML]`
+List the forecasting playbooks available to the Research Director.
+
+```bash
+autoresearch skills
+```
+
+### `autoresearch status [--run-dir DIR]`
+Print the run state (baseline, incumbent, round, counts, spend) as JSON.
+
+```bash
+autoresearch status --run-dir runs/my-forecast/20260810-093424
+```
+
+### `autoresearch leaderboard [--run-dir DIR] [-c TASK_YAML]`
+Show ranked, guardrail-passing attempts with metrics and per-experiment cost.
+
+```bash
+autoresearch leaderboard -c tasks/my-forecast/task.yaml
+```
+
+### `autoresearch show ATTEMPT_ID [--run-dir DIR]`
+Print one attempt's full record and its diff.
+
+```bash
+autoresearch show a1b2c3d4 --run-dir runs/my-forecast/20260810-093424
+```
+
+### `autoresearch report [--run-dir DIR] [-o OUTPUT]`
+Generate a markdown research report (outcome, total spend, promoted experiments, full ledger).
+
+```bash
+autoresearch report --run-dir runs/my-forecast/20260810-093424 -o report.md
+```
+
+### `autoresearch stop`
+Request a stop from another terminal: mid-round agents are cancelled within seconds and recorded
+as cancelled.
+
+```bash
+autoresearch stop
+```
 
 ## Guardrails
 

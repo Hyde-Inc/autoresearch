@@ -9,3 +9,6 @@ runs/
 sandbox/
 # lab notebooks written by demo runs; real users commit their own research/
 demo/*/research/
+# per-run working state and lab notebooks written at the repo root by live runs
+.autoresearch/
+/research/
