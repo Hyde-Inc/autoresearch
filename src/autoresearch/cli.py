@@ -126,25 +126,41 @@ def foundry_setup(
     write_config: Annotated[
         Path, typer.Option(help="Where to write the runtime: foundry task.yaml")
     ] = Path("foundry-task.yaml"),
+    no_push: Annotated[
+        bool, typer.Option("--no-push", help="Scaffold and provision but skip the git push")
+    ] = False,
 ) -> None:
-    """Phase 0: generate synthetic demand, split it, and upload the datasets to Foundry.
+    """Install autoresearch into a Foundry transforms repo, end to end.
 
-    Also writes a task.yaml wired for ``runtime: foundry`` so ``autoresearch run``
-    trains on Foundry.
+    Reads the repo's own gradle.properties for its identity, provisions the five
+    datasets, scaffolds the baseline transform + AUTORESEARCH.md contract +
+    curated dependencies into the repo, pushes it so Foundry publishes the
+    baseline, and writes a ``runtime: foundry`` task.yaml. After this,
+    ``autoresearch run -c foundry-task.yaml`` runs the whole loop autonomously.
     """
     import yaml
 
     from . import foundry_setup as setup
     from .foundry import resolve_parent_folder
+    from .foundry_build import FoundryBuildError, push_repo
 
     _load_env()
     repo = repo.resolve()
-    repo_rid = _repo_rid_from_git(repo)
+    props = setup.read_gradle_properties(repo)
+    repo_rid = props.get("transformsRepoRid") or _repo_rid_from_git(repo)
+    repo_path = props.get("transformsRepoPath", "")
+    if branch == "master":
+        branch = props.get("transformsDefaultBranchName", branch)
+    if not repo_path:
+        raise typer.BadParameter(
+            f"{repo}/gradle.properties has no transformsRepoPath - is this a cloned "
+            "Foundry transforms repository?"
+        )
+    project_path = repo_path.rsplit("/", 1)[0]
+    datasets_path = f"{project_path}/{setup.FOLDER}"
     project = project_folder_rid or (resolve_parent_folder(repo_rid) if repo_rid else "")
     if not project:
-        raise typer.BadParameter(
-            "could not resolve the project folder; pass --project-folder-rid"
-        )
+        raise typer.BadParameter("could not resolve the project folder; pass --project-folder-rid")
 
     console.print("[bold]Generating synthetic demand history[/bold]")
     history = setup.generate_history(n_skus=n_skus, n_days=n_days)
@@ -158,7 +174,7 @@ def foundry_setup(
         summary.add_row(key, f"{len(frames[key]):,}")
     console.print(summary)
 
-    console.print(f"[bold]Provisioning datasets under[/bold] {project}")
+    console.print(f"[bold]Provisioning datasets under[/bold] {datasets_path}")
     try:
         result = setup.provision(frames, project_folder_rid=project, branch=branch)
     except FoundryError as exc:
@@ -172,16 +188,33 @@ def foundry_setup(
         table.add_row(key, rid)
     console.print(table)
 
+    console.print("[bold]Scaffolding the repo[/bold]")
+    transform_rel, actions = setup.scaffold(repo, datasets_path, branch)
+    for action in actions:
+        console.print(f"  {action}")
+
+    if no_push:
+        console.print("[yellow]--no-push: remember to push before running[/yellow]")
+    else:
+        console.print(f"[bold]Pushing to Foundry[/bold] ({branch}) so the baseline publishes")
+        try:
+            push_repo(repo, branch=branch, message="autoresearch: install baseline transform")
+        except FoundryBuildError as exc:
+            console.print(f"[red]push failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
     task = {
         "name": "foundry-demand-forecasting",
         "goal": "Reduce validation WMAPE on the Foundry demand dataset.",
         "runtime": "foundry",
         "metric": {"name": "wmape", "direction": "min"},
         "data": {"id_column": "sku_id", "date_column": "date", "target_column": "units_sold"},
-        "agents": {"count": 1},
-        "budget": {"rounds": 3, "max_experiments": 6},
+        "agents": {"count": 3},
+        "budget": {"rounds": 3, "max_experiments": 9},
         "workspace": {
-            "allowed_paths": ["transforms-python/src/myproject/datasets/forecast.py"]
+            "seed": str(repo),
+            "runs": "runs",
+            "allowed_paths": [transform_rel],
         },
         "foundry": {
             "repo_dir": str(repo),
@@ -194,10 +227,7 @@ def foundry_setup(
     write_config = write_config.resolve()
     write_config.write_text(yaml.safe_dump(task, sort_keys=False))
     console.print(f"\n[green]Wrote task config:[/green] {write_config}")
-    console.print(
-        "Next: push the repo + baseline transform, then "
-        f"[bold]autoresearch run -c {write_config}[/bold]"
-    )
+    console.print(f"Next: [bold]autoresearch run -c {write_config}[/bold]")
 
 
 def _repo_rid_from_git(repo: Path) -> str:
@@ -224,6 +254,9 @@ def foundry_build_cmd(
     no_push: Annotated[
         bool, typer.Option("--no-push", help="Skip git push; build the already-published code")
     ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Rebuild even if Foundry considers the output up to date")
+    ] = False,
     timeout_s: Annotated[
         int | None, typer.Option(min=1, help="Override the build timeout (seconds)")
     ] = None,
@@ -233,7 +266,12 @@ def foundry_build_cmd(
     This is the manual 'train on Foundry' step: it publishes the current transform
     code and runs a build on Foundry compute, then reports the result.
     """
-    from .foundry_build import FoundryBuildError, create_build, push_repo, wait_for_build
+    from .foundry_build import (
+        FoundryBuildError,
+        create_build_when_ready,
+        push_repo,
+        wait_for_build,
+    )
 
     _load_env()
     cfg = load_config(config)
@@ -251,7 +289,13 @@ def foundry_build_cmd(
             sha = push_repo(repo_dir, branch=fdry.branch, message=message)
             console.print(f"  pushed{f' commit {sha[:8]}' if sha else ' (nothing new to commit)'}")
         console.print(f"[bold]Triggering build[/bold] of forecasts [dim]{target}[/dim]")
-        build_rid = create_build([target], branch=fdry.branch)
+
+        def on_wait(elapsed: float) -> None:
+            console.print(f"  [{elapsed:6.0f}s] waiting for Foundry to publish the transform…")
+
+        build_rid = create_build_when_ready(
+            [target], branch=fdry.branch, force=force, on_wait=on_wait
+        )
         console.print(f"  build {build_rid}")
 
         def on_status(status: str, elapsed: float) -> None:
@@ -267,6 +311,57 @@ def foundry_build_cmd(
     except (FoundryBuildError, FoundryError) as exc:
         console.print(f"[red]Foundry build failed:[/red] {exc}")
         raise typer.Exit(1) from exc
+
+
+@app.command(name="foundry-score")
+def foundry_score_cmd(
+    config: ConfigOption,
+    holdout: Annotated[
+        bool, typer.Option("--holdout", help="Also score the sealed holdout split")
+    ] = False,
+) -> None:
+    """Read the forecasts + sealed actuals back from Foundry and print the metrics."""
+    from .harness import forecasting_metrics
+
+    _load_env()
+    cfg = load_config(config)
+    if cfg.runtime != "foundry" or cfg.foundry is None:
+        raise typer.BadParameter("config is not runtime: foundry")
+    fdry = cfg.foundry
+    d = cfg.data
+    keys = [d.id_column, d.date_column]
+
+    forecasts = read_dataset(fdry.datasets.forecasts, branch=fdry.branch)
+    forecasts[d.date_column] = pd.to_datetime(forecasts[d.date_column], utc=True).dt.tz_localize(None)
+
+    table = Table(title="Foundry evaluation", show_edge=False)
+    table.add_column("Split")
+    table.add_column("Rows", justify="right")
+    table.add_column(cfg.metric.name, justify="right")
+    table.add_column("mape", justify="right")
+    table.add_column("rmse", justify="right")
+    table.add_column("bias%", justify="right")
+
+    def score(rid: str, label: str) -> None:
+        actuals = read_dataset(rid, branch=fdry.branch)
+        actuals[d.date_column] = pd.to_datetime(actuals[d.date_column], utc=True).dt.tz_localize(None)
+        merged = actuals.merge(forecasts[[*keys, "forecast"]], on=keys, validate="one_to_one")
+        met = forecasting_metrics(
+            merged[d.target_column].to_numpy(float), merged["forecast"].to_numpy(float)
+        )
+        table.add_row(
+            label,
+            f"{len(merged):,}",
+            f"{met['wmape']:.4f}",
+            f"{met['mape']:.4f}",
+            f"{met['rmse']:.3f}",
+            f"{met['bias_pct']:.2f}",
+        )
+
+    score(fdry.datasets.validation_actuals, "validation")
+    if holdout:
+        score(fdry.datasets.holdout_actuals, "holdout")
+    console.print(table)
 
 
 @app.command()

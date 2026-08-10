@@ -72,6 +72,19 @@ def push_repo(repo_dir: str | Path, *, branch: str = "master", message: str) -> 
         _git(repo, "commit", "-m", message)
         committed = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
+    # Foundry can advance the remote branch (server-side commits, other clients),
+    # so integrate it before pushing or the push is rejected as non-fast-forward.
+    fetch = _git(repo, "fetch", "origin", branch, check=False)
+    if fetch.returncode == 0:
+        rebase = _git(repo, "rebase", f"origin/{branch}", check=False)
+        if rebase.returncode != 0:
+            _git(repo, "rebase", "--abort", check=False)
+            raise FoundryBuildError(
+                f"could not rebase local changes onto Foundry origin/{branch}:\n"
+                f"{rebase.stderr.strip() or rebase.stdout.strip()}\n"
+                "Resolve the conflict in the transforms repo, then retry."
+            )
+
     push = _git(repo, "push", "origin", f"HEAD:{branch}", check=False)
     if push.returncode != 0:
         raise FoundryBuildError(
@@ -86,16 +99,25 @@ def create_build(
     *,
     branch: str = "master",
     retry_count: int = 0,
+    force: bool = False,
+    fallback_branches: list[str] | None = None,
 ) -> str:
-    """Trigger a manual build of ``target_rids`` and return the build RID."""
+    """Trigger a manual build of ``target_rids`` and return the build RID.
+
+    ``force`` sets ``forceBuild`` to rebuild even when Foundry considers the
+    output up to date (staleness ignored). ``fallback_branches`` lets a build on
+    an experiment branch resolve input datasets that only have transactions on
+    the main branch.
+    """
     payload = foundry._api_json(
         "POST",
         "/api/v2/orchestration/builds/create",
         body={
             "abortOnFailure": False,
+            "forceBuild": force,
             "retryBackoffDuration": {"unit": "SECONDS", "value": 30},
             "retryCount": retry_count,
-            "fallbackBranches": [],
+            "fallbackBranches": list(fallback_branches or []),
             "branchName": branch,
             "target": {"type": "manual", "targetRids": target_rids},
         },
@@ -104,6 +126,49 @@ def create_build(
     if not build_rid:
         raise FoundryBuildError(f"build create returned no RID: {payload}")
     return str(build_rid)
+
+
+# Both mean "the code we just pushed hasn't republished yet": no job spec at all
+# (first publish) or the old spec still matches the output (new publish pending).
+_PUBLISH_PENDING = ("BuildTargetsMissingJobSpecs", "BuildTargetsUpToDate")
+
+
+def create_build_when_ready(
+    target_rids: list[str],
+    *,
+    branch: str = "master",
+    force: bool = False,
+    publish_timeout_s: int = 1500,
+    poll_s: int = 20,
+    on_wait=None,
+) -> str:
+    """Create a build, retrying while the just-pushed transform is still publishing.
+
+    After a push, Foundry runs a publish/CI job before the new logic takes effect;
+    until then ``create_build`` returns ``BuildTargetsMissingJobSpecs`` (first
+    publish) or ``BuildTargetsUpToDate`` (new version not live yet). We poll until
+    a build is warranted or ``publish_timeout_s`` elapses. ``on_wait`` is an
+    optional ``(elapsed_s: float)`` progress callback.
+    """
+    start = time.monotonic()
+    while True:
+        try:
+            return create_build(target_rids, branch=branch, force=force)
+        except foundry.FoundryError as exc:
+            if not any(name in str(exc) for name in _PUBLISH_PENDING):
+                raise
+            elapsed = time.monotonic() - start
+            if elapsed > publish_timeout_s:
+                raise FoundryBuildError(
+                    "the pushed transform never became buildable within "
+                    f"{publish_timeout_s}s (still up-to-date / no job spec). "
+                    "Open the repository's Checks tab in Foundry — a failing "
+                    "publish/CI job, or an unchanged transform, would explain this. "
+                    "Use --force to rebuild unchanged code."
+                ) from exc
+            if on_wait:
+                on_wait(elapsed)
+            time.sleep(poll_s)
 
 
 def get_build(build_rid: str) -> dict:

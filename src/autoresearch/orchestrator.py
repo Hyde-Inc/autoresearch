@@ -26,6 +26,7 @@ from .dashboard import AgentDashboard
 from .director import ResearchDirector, openrouter_client
 from .editor import open_in_editor
 from .harness import Evaluation, evaluate
+from .harness_foundry import evaluate as foundry_evaluate
 from .models import Attempt, Idea
 from .plans import (
     PlanError,
@@ -74,9 +75,42 @@ def _paths_allowed(paths: list[str], prefixes: list[str]) -> list[str]:
     return [path for path in paths if not any(path.startswith(prefix) for prefix in prefixes)]
 
 
+def _main_ref(config: TaskConfig) -> str:
+    """The branch experiments start from and winners merge back into."""
+    if config.runtime == "foundry" and config.foundry is not None:
+        return config.foundry.branch
+    return "main"
+
+
 async def validate_baseline(config: TaskConfig) -> Evaluation:
     seed = config.resolve(config.workspace.seed)
+    if config.runtime == "foundry":
+        # Baseline = whatever transform is currently published on the main
+        # branch; never push local state from the user's repo.
+        return await foundry_evaluate(
+            seed,
+            config,
+            baseline=None,
+            guardrails=config.guardrails,
+            push=False,
+            branch=_main_ref(config),
+        )
     return await evaluate(seed, config, baseline=None, guardrails=config.guardrails)
+
+
+async def _final_evaluate(
+    worktree: Path,
+    config: TaskConfig,
+    baseline: dict[str, float],
+    on_progress,
+) -> Evaluation:
+    """Final gate (validation + holdout), routed by runtime. On Foundry the
+    experiment's branch was already built during the worker loop, so this
+    usually only re-reads the forecasts (it rebuilds if the worker rolled back
+    to an earlier snapshot)."""
+    if config.runtime == "foundry":
+        return await foundry_evaluate(worktree, config, baseline=baseline, on_progress=on_progress)
+    return await evaluate(worktree, config, baseline=baseline, on_progress=on_progress)
 
 
 async def _execute_attempt(
@@ -130,11 +164,11 @@ async def _execute_attempt(
             attempt.error = worker.error
         else:
             tracker.set(EVALUATING, "final gate: validation + holdout splits")
-            result = await evaluate(
+            result = await _final_evaluate(
                 worker.worktree,
                 config,
-                baseline=baseline,
-                on_progress=lambda line: tracker.set(action=line),
+                baseline,
+                lambda line: tracker.set(action=line),
             )
             attempt.metrics = result.metrics
             attempt.holdout_metrics = result.holdout_metrics
@@ -429,6 +463,7 @@ async def run_research(
     seed_template = config.resolve(config.workspace.seed)
     if not seed_template.exists():
         raise RuntimeError(f"seed workspace does not exist: {seed_template}; run prepare.py first")
+    main_ref = _main_ref(config)
     if resume_store:
         store = resume_store
         repo = store.run_dir / "repo"
@@ -437,7 +472,7 @@ async def run_research(
         prior = store.load_state()
         baseline = prior["baseline"]
         incumbent = prior["incumbent"]
-        incumbent_ref = prior.get("incumbent_ref", "main")
+        incumbent_ref = prior.get("incumbent_ref", main_ref)
         completed = int(prior.get("completed", len(store.load_attempts())))
         round_number = int(prior.get("round", 0))
         # Continue the same session folder so the notebook stays in one place.
@@ -459,7 +494,7 @@ async def run_research(
         holdout_key = f"holdout_{config.metric.name}"
         baseline[holdout_key] = baseline_eval.holdout_metrics[config.metric.name]
         incumbent = baseline
-        incumbent_ref = "main"
+        incumbent_ref = main_ref
         completed = 0
         round_number = 0
     if session_dir is None:
@@ -474,7 +509,7 @@ async def run_research(
                 "metric_direction": config.metric.direction,
                 "baseline": baseline,
                 "incumbent": baseline,
-                "incumbent_ref": "main",
+                "incumbent_ref": main_ref,
                 "completed": 0,
                 "round": 0,
                 "session_dir": str(session_dir),
@@ -554,7 +589,7 @@ async def run_research(
                     attempt.error = f"promotion failed: {output}"
                 else:
                     attempt.promoted = True
-                    incumbent_ref = "main"
+                    incumbent_ref = main_ref
                     incumbent = dict(attempt.metrics)
                     incumbent[f"holdout_{config.metric.name}"] = attempt.holdout_metrics[
                         config.metric.name
@@ -563,6 +598,21 @@ async def run_research(
                         f"[green]Promoted {attempt.id}[/green]: "
                         f"{config.metric.name}={attempt.metrics[config.metric.name]:.6f}"
                     )
+                    if config.runtime == "foundry":
+                        # The winner goes live: its code becomes the published
+                        # transform on the main Foundry branch.
+                        code, output = await _run(
+                            "git", "push", "origin", f"HEAD:{main_ref}", cwd=repo
+                        )
+                        if code:
+                            console.print(
+                                f"[yellow]! could not push the promoted model to Foundry "
+                                f"{main_ref}: {output.strip()}[/yellow]"
+                            )
+                        else:
+                            console.print(
+                                f"[green]Pushed the promoted model to Foundry {main_ref}[/green]"
+                            )
                 store.save_attempt(attempt)
             if round_cancelled:
                 # Skip the director's reflection: every agent was interrupted.

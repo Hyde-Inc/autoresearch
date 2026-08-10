@@ -11,7 +11,8 @@ from pathlib import Path
 
 from .agent_status import COMMITTING, EVALUATING, EXPLORING, SETTING_UP, TRAINING
 from .config import TaskConfig
-from .harness import evaluate_validation
+from .harness import Evaluation, evaluate_validation
+from .harness_foundry import evaluate_validation as foundry_evaluate_validation
 from .metrics import load_task_spec
 from .models import Idea
 from .opencode import OpenCodeResult, run_opencode
@@ -67,16 +68,50 @@ _PROMPT_RULES = (
 )
 
 
-def _fix_prompt(failure: str) -> str:
+def _entry_path(config: TaskConfig) -> str:
+    """The file the agent must produce: solution/train.py locally, the Foundry
+    transform when the task trains on Foundry."""
+    if config.runtime == "foundry":
+        paths = [p.rstrip("/") for p in config.workspace.allowed_paths]
+        for path in paths:
+            if path.endswith(".py"):
+                return path
+        return paths[0] if paths else "the transform file"
+    return "solution/train.py"
+
+
+def _task_doc(config: TaskConfig) -> str:
+    return "AUTORESEARCH.md" if config.runtime == "foundry" else "TASK.md"
+
+
+def _prompt_rules(config: TaskConfig) -> str:
+    if config.runtime != "foundry":
+        return _PROMPT_RULES
+    entry = _entry_path(config)
     return (
-        "The orchestrator ran your solution and it did not produce a valid scored result:\n\n"
-        f"{failure[:4000]}\n\n"
-        "Diagnose and fix the problem so solution/train.py runs end to end within the runtime "
-        f"budget. Re-read TASK.md and EXPERIMENT.md if you need to. {_PROMPT_RULES}"
+        f"You may only modify {entry}. Keep the @transform decorator, the Input/Output "
+        "dataset paths, and the output schema exactly as they are - only change the "
+        "forecasting logic. Do not run training or install packages yourself; only the "
+        "libraries pinned in the repo's conda recipe are available on Foundry. After your "
+        "reply ends, the orchestrator pushes your code to Foundry, builds it there on the "
+        "real data, and reports the score back into this conversation. Do not ask "
+        "questions. Do not commit changes."
     )
 
 
-def _improve_prompt(metric: str, value: float, target: float | None, direction: str) -> str:
+def _fix_prompt(config: TaskConfig, failure: str) -> str:
+    return (
+        "The orchestrator ran your solution and it did not produce a valid scored result:\n\n"
+        f"{failure[:4000]}\n\n"
+        f"Diagnose and fix the problem so {_entry_path(config)} runs end to end within the "
+        f"runtime budget. Re-read {_task_doc(config)} and EXPERIMENT.md if you need to. "
+        f"{_prompt_rules(config)}"
+    )
+
+
+def _improve_prompt(
+    config: TaskConfig, metric: str, value: float, target: float | None, direction: str
+) -> str:
     goal = "lower" if direction == "min" else "higher"
     comparison = (
         f" It must be {goal} than the incumbent's {metric}={target:.6f} to be promoted."
@@ -86,30 +121,48 @@ def _improve_prompt(metric: str, value: float, target: float | None, direction: 
     return (
         "The orchestrator trained and scored your solution on the validation split: "
         f"{metric}={value:.6f}.{comparison} Improve the solution - prefer one focused change "
-        "over a rewrite, and keep solution/train.py runnable end to end at all times. "
-        f"{_PROMPT_RULES}"
+        f"over a rewrite, and keep {_entry_path(config)} runnable end to end at all times. "
+        f"{_prompt_rules(config)}"
     )
 
 
-def _verify_build(worktree: Path) -> str | None:
+def _verify_build(worktree: Path, config: TaskConfig) -> str | None:
     """Cheap build check before spending a training run: the entry point must
     exist and parse."""
-    train = worktree / "solution" / "train.py"
-    if not train.exists():
-        return "solution/train.py does not exist"
+    entry = _entry_path(config)
+    target = worktree / entry
+    if not target.exists():
+        return f"{entry} does not exist"
     try:
-        ast.parse(train.read_text(), filename="solution/train.py")
+        ast.parse(target.read_text(), filename=entry)
     except SyntaxError as exc:
-        return f"solution/train.py has a syntax error: {exc}"
+        return f"{entry} has a syntax error: {exc}"
     return None
 
 
-async def _snapshot(worktree: Path, title: str, session: int) -> tuple[str | None, str | None]:
-    """Commit the current solution/ state after one session.
+async def _evaluate_validation(
+    worktree: Path,
+    config: TaskConfig,
+    *,
+    baseline: dict[str, float] | None,
+    guardrails: list[str] | None,
+    on_progress,
+) -> Evaluation:
+    """TRAIN + EVALUATE, routed by runtime: local subprocess or Foundry build."""
+    runner = foundry_evaluate_validation if config.runtime == "foundry" else evaluate_validation
+    return await runner(
+        worktree, config, baseline=baseline, guardrails=guardrails, on_progress=on_progress
+    )
+
+
+async def _snapshot(
+    worktree: Path, title: str, session: int, paths: list[str]
+) -> tuple[str | None, str | None]:
+    """Commit the current state of the agent-editable paths after one session.
 
     Returns ``(sha, error)``; ``sha`` is None when nothing changed since the
     previous snapshot."""
-    await _run("git", "add", "solution", cwd=worktree)
+    await _run("git", "add", "--", *paths, cwd=worktree)
     staged, _ = await _run("git", "diff", "--cached", "--quiet", cwd=worktree)
     if staged == 0:
         return None, None
@@ -214,15 +267,21 @@ async def run_worker(
             f"```python\n{spec.code}\n```\n"
         )
     (worktree / "EXPERIMENT.md").write_text(experiment)
-    prompt = (
-        "You are an autonomous ML research engineer. Read TASK.md and EXPERIMENT.md. "
-        "Implement this experiment completely. Division of labor: you BUILD solution/train.py; "
-        "after your reply ends, the orchestrator TRAINS it on the real evaluation inputs and "
-        "SCORES the forecasts, then reports the result back into this conversation so you can "
-        "fix or improve it. Get a complete end-to-end solution/train.py written before "
-        "polishing details, and keep its runtime within the stated budget. "
-        f"{_PROMPT_RULES}"
+    entry = _entry_path(config)
+    trains_where = (
+        "the orchestrator PUSHES it to Foundry, BUILDS it there on the real data"
+        if config.runtime == "foundry"
+        else "the orchestrator TRAINS it on the real evaluation inputs"
     )
+    prompt = (
+        f"You are an autonomous ML research engineer. Read {_task_doc(config)} and "
+        f"EXPERIMENT.md. Implement this experiment completely. Division of labor: you BUILD "
+        f"{entry}; after your reply ends, {trains_where} and SCORES the forecasts, then "
+        "reports the result back into this conversation so you can fix or improve it. Get a "
+        f"complete end-to-end {entry} written before polishing details, and keep its runtime "
+        f"within the stated budget. {_prompt_rules(config)}"
+    )
+    snapshot_paths = [p.rstrip("/") for p in config.workspace.allowed_paths] or ["solution"]
     log_path = store.logs_dir / f"{attempt_id}.jsonl"
     # Session state must outlive individual opencode runs so the loop can
     # resume the same conversation with evaluator feedback.
@@ -283,8 +342,8 @@ async def run_worker(
             session_id = last_result.session_id or session_id
             timed_out = last_result.error is not None and "timeout" in last_result.error
             note = "session timed out mid-build; " if timed_out else ""
-            phase(COMMITTING, f"session {sessions}: snapshotting solution/")
-            sha, commit_error = await _snapshot(worktree, idea.title, sessions)
+            phase(COMMITTING, f"session {sessions}: snapshotting changes")
+            sha, commit_error = await _snapshot(worktree, idea.title, sessions, snapshot_paths)
             if commit_error:
                 error = commit_error
                 record("commit", commit_error, head)
@@ -300,14 +359,22 @@ async def run_worker(
                 record("build", last_result.error, head)
                 break  # hard CLI/provider failure; keep what was harvested
             # Verify the build before spending a training run on it.
-            build_error = _verify_build(worktree)
+            build_error = _verify_build(worktree, config)
             if build_error is not None:
                 check, value, failure = None, None, build_error
                 phase(EVALUATING, f"session {sessions}: build check failed")
                 record("build", note + build_error, head)
             else:
-                phase(TRAINING, f"session {sessions}: training on the validation split")
-                check = await evaluate_validation(
+                phase(
+                    TRAINING,
+                    f"session {sessions}: "
+                    + (
+                        "building on Foundry"
+                        if config.runtime == "foundry"
+                        else "training on the validation split"
+                    ),
+                )
+                check = await _evaluate_validation(
                     worktree,
                     config,
                     baseline=baseline,
@@ -336,7 +403,7 @@ async def run_worker(
                     break  # done: a clean score that beats the incumbent
                 if stall >= STALL_LIMIT:
                     break
-                prompt = _improve_prompt(primary, value, target, direction)
+                prompt = _improve_prompt(config, primary, value, target, direction)
             else:
                 if build_error is None:
                     step = "train" if failure.startswith(("training exceeded", "solution exited")) else "evaluate"
@@ -345,7 +412,7 @@ async def run_worker(
                 if failure == last_failure:
                     break  # identical failure twice in a row: the agent is stuck
                 last_failure = failure
-                prompt = _fix_prompt(failure)
+                prompt = _fix_prompt(config, failure)
     finally:
         # The scratch XDG root holds a copy of opencode's auth.json.
         shutil.rmtree(scratch, ignore_errors=True)

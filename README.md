@@ -512,6 +512,41 @@ as cancelled.
 autoresearch stop
 ```
 
+## Train on Palantir Foundry (`runtime: foundry`)
+
+The full research loop can train on Foundry compute instead of locally: agents rewrite a
+Foundry Python transform, each experiment is pushed to its own Foundry branch and built there,
+and the CLI reads the branch's `forecasts` output plus the sealed actuals back through
+readTable to score it. Because Foundry datasets are branch-aware, parallel agents never
+collide — each gets its own published transform and its own forecasts branch. The winning
+experiment is merged and pushed to `master`, so promotion literally ships the model.
+
+Requires `FOUNDRY_HOSTNAME` and `FOUNDRY_TOKEN` in `.env` (scopes: `api:datasets-read`,
+`api:datasets-write`, `api:orchestration-write`).
+
+### `autoresearch foundry-setup --repo <transforms-repo>`
+One-shot installer for any cloned Foundry Python transforms repository. Reads the repo's
+`gradle.properties` for its identity, provisions the five datasets (`sales_train`,
+`forecast_request`, `forecasts`, `validation_actuals`, `holdout_actuals`) under the project's
+`autoresearch/` folder, scaffolds the baseline transform + `AUTORESEARCH.md` contract +
+curated conda dependencies, pushes so the baseline publishes, and writes `foundry-task.yaml`.
+
+```bash
+autoresearch foundry-setup --repo ~/code/my-foundry-repo
+autoresearch run -c foundry-task.yaml        # the autonomous loop, training on Foundry
+```
+
+- `--n-skus`, `--n-days`, `--validation-days`, `--holdout-days` — synthetic data shape.
+- `--no-push` — scaffold and provision only.
+
+### `autoresearch foundry-build -c foundry-task.yaml [-m MSG] [--force] [--no-push]`
+Manual one-shot: push the repo, wait for the transform to publish, build `forecasts` on the
+configured branch, and poll to completion. Useful for demos and debugging outside the loop.
+
+### `autoresearch foundry-score -c foundry-task.yaml [--holdout]`
+Read the current `forecasts` output and the sealed actuals from Foundry and print the metrics
+table without triggering a build.
+
 ## Guardrails
 
 Guardrails prevent an agent from improving one number while making the model worse somewhere else.

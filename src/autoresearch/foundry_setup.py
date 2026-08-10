@@ -17,6 +17,7 @@ The transform in the repo binds to these by path, so the paths here must match
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -177,3 +178,224 @@ def result_as_config(result: SetupResult) -> dict[str, str]:
             "holdout_actuals",
         )
     }
+
+
+# --------------------------------------------------------------------------
+# Repo scaffolding: turn ANY Foundry Python transforms repo into an
+# autoresearch-ready one (transform + contract doc + curated dependencies).
+# --------------------------------------------------------------------------
+
+REQUIRED_PACKAGES = ["numpy", "pandas", "pyarrow", "scikit-learn", "statsmodels", "xgboost", "lightgbm"]
+
+
+def read_gradle_properties(repo: Path) -> dict[str, str]:
+    """Parse ``gradle.properties`` — every transforms repo carries its own
+    identity there (repo RID, project path, default branch)."""
+    path = repo / "gradle.properties"
+    props: dict[str, str] = {}
+    if not path.exists():
+        return props
+    for line in path.read_text().splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, _, value = line.partition("=")
+            props[key.strip()] = value.strip()
+    return props
+
+
+def find_package_dir(repo: Path) -> Path:
+    """The python package under transforms-python/src (usually ``myproject``)."""
+    src = repo / "transforms-python" / "src"
+    if not src.exists():
+        raise foundry.FoundryError(
+            f"{repo} does not look like a Foundry Python transforms repo "
+            "(transforms-python/src is missing)"
+        )
+    for child in sorted(src.iterdir()):
+        if child.is_dir() and not child.name.endswith(".egg-info") and child.name != "tests":
+            return child
+    raise foundry.FoundryError(f"no python package found under {src}")
+
+
+_TRANSFORM_TEMPLATE = '''"""Autoresearch training transform — the model runs on Foundry compute.
+
+The autoresearch loop rewrites ONLY the body of ``build_forecasts`` to improve
+the model. Do NOT change the ``@transform`` decorator, the Input/Output dataset
+paths, or the output schema: the CLI pushes this repo, triggers a Foundry build
+of the ``forecasts`` dataset, then reads it back and scores it against sealed
+validation / holdout actuals it alone can see.
+
+Contract
+--------
+Input  ``sales_train``      : the training history. Columns:
+    sku_id (str), date (date), units_sold (float), promo (int 0/1),
+    price (float), category (str).
+Input  ``forecast_request`` : the rows to forecast (validation + holdout dates),
+    columns sku_id (str), date (date). NO target — actuals are sealed.
+Output ``forecasts``        : exactly sku_id (str), date (date),
+    forecast (float, finite, >= 0). One row per requested (sku_id, date).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from transforms.api import Input, Output, lightweight, transform
+
+# Fixed wiring - do not edit. autoresearch foundry-setup created these datasets.
+SALES_TRAIN = "{datasets_path}/sales_train"
+FORECAST_REQUEST = "{datasets_path}/forecast_request"
+FORECASTS = "{datasets_path}/forecasts"
+
+ID = "sku_id"
+DATE = "date"
+TARGET = "units_sold"
+
+
+@lightweight
+@transform(
+    sales_train=Input(SALES_TRAIN),
+    forecast_request=Input(FORECAST_REQUEST),
+    forecasts=Output(FORECASTS),
+)
+def compute(sales_train, forecast_request, forecasts):
+    train = sales_train.pandas()
+    request = forecast_request.pandas()
+    result = build_forecasts(train, request)
+    forecasts.write_pandas(result)
+
+
+def build_forecasts(train: pd.DataFrame, request: pd.DataFrame) -> pd.DataFrame:
+    """Baseline: per-SKU mean of the same weekday over the last 28 days.
+
+    Deliberately simple - autoresearch replaces this function with stronger
+    models. Must return exactly ``request`` rows plus a finite, non-negative
+    ``forecast`` column.
+    """
+    train = train.copy()
+    train[DATE] = pd.to_datetime(train[DATE])
+    request = request.copy()
+    request[DATE] = pd.to_datetime(request[DATE])
+
+    recent = train[train[DATE] >= train[DATE].max() - pd.Timedelta(days=27)]
+    recent = recent.assign(_dow=recent[DATE].dt.dayofweek)
+    dow_mean = recent.groupby([ID, "_dow"])[TARGET].mean().to_dict()
+    sku_mean = recent.groupby(ID)[TARGET].mean().to_dict()
+    global_mean = float(train[TARGET].mean()) if len(train) else 0.0
+
+    values = [
+        dow_mean.get(
+            (getattr(row, ID), getattr(row, DATE).dayofweek),
+            sku_mean.get(getattr(row, ID), global_mean),
+        )
+        for row in request.itertuples(index=False)
+    ]
+    result = request[[ID, DATE]].copy()
+    result["forecast"] = np.maximum(0.0, np.asarray(values, dtype=float))
+    return result
+'''
+
+_CONTRACT_TEMPLATE = """# Autoresearch × Foundry
+
+This Foundry transforms repository is driven by the **autoresearch CLI**. Agents rewrite
+the model code; the actual **training runs on Foundry** as a build of the `forecasts`
+dataset. Each experiment is pushed to its own Foundry branch and built there, so parallel
+agents produce independent forecasts; the winner is merged and pushed back to `{branch}`.
+
+## The loop
+
+1. BUILD — an agent rewrites `build_forecasts()` in `{transform_rel}`.
+2. TRAIN — the CLI pushes the experiment branch, Foundry publishes the transform, and a
+   build of `forecasts` runs on that branch (inputs fall back to `{branch}`).
+3. EVALUATE — the CLI reads the branch's `forecasts` plus the sealed actuals via
+   readTable, scores them, and feeds the result back to the agent.
+4. PROMOTE — the best passing experiment is merged and pushed to `{branch}`.
+
+Validation drives the improve loop; the hidden holdout is scored only at the final gate.
+
+## Datasets (under `{datasets_path}/`)
+
+| Dataset             | Role                          | Visible to the transform? |
+| ------------------- | ----------------------------- | ------------------------- |
+| `sales_train`       | training history (input)      | yes                       |
+| `forecast_request`  | (sku_id, date) rows to score  | yes                       |
+| `forecasts`         | model output (build result)   | written by the build      |
+| `validation_actuals`| sealed validation answers     | **no** — CLI only         |
+| `holdout_actuals`   | sealed holdout answers        | **no** — CLI only         |
+
+`sales_train` schema: `sku_id` (str), `date` (date), `units_sold` (float), `promo` (0/1),
+`price` (float), `category` (str).
+`forecasts` schema (exact): `sku_id` (str), `date` (date), `forecast` (float, finite, ≥ 0),
+one row per requested (sku_id, date).
+
+## Rules for the agent
+
+- Edit **only** `build_forecasts()` in `{transform_rel}`.
+- Do **not** change the `@transform` decorator, the Input/Output paths, or the output schema.
+- Do **not** edit dependencies. The forecasting stack (numpy, pandas, scikit-learn,
+  statsmodels, xgboost, lightgbm) is pre-declared in `transforms-python/conda_recipe/meta.yaml`.
+- The model may read only `sales_train` and `forecast_request`; the actuals are never inputs.
+"""
+
+
+def _patch_conda_recipe(repo: Path) -> bool:
+    """Add the curated forecasting packages to the recipe's ``run:`` block.
+
+    meta.yaml contains jinja placeholders, so this is a text patch, not a yaml
+    round-trip. Returns True when the file changed."""
+    path = repo / "transforms-python" / "conda_recipe" / "meta.yaml"
+    if not path.exists():
+        return False
+    text = path.read_text()
+    missing = [pkg for pkg in REQUIRED_PACKAGES if f"- {pkg}" not in text]
+    if not missing:
+        return False
+    lines = text.splitlines()
+    # Insert after the last "    - ..." entry of the run: block.
+    insert_at = None
+    in_run = False
+    for index, line in enumerate(lines):
+        if line.strip() == "run:":
+            in_run = True
+            insert_at = index
+            continue
+        if in_run:
+            if line.strip().startswith("- ") or line.strip().startswith("#") or not line.strip():
+                if line.strip().startswith("- "):
+                    insert_at = index
+            else:
+                break
+    if insert_at is None:
+        return False
+    addition = ["    # Forecasting stack for the autoresearch model transform."] + [
+        f"    - {pkg}" for pkg in missing
+    ]
+    lines[insert_at + 1 : insert_at + 1] = addition
+    path.write_text("\n".join(lines) + "\n")
+    return True
+
+
+def scaffold(repo: Path, datasets_path: str, branch: str) -> tuple[str, list[str]]:
+    """Install the autoresearch contract into ``repo``.
+
+    Writes the model transform (only if missing, so an improved model is never
+    clobbered), the AUTORESEARCH.md contract, and the curated dependencies.
+    Returns ``(transform_rel_path, actions)``."""
+    package = find_package_dir(repo)
+    datasets_dir = package / "datasets"
+    datasets_dir.mkdir(exist_ok=True)
+    transform = datasets_dir / "forecast.py"
+    transform_rel = str(transform.relative_to(repo))
+    actions: list[str] = []
+    if not transform.exists():
+        transform.write_text(_TRANSFORM_TEMPLATE.format(datasets_path=datasets_path))
+        actions.append(f"wrote baseline transform {transform_rel}")
+    contract = repo / "AUTORESEARCH.md"
+    contract.write_text(
+        _CONTRACT_TEMPLATE.format(
+            datasets_path=datasets_path, transform_rel=transform_rel, branch=branch
+        )
+    )
+    actions.append("wrote AUTORESEARCH.md")
+    if _patch_conda_recipe(repo):
+        actions.append("added forecasting packages to conda_recipe/meta.yaml")
+    return transform_rel, actions
