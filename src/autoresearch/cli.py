@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Annotated
 
+import pandas as pd
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
@@ -14,7 +15,8 @@ from rich.table import Table
 from .chat import input_box
 from .config import load_config
 from .director import openrouter_client
-from .ingest import ingest_csv, preview_csv
+from .foundry import FoundryError, parse_dataset_reference, read_dataset
+from .ingest import apply_column_mapping, ingest_frame, preview_frame
 from .interview import SetupSession, print_spec
 from .metrics import MetricInterpreter, adopt_spec, eval_columns
 from .models import Idea
@@ -94,15 +96,70 @@ def resume(
 
 @app.command()
 def ingest(
-    csv: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="Sales CSV")],
+    source: Annotated[
+        str,
+        typer.Argument(
+            help="Sales CSV path, or a Foundry dataset: foundry://ri.foundry.main.dataset.<uuid>"
+        ),
+    ],
     name: Annotated[str, typer.Option("--name", "-n", help="Task name")],
     tasks_root: Annotated[Path, typer.Option(help="Task output directory")] = Path("tasks"),
     validation_days: Annotated[int | None, typer.Option(min=1)] = None,
     holdout_days: Annotated[int | None, typer.Option(min=1)] = None,
     overwrite: Annotated[bool, typer.Option(help="Replace an existing task")] = False,
+    branch: Annotated[
+        str | None, typer.Option(help="Foundry branch to read (default: the dataset default)")
+    ] = None,
+    id_column: Annotated[
+        str | None, typer.Option(help="Source column to use as sku_name")
+    ] = None,
+    date_column: Annotated[str | None, typer.Option(help="Source column to use as date")] = None,
+    target_column: Annotated[
+        str | None, typer.Option(help="Source column to use as sales")
+    ] = None,
+    price_column: Annotated[
+        str | None, typer.Option(help="Source column to use as selling_price")
+    ] = None,
 ) -> None:
-    """Turn a sales CSV into a protected forecasting task."""
-    preview = preview_csv(csv)
+    """Turn a sales history (local CSV or Foundry dataset) into a protected forecasting task."""
+    load_dotenv()
+    try:
+        rid = parse_dataset_reference(source)
+    except FoundryError as exc:
+        console.print(f"[red]x {exc}[/red]")
+        raise typer.Exit(1) from None
+
+    if rid:
+        console.print(f"Reading Foundry dataset [bold]{rid}[/bold]" + (f" ({branch})" if branch else ""))
+        try:
+            frame = read_dataset(rid, branch=branch)
+        except FoundryError as exc:
+            console.print(f"[red]x {exc}[/red]")
+            raise typer.Exit(1) from None
+        console.print(f"Downloaded [bold]{len(frame)}[/bold] rows from Foundry")
+    else:
+        path = Path(source)
+        if not path.is_file():
+            raise typer.BadParameter(f"'{source}' is not a file or a Foundry dataset reference")
+        try:
+            frame = pd.read_csv(path)
+        except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
+            console.print(f"[red]x could not read CSV: {exc}[/red]")
+            raise typer.Exit(1) from None
+
+    try:
+        frame = apply_column_mapping(
+            frame,
+            id_column=id_column,
+            date_column=date_column,
+            target_column=target_column,
+            price_column=price_column,
+        )
+    except ValueError as exc:
+        console.print(f"[red]x {exc}[/red]")
+        raise typer.Exit(1) from None
+
+    preview = preview_frame(frame)
     for warning in preview.warnings:
         console.print(f"[yellow]! {warning}[/yellow]")
     if not preview.ok:
@@ -113,8 +170,8 @@ def ingest(
         f"Found [bold]{preview.rows}[/bold] rows, [bold]{preview.skus}[/bold] items, "
         f"{preview.distinct_dates} dates ({preview.date_min} to {preview.date_max})"
     )
-    result = ingest_csv(
-        csv,
+    result = ingest_frame(
+        frame,
         name=name,
         tasks_root=tasks_root,
         validation_days=validation_days,

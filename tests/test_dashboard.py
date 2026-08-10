@@ -95,6 +95,18 @@ def test_keys_select_rows_toggle_help_and_fire_callbacks() -> None:
     assert not dashboard.show_help
 
 
+def test_chat_key_suspends_live_and_fires_callback() -> None:
+    chats: list[bool] = []
+    console = Console(file=io.StringIO())
+    dashboard = AgentDashboard(console, "Round 1", _agents(), on_chat=lambda: chats.append(True))
+    dashboard.handle_key("c")
+    assert chats == [True]
+    # Without a chat callback the key is a no-op.
+    silent = AgentDashboard(console, "Round 1", _agents())
+    silent.handle_key("c")  # must not raise
+    assert "[c] chat" in _rendered(dashboard)
+
+
 def test_non_tty_fallback_prints_periodic_plain_summaries() -> None:
     buffer = io.StringIO()
     console = Console(file=buffer, force_terminal=False, width=200)

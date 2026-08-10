@@ -1,4 +1,4 @@
-"""CSV ingestion: turn a standard-schema sales export into a runnable task.
+"""Data ingestion: turn a standard-schema sales history into a runnable task.
 
 The product's fixed input schema is:
 
@@ -9,6 +9,10 @@ and show the user what was found. ``ingest_csv`` cleans the data, splits it
 chronologically into train / validation / holdout, and writes a complete task
 directory (seed workspace, private actuals, and task.yaml) that the existing
 orchestrator can run unchanged.
+
+Sources that are not local CSV files (e.g. Foundry datasets) arrive as
+DataFrames: ``apply_column_mapping`` renames source columns onto the standard
+schema, and ``preview_frame`` / ``ingest_frame`` run the same pipeline.
 """
 
 from __future__ import annotations
@@ -73,6 +77,38 @@ def _read_csv(data: str | bytes | Path) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(data))
 
 
+def apply_column_mapping(
+    frame: pd.DataFrame,
+    *,
+    id_column: str | None = None,
+    date_column: str | None = None,
+    target_column: str | None = None,
+    price_column: str | None = None,
+) -> pd.DataFrame:
+    """Rename source columns onto the standard schema, validating they exist."""
+    mapping = {
+        source: standard
+        for source, standard in (
+            (id_column, ID_COLUMN),
+            (date_column, DATE_COLUMN),
+            (target_column, TARGET_COLUMN),
+            (price_column, "selling_price"),
+        )
+        if source and source != standard
+    }
+    if not mapping:
+        return frame
+    frame = frame.copy()
+    frame.columns = [str(c).strip() for c in frame.columns]
+    missing = [source for source in mapping if source not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"column(s) not found in the data: {', '.join(missing)} "
+            f"(available: {', '.join(frame.columns)})"
+        )
+    return frame.rename(columns=mapping)
+
+
 def _clean(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """Normalise types, drop unusable rows, and report what was adjusted."""
     warnings: list[str] = []
@@ -128,7 +164,11 @@ def preview_csv(data: str | bytes | Path) -> Preview:
         frame = _read_csv(data)
     except Exception as exc:  # noqa: BLE001
         return Preview(ok=False, errors=[f"could not read CSV: {exc}"])
+    return preview_frame(frame)
 
+
+def preview_frame(frame: pd.DataFrame) -> Preview:
+    """Validate and summarise an already-loaded sales history."""
     columns = [str(c).strip() for c in frame.columns]
     missing = [c for c in REQUIRED_COLUMNS if c not in columns]
     if missing:
@@ -257,9 +297,12 @@ name = "{name}-experiment"
 version = "0.1.0"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+  "catboost>=1.2",
+  "lightgbm>=4.5",
   "numpy>=2.0",
   "pandas>=2.2",
   "pyarrow>=17",
+  "scikit-learn>=1.5",
   "statsmodels>=0.14",
   "xgboost>=2.1",
 ]
@@ -298,7 +341,26 @@ def ingest_csv(
     overwrite: bool = False,
 ) -> IngestResult:
     """Create a complete task directory from a standard-schema sales CSV."""
-    frame = _read_csv(data)
+    return ingest_frame(
+        _read_csv(data),
+        name=name,
+        tasks_root=tasks_root,
+        validation_days=validation_days,
+        holdout_days=holdout_days,
+        overwrite=overwrite,
+    )
+
+
+def ingest_frame(
+    frame: pd.DataFrame,
+    *,
+    name: str,
+    tasks_root: Path,
+    validation_days: int | None = None,
+    holdout_days: int | None = None,
+    overwrite: bool = False,
+) -> IngestResult:
+    """Create a complete task directory from an already-loaded sales history."""
     missing = [c for c in REQUIRED_COLUMNS if c not in [str(c).strip() for c in frame.columns]]
     if missing:
         raise ValueError(f"missing required column(s): {', '.join(missing)}")

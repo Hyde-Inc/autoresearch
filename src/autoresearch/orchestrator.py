@@ -11,6 +11,7 @@ from typing import Literal
 
 from rich.console import Console
 
+from .agent_chat import RoundChat
 from .agent_status import (
     CANCELLED,
     EVALUATING,
@@ -21,7 +22,7 @@ from .agent_status import (
 )
 from .config import TaskConfig
 from .dashboard import AgentDashboard
-from .director import ResearchDirector
+from .director import ResearchDirector, openrouter_client
 from .editor import open_in_editor
 from .harness import Evaluation, evaluate
 from .models import Attempt, Idea
@@ -342,6 +343,29 @@ async def _run_round(
     ]
     controller = RoundController(asyncio.get_running_loop(), statuses, tasks)
     watcher = asyncio.create_task(_watch_stop_flag(controller, stop_poll_s), name="stop-watcher")
+
+    # Lazy so a missing OPENROUTER_API_KEY (or any client failure) degrades to a
+    # message instead of blocking the round. Runs on the dashboard's key thread.
+    chat_holder: list[RoundChat] = []
+
+    def _on_chat() -> None:
+        if not chat_holder:
+            try:
+                chat_holder.append(
+                    RoundChat(
+                        openrouter_client(),
+                        config.director.model,
+                        config.director.temperature,
+                        header=header,
+                        ideas=ideas,
+                        statuses=statuses,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - chat must never kill the round
+                console.print(f"[red]round chat unavailable: {exc}[/red]")
+                return
+        chat_holder[0].session(console)
+
     try:
         with AgentDashboard(
             console,
@@ -349,6 +373,7 @@ async def _run_round(
             statuses,
             on_cancel_agent=controller.cancel_agent,
             on_cancel_round=controller.cancel_round,
+            on_chat=_on_chat,
         ):
             raw = await asyncio.gather(*tasks, return_exceptions=True)
     finally:

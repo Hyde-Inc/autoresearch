@@ -35,9 +35,10 @@ _PHASE_STYLES = {
     TRAINING: "blue",
 }
 
-_LEGEND = "[1-9/↑↓] select   [x] cancel selected   [q] stop round   [?] help"
+_LEGEND = "[1-9/↑↓] select   [c] chat   [x] cancel selected   [q] stop round   [?] help"
 _HELP_LINES = (
     "1-9 or ↑/↓  select an agent row",
+    "c           chat with the director about the running agents",
     "x           cancel the selected agent (others keep running)",
     "q           cancel every agent and stop the research run",
     "?           hide this help",
@@ -56,6 +57,7 @@ class AgentDashboard:
         *,
         on_cancel_agent: Callable[[int], None] | None = None,
         on_cancel_round: Callable[[], None] | None = None,
+        on_chat: Callable[[], None] | None = None,
         summary_interval_s: float = 20.0,
     ) -> None:
         self.console = console
@@ -63,6 +65,7 @@ class AgentDashboard:
         self.agents = agents
         self.on_cancel_agent = on_cancel_agent
         self.on_cancel_round = on_cancel_round
+        self.on_chat = on_chat
         self.summary_interval_s = summary_interval_s
         self.selected = 0
         self.show_help = False
@@ -70,6 +73,8 @@ class AgentDashboard:
         self._live: Live | None = None
         self._key_thread: threading.Thread | None = None
         self._summary_thread: threading.Thread | None = None
+        self._stdin_fd: int | None = None
+        self._saved_termios: object | None = None
 
     # ------------------------------------------------------------- rendering
 
@@ -137,6 +142,57 @@ class AgentDashboard:
             self.on_cancel_agent(self.selected)
         elif key == "q" and self.on_cancel_round is not None:
             self.on_cancel_round()
+        elif key == "c" and self.on_chat is not None:
+            self._chat()
+
+    def _chat(self) -> None:
+        """Suspend the live table, hand the terminal to the chat, then resume.
+
+        Runs on the key-listener thread; the agents' asyncio tasks are
+        unaffected. The terminal leaves cbreak so the chat gets normal line
+        input, and returns to cbreak afterwards.
+        """
+        assert self.on_chat is not None
+        self._suspend_live()
+        self._restore_cooked_terminal()
+        try:
+            self.on_chat()
+        finally:
+            self._enter_cbreak()
+            self._resume_live()
+
+    def _suspend_live(self) -> None:
+        if self._live is not None:
+            with contextlib.suppress(Exception):
+                self._live.stop()
+            self._live = None
+
+    def _resume_live(self) -> None:
+        if self.console.is_terminal and not self._stop.is_set():
+            self._live = Live(
+                get_renderable=self.render,
+                console=self.console,
+                refresh_per_second=6,
+                transient=False,
+            )
+            with contextlib.suppress(Exception):
+                self._live.start()
+
+    def _restore_cooked_terminal(self) -> None:
+        if self._stdin_fd is None or self._saved_termios is None:
+            return
+        with contextlib.suppress(Exception):
+            import termios
+
+            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._saved_termios)
+
+    def _enter_cbreak(self) -> None:
+        if self._stdin_fd is None:
+            return
+        with contextlib.suppress(Exception):
+            import tty
+
+            tty.setcbreak(self._stdin_fd)
 
     def _read_keys(self) -> None:
         """Read single keys from the real terminal; restore settings no matter what."""
@@ -150,6 +206,8 @@ class AgentDashboard:
             saved = termios.tcgetattr(fd)
         except (termios.error, ValueError, OSError):
             return
+        self._stdin_fd = fd
+        self._saved_termios = saved
         try:
             tty.setcbreak(fd)  # cbreak keeps ISIG, so Ctrl-C still interrupts
             while not self._stop.is_set():
