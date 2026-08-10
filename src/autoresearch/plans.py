@@ -23,7 +23,7 @@ import yaml
 from .models import Attempt, Idea
 
 # Frontmatter keys the human may edit that flow back into the run.
-OVERRIDE_KEYS = ("goal", "metric", "n_agents", "guardrails", "timeout_s")
+OVERRIDE_KEYS = ("goal", "metric", "n_agents", "guardrails", "timeout_s", "budget_s")
 
 _STANDARD_STATUSES = {
     "proposed": "awaiting your review",
@@ -154,6 +154,7 @@ def render_plan(
     n_agents: int | None = None,
     guardrails: list[str] | None = None,
     timeout_s: int | None = None,
+    budget_s: int | None = None,
     analysis: list[str] | None = None,
 ) -> str:
     frontmatter = {
@@ -165,6 +166,7 @@ def render_plan(
         "n_agents": n_agents if n_agents is not None else len(ideas),
         "guardrails": list(guardrails or []),
         "timeout_s": timeout_s,
+        "budget_s": budget_s,
     }
     lines = [
         "---",

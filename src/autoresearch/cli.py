@@ -183,7 +183,10 @@ def review_round(round_number: int, ideas: list[Idea], plan_path: Path) -> Revie
             f"[bold]{plan_path}[/bold] (opened in your editor)\n"
             "Edit the file freely - the edited file is exactly what runs.\n"
             "Reply [green]execute[/green] to launch, [red]stop[/red] to end the run, or "
-            "give feedback to revise the plan.",
+            "give feedback to revise the plan.\n"
+            "While the round runs you get a live dashboard: [bold]1-9/arrows[/bold] select "
+            "an agent, [bold]x[/bold] cancels it (the others keep going), [bold]q[/bold] "
+            "stops the whole round, [bold]?[/bold] shows help.",
             title=f"Round {round_number} plan written",
         )
     )
@@ -348,9 +351,9 @@ def status(
 
 @app.command()
 def stop() -> None:
-    """Request that a running orchestrator stop after its current round."""
+    """Stop a running orchestrator: mid-round agents are cancelled within seconds."""
     Path(".autoresearch-stop").write_text("stop\n")
-    console.print("Stop requested.")
+    console.print("Stop requested. Running agents will be cancelled and recorded as such.")
 
 
 if __name__ == "__main__":

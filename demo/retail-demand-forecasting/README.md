@@ -6,7 +6,9 @@ over-forecasting creates waste and under-forecasting creates stockouts.
 
 ## Data
 
-`data/sales_daily.parquet` holds 14 months of daily sales for 24 SKUs:
+`data/sales_daily.parquet` holds 32 weeks of daily sales for 8 SKUs (1,792
+rows). A fresh autoresearch setup reserves two 28-day windows for validation
+and hidden holdout, leaving 24 weeks for model training:
 
 | column     | meaning                                    |
 | ---------- | ------------------------------------------ |

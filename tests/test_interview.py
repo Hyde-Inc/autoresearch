@@ -114,7 +114,7 @@ _PLAN_IDEAS = {
             "hypothesis": "Trees beat naive.",
             "instructions": "Build lag features.",
             "category": "ml",
-            "skills_used": ["tree-model-features", "made-up-skill"],
+            "skills_used": ["boosting-demand-models", "made-up-skill"],
         },
         {
             "title": "Bias calibration",

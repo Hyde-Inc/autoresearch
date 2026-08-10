@@ -48,13 +48,18 @@ class SessionSettings:
     guardrails: list[str] = field(default_factory=lambda: ["runtime_s<=600"])
     rounds: int = 4
     timeout_s: int = 1200
+    budget_s: int = 3600
 
     def overrides(self) -> dict:
         """Settings in generated-task-config form for prepare_workspace."""
         return {
             "metric": {"name": self.metric, "direction": "min"},
             "guardrails": list(self.guardrails),
-            "agents": {"count": self.n_agents, "timeout_s": self.timeout_s},
+            "agents": {
+                "count": self.n_agents,
+                "timeout_s": self.timeout_s,
+                "budget_s": self.budget_s,
+            },
             "budget": {"rounds": self.rounds},
         }
 
@@ -72,7 +77,8 @@ class SessionSettings:
             f"{metric_line}\n"
             f"guardrails: {self.guardrails}\n"
             f"max rounds: {self.rounds}\n"
-            f"agent timeout: {self.timeout_s}s"
+            f"agent session timeout: {self.timeout_s}s\n"
+            f"per-experiment budget: {self.budget_s}s"
         )
 
 
@@ -91,7 +97,8 @@ COMMANDS = [
     ("/metric <name|description>", "wmape, mape, rmse, bias_pct - or describe a custom metric in plain English"),
     ("/guardrail <expr>", "Add a guardrail, e.g. /guardrail bias_pct within -8..8"),
     ("/rounds <n>", "Maximum research rounds"),
-    ("/timeout <seconds>", "Per-experiment coding agent timeout"),
+    ("/timeout <seconds>", "Coding agent timeout for one session of the fix loop"),
+    ("/budget <seconds>", "Total per-experiment wall clock across all sessions"),
     ("/status", "Show the current settings"),
     ("/help", "Show this list"),
 ]
@@ -122,6 +129,7 @@ def print_status(console: Console, settings: SessionSettings) -> None:
     table.add_row("guardrails", "\n".join(settings.guardrails) or "-")
     table.add_row("rounds", str(settings.rounds))
     table.add_row("timeout", f"{settings.timeout_s}s")
+    table.add_row("budget", f"{settings.budget_s}s")
     console.print(table)
 
 
@@ -203,8 +211,12 @@ def handle_slash(text: str, settings: SessionSettings, console: Console) -> Slas
             return SlashResult(True, f"max rounds set to {settings.rounds}")
         if command == "timeout":
             settings.timeout_s = _positive_int(argument, "timeout", 60)
-            console.print(f"[green]Agent timeout:[/green] {settings.timeout_s}s")
-            return SlashResult(True, f"agent timeout set to {settings.timeout_s}s")
+            console.print(f"[green]Agent session timeout:[/green] {settings.timeout_s}s")
+            return SlashResult(True, f"agent session timeout set to {settings.timeout_s}s")
+        if command == "budget":
+            settings.budget_s = _positive_int(argument, "budget", 60)
+            console.print(f"[green]Per-experiment budget:[/green] {settings.budget_s}s")
+            return SlashResult(True, f"per-experiment budget set to {settings.budget_s}s")
         console.print(f"[yellow]Unknown command /{command}.[/yellow]")
         print_help(console)
         return SlashResult(handled=True)

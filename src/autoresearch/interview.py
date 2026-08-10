@@ -44,6 +44,7 @@ from .plans import (
     render_plan,
 )
 from .prepare import prepare_workspace, write_baseline
+from .progress import Activity
 from .skills import ResearchSkill, load_skills
 from .slash import (
     COMMANDS,
@@ -290,6 +291,13 @@ _TOOL_LABELS = {
     "record_context": "recording that in the task context",
     "write_plan": "writing the research plan file",
 }
+_ACTIVITY_PHASES = {
+    "prepare_workspace": "Preparing the protected workspace",
+    "write_baseline": "Building the baseline model",
+    "replace_baseline": "Installing the pinned baseline",
+    "evaluate_baseline": "Evaluating baseline on validation + hidden holdout",
+    "define_custom_metric": "Defining and verifying the custom metric",
+}
 
 _RUNTIME_CONTRACT = """\
 Runtime contract for solution/train.py (the baseline and every experiment):
@@ -363,7 +371,7 @@ class SetupSession:
             "facts the user can correct. If the user gives an unclear or invalid answer, say "
             "what went wrong and ask again; never stop the session.\n\n"
             "The user edits run settings with slash commands (/goal, /baseline, /n_agents, "
-            "/metric, /guardrail, /rounds, /timeout). Changes arrive as [settings updated] "
+            "/metric, /guardrail, /rounds, /timeout, /budget). Changes arrive as [settings updated] "
             "notes in the conversation. Treat them as final decisions: do not re-confirm them, "
             "and never ask the user to approve something they already set.\n\n"
             f"Current settings:\n{self.settings.describe()}\n\n"
@@ -687,6 +695,7 @@ class SetupSession:
                 n_agents=len(parsed),
                 guardrails=config.guardrails,
                 timeout_s=self.settings.timeout_s,
+                budget_s=self.settings.budget_s,
             )
         )
         refresh_session_readme(self.session_dir)
@@ -730,6 +739,8 @@ class SetupSession:
             self.settings.guardrails = [str(item) for item in overrides["guardrails"]]
         if overrides.get("timeout_s"):
             self.settings.timeout_s = max(60, int(overrides["timeout_s"]))
+        if overrides.get("budget_s"):
+            self.settings.budget_s = max(60, int(overrides["budget_s"]))
         config = self._require_config()
         raw = yaml.safe_load(config.config_path.read_text())
         if self.settings.goal:
@@ -738,6 +749,7 @@ class SetupSession:
         agents = raw.get("agents") or {}
         agents["count"] = self.settings.n_agents
         agents["timeout_s"] = self.settings.timeout_s
+        agents["budget_s"] = self.settings.budget_s
         raw["agents"] = agents
         metric = overrides.get("metric")
         current = raw.get("metric") or {}
@@ -843,8 +855,9 @@ class SetupSession:
         while True:
             if self.poll_survey():
                 messages[0] = {"role": "system", "content": self.system_prompt()}
-            renderer = TurnRenderer(self.console)
-            message = self.chat.turn(messages, renderer, tools=TOOLS)
+            with Activity(self.console, "Research Director thinking") as activity:
+                renderer = TurnRenderer(self.console, on_first_token=activity.stop)
+                message = self.chat.turn(messages, renderer, tools=TOOLS)
             renderer.finish()
             messages.append(message)
             if message.get("tool_calls"):
@@ -859,7 +872,12 @@ class SetupSession:
                     except json.JSONDecodeError:
                         result: dict = {"error": "tool arguments were not valid JSON"}
                     else:
-                        result = self.execute(name, arguments)
+                        phase = _ACTIVITY_PHASES.get(name)
+                        if phase:
+                            with Activity(self.console, phase):
+                                result = self.execute(name, arguments)
+                        else:
+                            result = self.execute(name, arguments)
                     if "error" in result:
                         self.console.print(f"[yellow]! {result['error']}[/yellow]")
                     messages.append(

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import re
 import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +16,9 @@ import pandas as pd
 from .config import TaskConfig
 from .guardrails import check_guardrails
 from .metrics import compile_metric, load_task_spec
+
+OnProgress = Callable[[str], None]
+"""Receives each output line train.py prints while it runs (live status)."""
 
 
 @dataclass
@@ -76,11 +83,39 @@ def _validate_forecasts(
     return metrics, merged
 
 
+async def _stream_lines(
+    stream: asyncio.StreamReader,
+    tail: deque[str],
+    on_progress: OnProgress | None,
+) -> None:
+    """Split train.py output on newlines and carriage returns (progress bars),
+    keep a tail for error reporting, and surface each line live."""
+
+    def emit(raw: bytes) -> None:
+        line = raw.decode(errors="replace").strip()
+        if not line:
+            return
+        tail.append(line)
+        if on_progress is not None:
+            # A display bug must never turn a good training run into a failure.
+            with contextlib.suppress(Exception):
+                on_progress(line)
+
+    buffer = b""
+    while chunk := await stream.read(8192):
+        buffer += chunk
+        *lines, buffer = re.split(rb"[\r\n]", buffer)
+        for raw in lines:
+            emit(raw)
+    emit(buffer)
+
+
 async def _evaluate_split(
     worktree: Path,
     actuals_path: Path,
     config: TaskConfig,
     label: str,
+    on_progress: OnProgress | None = None,
 ) -> tuple[dict[str, float], float, pd.DataFrame]:
     actuals = pd.read_parquet(actuals_path)
     keys = [config.data.id_column, config.data.date_column]
@@ -109,23 +144,68 @@ async def _evaluate_split(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
+    tail: deque[str] = deque(maxlen=200)
     try:
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(), timeout=config.budget.train_timeout_s
-        )
+        assert process.stdout is not None
+        async with asyncio.timeout(config.budget.train_timeout_s):
+            await _stream_lines(process.stdout, tail, on_progress)
+            await process.wait()
     except TimeoutError:
         process.kill()
         await process.wait()
         raise ValueError(f"training exceeded {config.budget.train_timeout_s}s timeout")
+    except asyncio.CancelledError:
+        # A user interrupt must kill train.py and stay a cancellation, never
+        # become a scored failure.
+        process.kill()
+        with contextlib.suppress(asyncio.CancelledError):
+            await process.wait()
+        raise
     finally:
         request.unlink(missing_ok=True)
     elapsed = time.monotonic() - started
     if process.returncode:
-        raise ValueError(
-            f"solution exited with {process.returncode}: {stdout.decode(errors='replace')[-2000:]}"
-        )
+        output_tail = "\n".join(tail)
+        raise ValueError(f"solution exited with {process.returncode}: {output_tail[-2000:]}")
     metrics, merged = _validate_forecasts(output, actuals, config)
     return metrics, elapsed, merged
+
+
+async def evaluate_validation(
+    worktree: Path,
+    config: TaskConfig,
+    baseline: dict[str, float] | None = None,
+    guardrails: list[str] | None = None,
+    on_progress: OnProgress | None = None,
+) -> Evaluation:
+    """Score the validation split only.
+
+    This is the feedback signal for the worker's build-evaluate-fix loop: it
+    never touches the hidden holdout split, so agents can iterate against it
+    without overfitting the final promotion gate.
+    """
+    started = time.monotonic()
+    try:
+        metrics, val_time, validation_frame = await _evaluate_split(
+            worktree,
+            config.resolve(config.data.validation_actuals),
+            config,
+            "validation",
+            on_progress=on_progress,
+        )
+        metrics["runtime_s"] = val_time
+        expressions = guardrails if guardrails is not None else config.guardrails
+        checks = check_guardrails(expressions, metrics, baseline or metrics)
+        failures = [f"{item.expression}: {item.detail}" for item in checks if not item.passed]
+        return Evaluation(
+            passed=not failures,
+            metrics=metrics,
+            guardrail_failures=failures,
+            duration_s=time.monotonic() - started,
+            validation_frame=validation_frame,
+        )
+    except Exception as exc:  # noqa: BLE001 - evaluator failures become scored failures
+        return Evaluation(False, error=str(exc), duration_s=time.monotonic() - started)
 
 
 async def evaluate(
@@ -133,43 +213,45 @@ async def evaluate(
     config: TaskConfig,
     baseline: dict[str, float] | None = None,
     guardrails: list[str] | None = None,
+    on_progress: OnProgress | None = None,
 ) -> Evaluation:
     started = time.monotonic()
+    result = await evaluate_validation(worktree, config, baseline, guardrails, on_progress)
+    if result.error:
+        return result
     try:
-        metrics, val_time, validation_frame = await _evaluate_split(
-            worktree, config.resolve(config.data.validation_actuals), config, "validation"
-        )
         holdout, holdout_time, _ = await _evaluate_split(
-            worktree, config.resolve(config.data.holdout_actuals), config, "holdout"
-        )
-        metrics["runtime_s"] = val_time
-        holdout["runtime_s"] = holdout_time
-        expressions = guardrails if guardrails is not None else config.guardrails
-        checks = check_guardrails(expressions, metrics, baseline or metrics)
-        failures = [f"{item.expression}: {item.detail}" for item in checks if not item.passed]
-        primary = config.metric.name
-        holdout_key = f"holdout_{primary}"
-        incumbent_holdout = baseline.get(holdout_key) if baseline else None
-        holdout_worse = (
-            incumbent_holdout is not None
-            and (
-                holdout[primary] > incumbent_holdout
-                if config.metric.direction == "min"
-                else holdout[primary] < incumbent_holdout
-            )
-        )
-        if holdout_worse:
-            failures.append(
-                f"hidden holdout {primary} {holdout[primary]:.6f} is worse than incumbent "
-                f"{incumbent_holdout:.6f}"
-            )
-        return Evaluation(
-            passed=not failures,
-            metrics=metrics,
-            holdout_metrics=holdout,
-            guardrail_failures=failures,
-            duration_s=time.monotonic() - started,
-            validation_frame=validation_frame,
+            worktree,
+            config.resolve(config.data.holdout_actuals),
+            config,
+            "holdout",
+            on_progress=on_progress,
         )
     except Exception as exc:  # noqa: BLE001 - evaluator failures become scored failures
         return Evaluation(False, error=str(exc), duration_s=time.monotonic() - started)
+    holdout["runtime_s"] = holdout_time
+    failures = list(result.guardrail_failures)
+    primary = config.metric.name
+    holdout_key = f"holdout_{primary}"
+    incumbent_holdout = baseline.get(holdout_key) if baseline else None
+    holdout_worse = (
+        incumbent_holdout is not None
+        and (
+            holdout[primary] > incumbent_holdout
+            if config.metric.direction == "min"
+            else holdout[primary] < incumbent_holdout
+        )
+    )
+    if holdout_worse:
+        failures.append(
+            f"hidden holdout {primary} {holdout[primary]:.6f} is worse than incumbent "
+            f"{incumbent_holdout:.6f}"
+        )
+    return Evaluation(
+        passed=not failures,
+        metrics=result.metrics,
+        holdout_metrics=holdout,
+        guardrail_failures=failures,
+        duration_s=time.monotonic() - started,
+        validation_frame=result.validation_frame,
+    )

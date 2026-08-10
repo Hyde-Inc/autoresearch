@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import uuid
 from collections.abc import Callable
@@ -10,7 +11,16 @@ from typing import Literal
 
 from rich.console import Console
 
+from .agent_status import (
+    CANCELLED,
+    EVALUATING,
+    FAILED,
+    PASSED,
+    REJECTED,
+    AgentStatus,
+)
 from .config import TaskConfig
+from .dashboard import AgentDashboard
 from .director import ResearchDirector
 from .editor import open_in_editor
 from .harness import Evaluation, evaluate
@@ -26,8 +36,16 @@ from .plans import (
     render_plan,
     write_findings,
 )
+from .progress import Activity
 from .store import RunStore
-from .worker import WorkerResult, _run, ensure_seed_repo, remove_worktree, run_worker
+from .worker import (
+    WorkerResult,
+    _run,
+    ensure_seed_repo,
+    remove_worktree,
+    remove_worktree_path,
+    run_worker,
+)
 
 console = Console()
 
@@ -68,41 +86,83 @@ async def _execute_attempt(
     round_number: int,
     base_ref: str,
     baseline: dict[str, float],
-) -> tuple[Attempt, WorkerResult]:
+    status: AgentStatus | None = None,
+) -> tuple[Attempt, WorkerResult | None]:
+    """Run one agent end to end, updating its dashboard row along the way.
+
+    Cancelling the surrounding task (dashboard ``x``/``q`` or the stop flag)
+    kills the agent's subprocesses, records the attempt as ``cancelled``,
+    cleans its worktree, and returns normally so sibling agents keep running.
+    """
+    tracker = status or AgentStatus(index=0, attempt_id=attempt_id, title=idea.title)
     attempt = Attempt(id=attempt_id, round=round_number, idea=idea, status="running")
-    store.save_attempt(attempt)
-    worker = await run_worker(
-        config=config,
-        store=store,
-        repo=repo,
-        idea=idea,
-        attempt_id=attempt_id,
-        base_ref=base_ref,
-    )
-    attempt.branch = worker.branch
-    attempt.commit = worker.commit
     attempt.log_path = str(store.logs_dir / f"{attempt_id}.jsonl")
-    diff_path = store.attempts_dir / f"{attempt_id}.patch"
-    diff_path.write_text(worker.diff)
-    attempt.diff_path = str(diff_path)
-    forbidden = _paths_allowed(worker.changed_paths, config.workspace.allowed_paths)
-    if forbidden:
-        attempt.status = "rejected"
-        attempt.error = f"agent changed forbidden paths: {forbidden}"
-    elif worker.error:
-        attempt.status = "failed"
-        attempt.error = worker.error
-    else:
-        result = await evaluate(worker.worktree, config, baseline=baseline)
-        attempt.metrics = result.metrics
-        attempt.holdout_metrics = result.holdout_metrics
-        attempt.duration_s = result.duration_s
-        attempt.guardrail_failures = result.guardrail_failures
-        attempt.error = result.error
-        attempt.status = "passed" if result.passed else ("failed" if result.error else "rejected")
-        if result.validation_frame is not None:
-            store.save_validation_frame(attempt_id, result.validation_frame)
+    tracker.log_path = store.logs_dir / f"{attempt_id}.jsonl"
     store.save_attempt(attempt)
+    worker: WorkerResult | None = None
+    try:
+        worker = await run_worker(
+            config=config,
+            store=store,
+            repo=repo,
+            idea=idea,
+            attempt_id=attempt_id,
+            base_ref=base_ref,
+            baseline=baseline,
+            on_event=tracker.apply_event,
+            on_phase=tracker.set,
+        )
+        attempt.branch = worker.branch
+        attempt.commit = worker.commit
+        attempt.metadata["sessions"] = worker.sessions
+        attempt.metadata["loop"] = worker.history
+        diff_path = store.attempts_dir / f"{attempt_id}.patch"
+        diff_path.write_text(worker.diff)
+        attempt.diff_path = str(diff_path)
+        forbidden = _paths_allowed(worker.changed_paths, config.workspace.allowed_paths)
+        if forbidden:
+            attempt.status = "rejected"
+            attempt.error = f"agent changed forbidden paths: {forbidden}"
+        elif worker.error:
+            attempt.status = "failed"
+            attempt.error = worker.error
+        else:
+            tracker.set(EVALUATING, "final gate: validation + holdout splits")
+            result = await evaluate(
+                worker.worktree,
+                config,
+                baseline=baseline,
+                on_progress=lambda line: tracker.set(action=line),
+            )
+            attempt.metrics = result.metrics
+            attempt.holdout_metrics = result.holdout_metrics
+            attempt.duration_s = result.duration_s
+            attempt.guardrail_failures = result.guardrail_failures
+            attempt.error = result.error
+            attempt.status = (
+                "passed" if result.passed else ("failed" if result.error else "rejected")
+            )
+            if result.validation_frame is not None:
+                store.save_validation_frame(attempt_id, result.validation_frame)
+        primary = attempt.metrics.get(config.metric.name)
+        outcome = f"{config.metric.name} {primary:.4f}" if primary is not None else attempt.error
+        tracker.finish(
+            {"passed": PASSED, "failed": FAILED}.get(attempt.status, REJECTED),
+            outcome or attempt.status,
+        )
+    except asyncio.CancelledError:
+        # Swallow the cancellation so the round's gather keeps sibling results.
+        task = asyncio.current_task()
+        while task is not None and task.cancelling():
+            task.uncancel()
+        attempt.status = "cancelled"
+        attempt.error = "cancelled by user"
+        tracker.finish(CANCELLED, "cancelled by user")
+        if worker is None:
+            # run_worker never returned, but its worktree may already exist.
+            await remove_worktree_path(repo, store.worktrees_dir / attempt_id)
+    finally:
+        store.save_attempt(attempt)
     return attempt, worker
 
 
@@ -118,13 +178,15 @@ def _print_director_findings(director: ResearchDirector) -> None:
 
 
 def _apply_plan_overrides(config: TaskConfig, overrides: dict) -> None:
-    """Honor the safe frontmatter edits mid-run (goal, guardrails, timeout)."""
+    """Honor the safe frontmatter edits mid-run (goal, guardrails, timeouts)."""
     if overrides.get("goal"):
         config.goal = str(overrides["goal"])
     if overrides.get("guardrails"):
         config.guardrails = [str(item) for item in overrides["guardrails"]]
     if overrides.get("timeout_s"):
         config.agents.timeout_s = max(60, int(overrides["timeout_s"]))
+    if overrides.get("budget_s"):
+        config.agents.budget_s = max(60, int(overrides["budget_s"]))
 
 
 async def _propose_round(
@@ -146,16 +208,17 @@ async def _propose_round(
     feedback: str | None = None
     previous: list[Idea] | None = None
     while True:
-        ideas = await director.propose(
-            count=count if review is None else None,
-            count_range=None if review is None else (PROPOSALS_MIN, PROPOSALS_MAX),
-            round_number=round_number,
-            attempts=store.load_attempts(),
-            notes=notes,
-            store=store,
-            feedback=feedback,
-            previous=previous,
-        )
+        with Activity(console, f"Director designing round {round_number}"):
+            ideas = await director.propose(
+                count=count if review is None else None,
+                count_range=None if review is None else (PROPOSALS_MIN, PROPOSALS_MAX),
+                round_number=round_number,
+                attempts=store.load_attempts(),
+                notes=notes,
+                store=store,
+                feedback=feedback,
+                previous=previous,
+            )
         _print_director_findings(director)
         plan_file.write_text(
             render_plan(
@@ -165,6 +228,7 @@ async def _propose_round(
                 metric=config.metric.name,
                 guardrails=config.guardrails,
                 timeout_s=config.agents.timeout_s,
+                budget_s=config.agents.budget_s,
                 analysis=list(director.last_analysis),
             )
         )
@@ -192,6 +256,114 @@ async def _propose_round(
             _apply_plan_overrides(config, parsed.overrides)
             mark_executed(plan_file)
             return parsed.ideas, plan_file
+
+
+class RoundController:
+    """Owns one round's agent tasks so the dashboard and the stop flag can
+    cancel them safely from any thread."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        statuses: list[AgentStatus],
+        tasks: list[asyncio.Task],
+    ) -> None:
+        self.loop = loop
+        self.statuses = statuses
+        self.tasks = tasks
+        self.round_cancelled = False
+
+    def cancel_agent(self, index: int) -> None:
+        """Thread-safe: called from the dashboard's key listener."""
+        self.loop.call_soon_threadsafe(self._cancel_agent, index)
+
+    def cancel_round(self) -> None:
+        """Thread-safe: cancel every agent and end the research run."""
+        self.round_cancelled = True
+        self.loop.call_soon_threadsafe(self._cancel_all)
+
+    def _cancel_agent(self, index: int) -> None:
+        status, task = self.statuses[index], self.tasks[index]
+        if status.cancel_requested or task.done():
+            return
+        status.cancel_requested = True
+        status.set(action="cancelling…")
+        task.cancel()
+
+    def _cancel_all(self) -> None:
+        for index in range(len(self.tasks)):
+            self._cancel_agent(index)
+
+
+async def _watch_stop_flag(controller: RoundController, interval_s: float = 2.0) -> None:
+    """Make `autoresearch stop` take effect mid-round instead of after it."""
+    while True:
+        await asyncio.sleep(interval_s)
+        if Path(".autoresearch-stop").exists():
+            controller.cancel_round()
+            return
+
+
+async def _run_round(
+    config: TaskConfig,
+    store: RunStore,
+    repo: Path,
+    ideas: list[Idea],
+    round_number: int,
+    base_ref: str,
+    baseline: dict[str, float],
+    header: str,
+    stop_poll_s: float = 2.0,
+) -> tuple[list[tuple[Attempt, WorkerResult | None]], bool]:
+    """Run one round of agents under the live dashboard.
+
+    Returns the per-agent results plus whether the whole round was cancelled
+    (dashboard ``q`` or the stop flag)."""
+    statuses = [
+        AgentStatus(index=position + 1, attempt_id=uuid.uuid4().hex[:8], title=idea.title)
+        for position, idea in enumerate(ideas)
+    ]
+    tasks = [
+        asyncio.create_task(
+            _execute_attempt(
+                config,
+                store,
+                repo,
+                idea,
+                status.attempt_id,
+                round_number,
+                base_ref,
+                baseline,
+                status=status,
+            ),
+            name=f"agent-{status.attempt_id}",
+        )
+        for idea, status in zip(ideas, statuses, strict=True)
+    ]
+    controller = RoundController(asyncio.get_running_loop(), statuses, tasks)
+    watcher = asyncio.create_task(_watch_stop_flag(controller, stop_poll_s), name="stop-watcher")
+    try:
+        with AgentDashboard(
+            console,
+            header,
+            statuses,
+            on_cancel_agent=controller.cancel_agent,
+            on_cancel_round=controller.cancel_round,
+        ):
+            raw = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+    failures = [
+        item
+        for item in raw
+        if isinstance(item, BaseException) and not isinstance(item, asyncio.CancelledError)
+    ]
+    if failures:
+        raise failures[0]
+    results = [item for item in raw if isinstance(item, tuple)]
+    return results, controller.round_cancelled
 
 
 async def run_research(
@@ -242,7 +414,8 @@ async def run_research(
         repo = store.run_dir / "repo"
         shutil.copytree(seed_template, repo)
         await ensure_seed_repo(repo)
-        baseline_eval = await validate_baseline(config)
+        with Activity(console, "Confirming the baseline before research"):
+            baseline_eval = await validate_baseline(config)
         if baseline_eval.error:
             raise RuntimeError(f"baseline evaluation failed: {baseline_eval.error}")
         if baseline_eval.validation_frame is not None:
@@ -277,9 +450,11 @@ async def run_research(
         f"holdout={baseline[f'holdout_{config.metric.name}']:.6f}"
     )
     director = ResearchDirector(config)
+    stop_requested = False
     try:
         while completed < maximum and round_number < config.budget.rounds:
             if Path(".autoresearch-stop").exists():
+                stop_requested = True
                 break
             round_number += 1
             count = min(parallel, maximum - completed)
@@ -299,27 +474,21 @@ async def run_research(
             console.print(
                 f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments"
             )
-            jobs = []
-            for idea in ideas:
-                attempt_id = uuid.uuid4().hex[:8]
-                jobs.append(
-                    _execute_attempt(
-                        config,
-                        store,
-                        repo,
-                        idea,
-                        attempt_id,
-                        round_number,
-                        incumbent_ref,
-                        incumbent,
-                    )
-                )
-            results = await asyncio.gather(*jobs)
-            completed += len(results)
+            header = (
+                f"Round {round_number} · baseline {config.metric.name} "
+                f"{incumbent[config.metric.name]:.4f} · {count} agents"
+            )
+            results, round_cancelled = await _run_round(
+                config, store, repo, ideas, round_number, incumbent_ref, incumbent, header
+            )
+            # Cancelled attempts should not burn the experiment budget.
+            completed += sum(1 for attempt, _ in results if attempt.status != "cancelled")
             passing = [
                 (attempt, worker)
                 for attempt, worker in results
-                if attempt.status == "passed" and config.metric.name in attempt.metrics
+                if attempt.status == "passed"
+                and worker is not None
+                and config.metric.name in attempt.metrics
             ]
             passing.sort(
                 key=lambda pair: pair[0].metrics[config.metric.name],
@@ -348,7 +517,12 @@ async def run_research(
                         f"{config.metric.name}={attempt.metrics[config.metric.name]:.6f}"
                     )
                 store.save_attempt(attempt)
-            reflection = await director.reflect([attempt for attempt, _ in results])
+            if round_cancelled:
+                # Skip the director's reflection: every agent was interrupted.
+                reflection = "Round cancelled by the user before completion."
+            else:
+                with Activity(console, f"Director reviewing round {round_number} results"):
+                    reflection = await director.reflect([attempt for attempt, _ in results])
             store.append_note(f"Round {round_number}", reflection)
             if plan_file is not None:
                 findings_file = write_findings(
@@ -357,11 +531,13 @@ async def run_research(
                     config.metric.name,
                     reflection,
                 )
-                if findings_file is not None and review is not None:
+                if findings_file is not None and review is not None and not round_cancelled:
                     console.print(f"[dim]Findings written to {findings_file}[/dim]")
                     open_in_editor(findings_file)
             for _, worker in results:
-                await remove_worktree(repo, worker)
+                # Agents cancelled mid-build (worker is None) already removed theirs.
+                if worker is not None:
+                    await remove_worktree(repo, worker)
             store.save_state(
                 {
                     "task": config.name,
@@ -377,9 +553,17 @@ async def run_research(
                     "session_dir": str(session_dir),
                 }
             )
+            if round_cancelled:
+                stop_requested = True
+                console.print("[bold]Round cancelled - research run stopped.[/bold]")
+                break
     finally:
         state = store.load_state()
-        state["status"] = "stopped" if Path(".autoresearch-stop").exists() else "completed"
+        state["status"] = (
+            "stopped"
+            if stop_requested or Path(".autoresearch-stop").exists()
+            else "completed"
+        )
         store.save_state(state)
         Path(".autoresearch-stop").unlink(missing_ok=True)
     return store

@@ -16,30 +16,41 @@ The flow has three phases: settle the metric, understand the repo, then research
 editable plan files.
 
 1. In a streamed chat you settle what to optimize: the goal, the baseline, and the metric
-   (standard or custom, verified with a hand-worked example).
+  (standard or custom, verified with a hand-worked example).
 2. An OpenCode agent surveys a throwaway copy of your repo in the background - models, data
-   files and columns, evaluation conventions - while you chat; the chat opens instantly and
+  files and columns, evaluation conventions - while you chat; the chat opens instantly and
    the findings fold into the director's context the moment they are ready (cached at
    `.autoresearch/survey.md`). The director verifies anything load-bearing with its own
    read/EDA tools instead of asking you where things live.
 3. It splits your history into train / validation / hidden holdout and seals the actuals away
-   from the agents, then writes the baseline itself: if your repo already has a model, it ports
+  from the agents, then writes the baseline itself: if your repo already has a model, it ports
    it faithfully so the research has to beat your current approach; if there is no model, it
    picks a first model from the EDA and its demand forecasting skills.
 4. Each research session gets its own numbered, goal-named folder under the visible `research/`
-   directory, e.g. `research/001-reduce-wmape/`. The director writes its round-1 proposal there
+  directory, e.g. `research/001-reduce-wmape/`. The director writes its round-1 proposal there
    as `round-1-plan.md` and pops it open in your editor - like a coding agent's plan mode. You
    edit the file freely (reword hypotheses, delete or add experiments, change frontmatter), then
    type `execute`. The edited file is exactly what runs.
-5. Each OpenCode agent gets its own git worktree and edits only `solution/`. A protected
-   evaluator checks WMAPE, MAPE, RMSE, bias, runtime, and hidden holdout results, and the best
-   valid experiment is promoted.
+5. Each OpenCode agent gets its own git worktree and edits only `solution/`. The orchestrator
+  drives it the way you drive a coding assistant, as an explicit build -> train -> evaluate
+   loop with each step verified and tracked on the live dashboard: the agent *builds*
+   `solution/train.py` (checked cheaply - exists and parses - before anything runs), then the
+   orchestrator itself *trains* it on the validation request while streaming `train.py` output
+   as live status - no coding agent is running or billed while training executes - then the
+   harness *evaluates* the forecasts and sends the result (traceback, guardrail failure, or
+   metric vs. the incumbent) back into the same conversation to fix or improve, looping until
+   the experiment beats the incumbent or its time budget runs out. Every session is
+   snapshot-committed so a timeout or late regression never loses a working state, and each
+   session's step outcomes are recorded on the attempt. Holdout results are computed only at
+   the final gate - agents never see them - and the best valid experiment is promoted.
 6. After the round, the findings open on your screen as `round-1-findings.md` (per-experiment
-   scores plus the director's reflection), and the director writes `round-2-plan.md` (2-5
+  scores plus the director's reflection), and the director writes `round-2-plan.md` (2-5
    parallel researches) after studying the errors of past attempts (worst SKUs, weekday bias,
    horizon decay) and the data itself. Each approval starts the next round. The session's
    `README.md` indexes every round with its status, so the folder reads like a lab notebook of
    all the research tried and how it scored.
+
+
 
 ## Setup
 
@@ -57,12 +68,15 @@ Add your key to `.env`:
 OPENROUTER_API_KEY=sk-or-v1-your-key
 ```
 
+
+
 ## Run it on the demo project
 
-`demo/retail-demand-forecasting` looks like a real data science repo: 14 months of daily sales
-for 24 SKUs (including intermittent slow movers) - kept small so demo experiments train in
-seconds - a README, a production seasonal-naive model in `models/seasonal_baseline.py`, and a
-candidate ARIMA model in `models/arima.py`. Generate its data, then start:
+`demo/retail-demand-forecasting` looks like a real data science repo: 32 weeks of daily sales
+for 8 SKUs (including intermittent slow movers) - intentionally tiny so repeated training and
+evaluation stays quick on camera - a README, a production seasonal-naive model in
+`models/seasonal_baseline.py`, and a candidate ARIMA model in `models/arima.py`. Generate its
+data, then start:
 
 ```bash
 uv run python demo/retail-demand-forecasting/scripts/make_dataset.py
@@ -105,6 +119,76 @@ the same every time: edit the plan file if you want, then `execute`, feedback, o
 auto-open via the `cursor`/`code` CLI or the OS default; set `AUTORESEARCH_NO_OPEN=1` to turn
 that off.
 
+## Watching a round: the live agent dashboard
+
+While a round runs, the terminal shows one live dashboard with a row per agent:
+
+```
+Round 1 · baseline wmape 0.1039 · 3 agents
+
+  #  Experiment                 Phase            Current action               Elapsed
+ >1  Global XGBoost             Editing          write solution/train.py        01:42
+  2  Intermittent-demand route  Testing          running local backtest         01:37
+  3  ARIMA + promo              Protected eval   validation + holdout splits    01:31
+
+Selected: read solution/train.py → edit features.py → running uv test
+Log: runs/t/.../logs/aaa11111.jsonl
+[1-9/↑↓] select   [x] cancel selected   [q] stop round   [?] help
+```
+
+Phases are factual - `Setting up`, `Exploring`, `Editing`, `Testing`, `Committing`,
+`Protected eval`, then `Passed` / `Failed` / `Rejected` / `Cancelled` - and the current
+action comes straight from the agent's streamed events (which file it read or edited,
+which command it ran). The selected row shows a short trail of recent actions and the
+path to its full JSONL log.
+
+Interruption is first-class:
+
+- `x` cancels the selected agent only. Its subprocesses are killed, the attempt is
+  recorded as `cancelled` with its partial log kept, its worktree is removed, and the
+  other agents keep running.
+- `q` cancels every agent and ends the research run cleanly after the round is
+  persisted.
+- `autoresearch stop` (from another terminal) now takes effect mid-round within
+  seconds instead of waiting for all agents to finish.
+
+Outside a real terminal (CI, piped output) the dashboard degrades to periodic
+plain-text summary lines and the key controls are disabled.
+
+## Where the Markdown documentation is stored
+
+The human-facing research notebook is written inside the project you passed to `start`:
+
+```text
+<project>/research/
+└── 001-reduce-wmape/
+    ├── README.md
+    ├── round-1-plan.md
+    ├── round-1-findings.md
+    ├── round-2-plan.md
+    └── round-2-findings.md
+```
+
+- `research/<session>/README.md` is the session index. It records the goal, metric, baseline,
+  every round's status, and links to its plan and findings.
+- `round-N-plan.md` is the editable plan awaiting human review. Its frontmatter contains the run
+  settings; its experiment sections are exactly what the coding agents execute after you type
+  `execute`.
+- `round-N-findings.md` is written after execution. It records each experiment's validation and
+  hidden-holdout score, status, promotion decision, and the Research Director's reflection.
+- Each new `start` creates the next numbered, goal-named session directory. All rounds from that
+  session stay together.
+
+Supporting Markdown used internally is stored separately:
+
+- `<project>/.autoresearch/survey.md` caches the coding agent's repository survey.
+- `<project>/runs/<task>/<timestamp>/notes.md` stores the director's round-by-round reflections
+  used when resuming or proposing later rounds.
+- `autoresearch report ... -o report.md` creates a standalone report wherever you specify.
+
+The visible `research/` folder is the documentation intended for humans to browse, edit, and
+commit. `.autoresearch/` and `runs/` contain execution state and lower-level artifacts.
+
 To see the no-baseline path, delete `models/` from the demo repo and start again: the director
 runs EDA (seasonality, intermittency, promo/price drivers) and bootstraps a first model from its
 skills instead.
@@ -114,16 +198,19 @@ skills instead.
 There is nothing to configure up front: defaults come from code, and you edit them inline in the
 chat, Cursor/Claude style:
 
-| command | what it does |
-| --- | --- |
-| `/goal <text>` | what the research must improve |
-| `/baseline <path>` | pin an existing model script as the baseline |
-| `/n_agents <1-5>` | parallel researches per round |
-| `/metric <name\|description>` | wmape, mape, rmse, bias_pct - or describe a custom metric in plain English |
-| `/guardrail <expr>` | add a guardrail, e.g. `bias_pct within -8..8` |
-| `/rounds <n>` | maximum research rounds |
-| `/timeout <seconds>` | per-experiment coding agent timeout |
-| `/status`, `/help` | show settings / commands |
+
+| command                      | what it does                                                               |
+| ---------------------------- | -------------------------------------------------------------------------- |
+| `/goal <text>`               | what the research must improve                                             |
+| `/baseline <path>`           | pin an existing model script as the baseline                               |
+| `/n_agents <1-5>`            | parallel researches per round                                              |
+| `/metric <name|description>` | wmape, mape, rmse, bias_pct - or describe a custom metric in plain English |
+| `/guardrail <expr>`          | add a guardrail, e.g. `bias_pct within -8..8`                              |
+| `/rounds <n>`                | maximum research rounds                                                    |
+| `/timeout <seconds>`         | coding agent timeout for one session of the build-evaluate-fix loop        |
+| `/budget <seconds>`          | total per-experiment wall clock across all sessions (default 3600)         |
+| `/status`, `/help`           | show settings / commands                                                   |
+
 
 The agreed setup is saved internally to `<repo>/.autoresearch/task/task.yaml` so runs can be
 resumed and inspected; you never write or edit it. Non-interactive commands work against it:
@@ -133,6 +220,8 @@ uv run autoresearch validate -c demo/retail-demand-forecasting/.autoresearch/tas
 uv run autoresearch run -c demo/retail-demand-forecasting/.autoresearch/task/task.yaml --parallel 3
 uv run autoresearch resume -c demo/retail-demand-forecasting/.autoresearch/task/task.yaml
 ```
+
+
 
 ## Use a raw sales CSV
 
@@ -145,16 +234,21 @@ uv run autoresearch metric -c tasks/my-forecast/task.yaml \
   "Penalize under-forecasting twice as much as over-forecasting"
 ```
 
+
+
 ## Research Director skills and tools
 
-The outer loop includes our demand forecasting playbooks. It chooses the relevant skills each
-round based on the data, past results, holdout gaps, bias, and guardrail failures, and cites
-them per experiment in the plan file (`skills:` line - your edits there are honored too).
-Skills cover model selection, leakage-safe tree features, an XGBoost demand playbook (Tweedie
-objectives for zero-heavy demand, direct vs recursive multi-step, stockout bias traps), a
-Chronos playbook (the zero-shot-first ladder, context/horizon limits, covariate regressors,
-fine-tuning recipes), intermittent demand, price and promotions, bias correction, and
-ensembling.
+The outer loop includes eight implementation-grade demand forecasting playbooks. It chooses the
+relevant skills each round based on the data, past results, holdout gaps, bias, and guardrail
+failures, and cites them per experiment in the plan file (`skills:` line - your edits there are
+honored too). The library covers model-family routing; global boosting with XGBoost, LightGBM,
+and CatBoost; ARIMA/SARIMAX/ETS statistical models; current Chronos-Bolt and Chronos-2 APIs;
+Croston/SBA/TSB and hurdle models for intermittent demand; retail data semantics such as
+stockout-censored sales, planned promotions, and cold starts; temporal validation and explicit
+leakage tests; and constrained ensembling/calibration. Each model skill includes concrete APIs,
+failure modes, dependency/runtime checks, fallbacks, and required verification before reporting.
+The director uses the playbooks to design experiments, and each worker receives the full bodies
+of the skills cited by its experiment—not just their names.
 
 ```bash
 uv run autoresearch skills
@@ -170,13 +264,13 @@ round.
 ```bash
 uv run autoresearch status
 uv run autoresearch leaderboard
-uv run autoresearch show ATTEMPT_ID --run-dir <repo>/.autoresearch/runs/TASK/TIMESTAMP
-uv run autoresearch report --run-dir <repo>/.autoresearch/runs/TASK/TIMESTAMP -o report.md
+uv run autoresearch show ATTEMPT_ID --run-dir <repo>/runs/TASK/TIMESTAMP
+uv run autoresearch report --run-dir <repo>/runs/TASK/TIMESTAMP -o report.md
 uv run autoresearch stop
 ```
 
 Results, patches, agent logs, metrics, per-attempt validation forecasts, and research notes are
-saved under `<repo>/.autoresearch/runs/`.
+saved under `<repo>/runs/`.
 
 ## Guardrails
 

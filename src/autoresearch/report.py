@@ -26,6 +26,7 @@ def build_report(run_dir: Path) -> str:
         f"- Passing: {sum(item.status == 'passed' for item in attempts)}",
         f"- Rejected: {sum(item.status == 'rejected' for item in attempts)}",
         f"- Failed: {sum(item.status == 'failed' for item in attempts)}",
+        f"- Cancelled: {sum(item.status == 'cancelled' for item in attempts)}",
     ]
     if improvement is not None:
         lines.extend(

@@ -25,11 +25,42 @@ def test_select_skills_filters_unknown_names() -> None:
     async def complete(_system: str, _user: str) -> dict:
         return {
             "selected": [
-                {"name": "bias-correction", "reason": "Bias is high."},
+                {"name": "ensembling", "reason": "Bias is high."},
                 {"name": "not-real", "reason": "Should be removed."},
             ]
         }
 
     selection = asyncio.run(select_skills("high under-forecast bias", skills, complete))
-    assert [item.name for item in selection.selected] == ["bias-correction"]
-    assert "out-of-sample residuals" in selected_skill_context(selection, skills)
+    assert [item.name for item in selection.selected] == ["ensembling"]
+    assert "out-of-sample" in selected_skill_context(selection, skills)
+
+
+def test_builtin_library_has_grounded_model_family_playbooks() -> None:
+    skills = load_skills()
+    by_name = {skill.name: skill for skill in skills}
+    assert set(by_name) == {
+        "boosting-demand-models",
+        "chronos-playbook",
+        "ensembling",
+        "intermittent-demand",
+        "model-ladder",
+        "retail-demand-data",
+        "statistical-demand-models",
+        "temporal-validation-and-leakage",
+    }
+
+    # These are implementation playbooks, not generic model-selection blurbs.
+    required_terms = {
+        "boosting-demand-models": ("XGBRegressor", "lightgbm", "CatBoostRegressor"),
+        "chronos-playbook": ("BaseChronosPipeline", "predict_quantiles", "Chronos2Pipeline"),
+        "statistical-demand-models": ("ExponentialSmoothing", "ARIMA", "SARIMAX"),
+        "intermittent-demand": ("Croston", "SBA", "TSB"),
+        "retail-demand-data": ("stockout", "planned", "cold start"),
+        "temporal-validation-and-leakage": ("forecast origin", "rolling origins", "leakage"),
+        "ensembling": ("convex", "residual correlation", "calibration"),
+    }
+    for name, terms in required_terms.items():
+        body = by_name[name].body
+        assert len(body) >= 2_000, f"{name} is too shallow to be an implementation skill"
+        for term in terms:
+            assert term.lower() in body.lower(), f"{name} is missing {term}"

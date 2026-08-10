@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from autoresearch.opencode import OpenCodeResult
@@ -25,7 +26,13 @@ def test_survey_runs_opencode_on_a_copy_and_caches(tmp_path: Path, monkeypatch) 
         # The sandbox must be a git repo so opencode anchors its project root
         # here instead of escaping to a parent repository.
         seen["had_git"] = (cwd / ".git").is_dir()
-        (cwd / "SURVEY.md").write_text("# Repository survey\n\n## Models\nmodels/arima.py\n")
+        seen["prompt"] = prompt
+        report = (
+            "# Repository survey\n\n## Overview\nDemo\n\n## Models\nmodels/arima.py\n\n"
+            "## Data\nsales.parquet\n\n## Evaluation\nWMAPE\n\n## Dependencies\npandas\n"
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(json.dumps({"type": "text", "part": {"type": "text", "text": report}}))
         return OpenCodeResult(0, "s1", None)
 
     monkeypatch.setattr("autoresearch.survey.run_opencode", fake_opencode)
@@ -35,6 +42,9 @@ def test_survey_runs_opencode_on_a_copy_and_caches(tmp_path: Path, monkeypatch) 
     assert seen["cwd"] != repo
     assert seen["had_git"] is True
     assert seen["had_model"] is True
+    assert str(seen["cwd"]) in seen["prompt"]
+    assert "Do not create or modify any files" in seen["prompt"]
+    assert not (seen["cwd"] / "SURVEY.md").exists()
     # ...and the copy excludes .autoresearch (protected splits live there).
     assert seen["had_autoresearch"] is False
     assert not (repo / "SURVEY.md").exists()

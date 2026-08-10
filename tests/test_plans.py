@@ -33,7 +33,7 @@ def _write(tmp_path: Path, ideas: list[Idea], **kwargs) -> Path:
 
 
 def test_render_parse_roundtrip(tmp_path: Path) -> None:
-    ideas = [_idea("Global XGBoost", ["tree-model-features"]), _idea("Croston routing")]
+    ideas = [_idea("Global XGBoost", ["boosting-demand-models"]), _idea("Croston routing")]
     path = _write(
         tmp_path,
         ideas,
@@ -42,15 +42,17 @@ def test_render_parse_roundtrip(tmp_path: Path) -> None:
         baseline="models/arima.py",
         guardrails=["runtime_s<=600"],
         timeout_s=1200,
+        budget_s=3600,
         analysis=["weekday bias is worst on Mondays"],
     )
     parsed = parse_plan(path)
     assert [idea.title for idea in parsed.ideas] == ["Global XGBoost", "Croston routing"]
-    assert parsed.ideas[0].skills_used == ["tree-model-features"]
+    assert parsed.ideas[0].skills_used == ["boosting-demand-models"]
     assert parsed.ideas[0].hypothesis == "Global XGBoost should reduce error"
     assert parsed.overrides["goal"] == "reduce wmape"
     assert parsed.overrides["n_agents"] == 2
     assert parsed.overrides["timeout_s"] == 1200
+    assert parsed.overrides["budget_s"] == 3600
 
 
 def test_session_folders_are_numbered_and_named_after_the_goal(tmp_path: Path) -> None:

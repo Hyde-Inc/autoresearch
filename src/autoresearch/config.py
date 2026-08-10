@@ -23,6 +23,9 @@ class ModelConfig(BaseModel):
 class AgentConfig(ModelConfig):
     count: int = Field(default=3, ge=1)
     timeout_s: int = Field(default=1200, ge=1)
+    """Wall clock for one opencode session (one message of the worker loop)."""
+    budget_s: int = Field(default=3600, ge=1)
+    """Total wall clock for one experiment across all of its sessions."""
 
 
 class BudgetConfig(BaseModel):

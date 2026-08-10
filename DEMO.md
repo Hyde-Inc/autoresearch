@@ -22,7 +22,8 @@ background survey entirely).
 Open in the editor beforehand, on a second screen or tab:
 
 - `demo/retail-demand-forecasting/README.md` - the "client's" project
-- `src/autoresearch/skills_library/chronos-playbook.md` and `xgboost-demand.md`
+- `src/autoresearch/skills_library/chronos-playbook.md` and
+  `boosting-demand-models.md`
 
 ## 1. The pitch (30 seconds, before typing anything)
 
@@ -34,8 +35,9 @@ Open in the editor beforehand, on a second screen or tab:
 > fine-tune Chronos and when zero-shot is enough, which XGBoost objective fits
 > intermittent demand, how to correct forecast bias."
 
-Show the client repo README: a realistic project - 14 months of daily sales
-for 24 SKUs, a production seasonal-naive model, a candidate ARIMA model.
+Show the client repo README: a realistic but demo-sized project - 32 weeks of
+daily sales for 8 SKUs, a production seasonal-naive model, and a candidate
+ARIMA model.
 
 ## 2. Show the built-in expertise first
 
@@ -43,10 +45,12 @@ for 24 SKUs, a production seasonal-naive model, a candidate ARIMA model.
 uv run autoresearch skills
 ```
 
-> "These nine playbooks are our researchers' experience, written down: model
-> selection, intermittent demand, promo signals, bias correction, ensembling,
-> and deep playbooks for Chronos and XGBoost. The director cites them by name
-> in every plan it writes - this is the moat."
+> "These eight playbooks are our researchers' implementation experience,
+> written down: boosting across XGBoost, LightGBM, and CatBoost; statistical
+> ARIMA/ETS models; Chronos; intermittent demand; temporal validation and
+> leakage; retail data semantics like stockouts and cold starts; ensembling;
+> and model-family routing. The director cites them by name in every plan it
+> writes - this is the moat."
 
 Open `chronos-playbook.md` briefly: point at the situation-conditioned rules
 (when zero-shot beats fine-tuning, when Chronos is the wrong tool).
@@ -123,7 +127,7 @@ The round-1 plan **pops open in the editor automatically** at
 
 > "Like a coding agent's plan mode. YAML frontmatter holds the run parameters;
 > each experiment has a hypothesis and instructions, and cites which of our
-> playbooks informed it - see `skills: xgboost-demand`."
+> playbooks informed it - see `skills: boosting-demand-models`."
 
 **Edit the file on camera**: reword a hypothesis, or delete an experiment, or
 change `n_agents` in the frontmatter. Then type in the chat:
@@ -193,7 +197,9 @@ Finish on the `research/001-reduce-wmape/` folder in the editor:
 
 - **No files pop open**: the opener uses the `cursor`/`code` CLI or the Cursor
   app bundle; `AUTORESEARCH_NO_OPEN=1` disables it (make sure it isn't set).
-- **Experiments time out**: raise `/timeout` (default 1200 s) - Chronos or
-  heavy XGBoost sweeps need more than 300 s.
+- **Experiments run long**: a session timeout is no longer fatal - the worker
+  commits whatever exists, scores it, and feeds the result back to the same
+  agent conversation. `/timeout` (default 1200 s) caps one session;
+  `/budget` (default 3600 s) caps the whole experiment across sessions.
 - **Session ends unexpectedly**: `uv run autoresearch resume` picks up the
   latest run at the next review gate.
