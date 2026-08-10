@@ -22,7 +22,10 @@ class ModelConfig(BaseModel):
 
 class AgentConfig(ModelConfig):
     count: int = Field(default=3, ge=1)
-    timeout_s: int = Field(default=900, ge=1)
+    timeout_s: int = Field(default=1200, ge=1)
+    """Wall clock for one opencode session (one message of the worker loop)."""
+    budget_s: int = Field(default=3600, ge=1)
+    """Total wall clock for one experiment across all of its sessions."""
 
 
 class BudgetConfig(BaseModel):
@@ -47,6 +50,35 @@ class WorkspaceConfig(BaseModel):
     allowed_paths: list[str] = Field(default_factory=lambda: ["solution/"])
 
 
+class FoundryDatasets(BaseModel):
+    """Dataset RIDs the Foundry runtime reads and writes."""
+
+    sales_train: str = ""
+    forecast_request: str = ""
+    forecasts: str = ""
+    validation_actuals: str = ""
+    holdout_actuals: str = ""
+
+
+class FoundryRuntimeConfig(BaseModel):
+    """Everything needed to train on Foundry instead of a local subprocess.
+
+    The transforms repo at ``repo_dir`` is pushed to Foundry; a build of the
+    ``forecasts`` dataset runs the model on Foundry compute; the CLI reads the
+    result and the sealed actuals back through readTable.
+    """
+
+    repo_dir: Path
+    branch: str = "master"
+    repo_rid: str = ""
+    """Stemma repo RID, used to resolve the project folder during setup."""
+    project_folder_rid: str = ""
+    """Explicit project folder RID (overrides resolution from repo_rid)."""
+    datasets: FoundryDatasets = FoundryDatasets()
+    build_timeout_s: int = Field(default=3600, ge=1)
+    poll_s: int = Field(default=15, ge=1)
+
+
 class TaskConfig(BaseModel):
     name: str = "autoresearch-task"
     description: str = ""
@@ -59,6 +91,8 @@ class TaskConfig(BaseModel):
     budget: BudgetConfig = BudgetConfig()
     data: DataConfig = DataConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
+    runtime: Literal["local", "foundry"] = "local"
+    foundry: FoundryRuntimeConfig | None = None
     idea_hints: list[str] = Field(default_factory=list)
     context: str = ""
     skills: list[Path] = Field(default_factory=list)
@@ -69,6 +103,8 @@ class TaskConfig(BaseModel):
         for cfg in (self.director, self.agents):
             if "/" not in cfg.model:
                 raise ValueError(f"model must use provider/model format: {cfg.model}")
+        if self.runtime == "foundry" and self.foundry is None:
+            raise ValueError("runtime: foundry requires a 'foundry:' block")
         return self
 
     @property

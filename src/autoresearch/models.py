@@ -18,7 +18,7 @@ class Attempt(BaseModel):
     id: str
     round: int
     idea: Idea
-    status: Literal["running", "passed", "rejected", "failed"]
+    status: Literal["running", "passed", "rejected", "failed", "cancelled"]
     branch: str | None = None
     commit: str | None = None
     metrics: dict[str, float] = Field(default_factory=dict)

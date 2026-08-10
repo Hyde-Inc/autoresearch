@@ -5,23 +5,27 @@ import json
 from pathlib import Path
 from typing import Annotated
 
+import pandas as pd
 import typer
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 from .chat import input_box
 from .config import load_config
+from .costs import format_cost
 from .director import openrouter_client
-from .ingest import ingest_csv, preview_csv
+from .doctor import run_checks
+from .foundry import FoundryError, parse_dataset_reference, read_dataset
+from .ingest import Preview, apply_column_mapping, ingest_frame, preview_frame
 from .interview import SetupSession, print_spec
 from .metrics import MetricInterpreter, adopt_spec, eval_columns
 from .models import Idea
 from .orchestrator import ReviewDecision, run_research, validate_baseline
 from .report import build_report
 from .skills import load_skills
-from .slash import SessionSettings, print_help
+from .slash import SessionSettings, parse_reply, print_help
 from .store import RunStore, latest_run
 
 app = typer.Typer(no_args_is_help=True, help="Parallel autonomous ML experimentation.")
@@ -29,6 +33,37 @@ console = Console()
 ConfigOption = Annotated[
     Path, typer.Option("--config", "-c", exists=True, dir_okay=False, help="Task YAML")
 ]
+
+
+def _load_env() -> None:
+    """Load .env by searching upward from the *current directory*.
+
+    ``load_dotenv()``'s default searches from the installed package's own
+    directory, which works in a repo checkout (the .venv sits next to .env)
+    but silently finds nothing when the CLI is installed globally as a tool.
+    """
+    load_dotenv(find_dotenv(usecwd=True))
+
+
+def _print_quality_gate(preview: Preview) -> None:
+    """Show a per-column data-quality summary and any cleaning warnings."""
+    if preview.raw_rows:
+        table = Table(title="Data quality", show_edge=False)
+        table.add_column("Column")
+        table.add_column("Unusable rows", justify="right")
+        table.add_column("% of source", justify="right")
+        for column, count in preview.null_counts.items():
+            pct = (count / preview.raw_rows * 100) if preview.raw_rows else 0.0
+            style = "red" if pct >= 20 else ("yellow" if count else "green")
+            table.add_row(column, f"[{style}]{count}[/{style}]", f"[{style}]{pct:.1f}%[/{style}]")
+        console.print(table)
+        drop_style = "red" if preview.dropped_pct >= 20 else "yellow" if preview.dropped_rows else "green"
+        console.print(
+            f"[{drop_style}]{preview.dropped_rows} of {preview.raw_rows} rows "
+            f"({preview.dropped_pct:.1f}%) dropped during cleaning[/{drop_style}]"
+        )
+    for warning in preview.warnings:
+        console.print(f"[yellow]! {warning}[/yellow]")
 
 
 def _store_from(run_dir: Path | None, config: Path | None = None) -> RunStore:
@@ -53,9 +88,13 @@ def run(
     ] = None,
     parallel: Annotated[int | None, typer.Option(min=1)] = None,
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
+    max_cost: Annotated[
+        float | None,
+        typer.Option(min=0.0, help="Stop before a new round once model spend (USD) hits this"),
+    ] = None,
 ) -> None:
     """Start a new autonomous research run."""
-    load_dotenv()
+    _load_env()
     cfg = load_config(config)
     store = asyncio.run(
         run_research(
@@ -64,9 +103,265 @@ def run(
             guardrails=guardrail,
             parallel=parallel,
             max_experiments=max_experiments,
+            max_cost=max_cost,
         )
     )
     console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
+
+
+@app.command(name="foundry-setup")
+def foundry_setup(
+    repo: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, help="Path to the Foundry transforms repo"),
+    ],
+    project_folder_rid: Annotated[
+        str, typer.Option(help="Project folder RID (else resolved from the repo's git remote)")
+    ] = "",
+    branch: Annotated[str, typer.Option(help="Foundry branch to write/build on")] = "master",
+    n_skus: Annotated[int, typer.Option(min=2)] = 10,
+    n_days: Annotated[int, typer.Option(min=60)] = 210,
+    validation_days: Annotated[int, typer.Option(min=1)] = 28,
+    holdout_days: Annotated[int, typer.Option(min=1)] = 28,
+    write_config: Annotated[
+        Path, typer.Option(help="Where to write the runtime: foundry task.yaml")
+    ] = Path("foundry-task.yaml"),
+    no_push: Annotated[
+        bool, typer.Option("--no-push", help="Scaffold and provision but skip the git push")
+    ] = False,
+) -> None:
+    """Install autoresearch into a Foundry transforms repo, end to end.
+
+    Reads the repo's own gradle.properties for its identity, provisions the five
+    datasets, scaffolds the baseline transform + AUTORESEARCH.md contract +
+    curated dependencies into the repo, pushes it so Foundry publishes the
+    baseline, and writes a ``runtime: foundry`` task.yaml. After this,
+    ``autoresearch run -c foundry-task.yaml`` runs the whole loop autonomously.
+    """
+    import yaml
+
+    from . import foundry_setup as setup
+    from .foundry import resolve_parent_folder
+    from .foundry_build import FoundryBuildError, push_repo
+
+    _load_env()
+    repo = repo.resolve()
+    props = setup.read_gradle_properties(repo)
+    repo_rid = props.get("transformsRepoRid") or _repo_rid_from_git(repo)
+    repo_path = props.get("transformsRepoPath", "")
+    if branch == "master":
+        branch = props.get("transformsDefaultBranchName", branch)
+    if not repo_path:
+        raise typer.BadParameter(
+            f"{repo}/gradle.properties has no transformsRepoPath - is this a cloned "
+            "Foundry transforms repository?"
+        )
+    project_path = repo_path.rsplit("/", 1)[0]
+    datasets_path = f"{project_path}/{setup.FOLDER}"
+    project = project_folder_rid or (resolve_parent_folder(repo_rid) if repo_rid else "")
+    if not project:
+        raise typer.BadParameter("could not resolve the project folder; pass --project-folder-rid")
+
+    console.print("[bold]Generating synthetic demand history[/bold]")
+    history = setup.generate_history(n_skus=n_skus, n_days=n_days)
+    frames = setup.chronological_split(
+        history, validation_days=validation_days, holdout_days=holdout_days
+    )
+    summary = Table(title="Chronological split", show_edge=False)
+    summary.add_column("Split")
+    summary.add_column("Rows", justify="right")
+    for key in ("sales_train", "validation_actuals", "holdout_actuals", "forecast_request"):
+        summary.add_row(key, f"{len(frames[key]):,}")
+    console.print(summary)
+
+    console.print(f"[bold]Provisioning datasets under[/bold] {datasets_path}")
+    try:
+        result = setup.provision(frames, project_folder_rid=project, branch=branch)
+    except FoundryError as exc:
+        console.print(f"[red]Foundry setup failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    table = Table(title="Foundry datasets", show_edge=False)
+    table.add_column("Dataset")
+    table.add_column("RID")
+    for key, rid in setup.result_as_config(result).items():
+        table.add_row(key, rid)
+    console.print(table)
+
+    console.print("[bold]Scaffolding the repo[/bold]")
+    transform_rel, actions = setup.scaffold(repo, datasets_path, branch)
+    for action in actions:
+        console.print(f"  {action}")
+
+    if no_push:
+        console.print("[yellow]--no-push: remember to push before running[/yellow]")
+    else:
+        console.print(f"[bold]Pushing to Foundry[/bold] ({branch}) so the baseline publishes")
+        try:
+            push_repo(repo, branch=branch, message="autoresearch: install baseline transform")
+        except FoundryBuildError as exc:
+            console.print(f"[red]push failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    task = {
+        "name": "foundry-demand-forecasting",
+        "goal": "Reduce validation WMAPE on the Foundry demand dataset.",
+        "runtime": "foundry",
+        "metric": {"name": "wmape", "direction": "min"},
+        "data": {"id_column": "sku_id", "date_column": "date", "target_column": "units_sold"},
+        "agents": {"count": 3},
+        "budget": {"rounds": 3, "max_experiments": 9},
+        "workspace": {
+            "seed": str(repo),
+            "runs": "runs",
+            "allowed_paths": [transform_rel],
+        },
+        "foundry": {
+            "repo_dir": str(repo),
+            "branch": branch,
+            "repo_rid": repo_rid,
+            "project_folder_rid": project,
+            "datasets": setup.result_as_config(result),
+        },
+    }
+    write_config = write_config.resolve()
+    write_config.write_text(yaml.safe_dump(task, sort_keys=False))
+    console.print(f"\n[green]Wrote task config:[/green] {write_config}")
+    console.print(f"Next: [bold]autoresearch run -c {write_config}[/bold]")
+
+
+def _repo_rid_from_git(repo: Path) -> str:
+    """Best-effort: read the Stemma repo RID from the git remote URL."""
+    import re
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    match = re.search(r"(ri\.stemma\.main\.repository\.[0-9a-fA-F-]+)", result.stdout)
+    return match.group(1) if match else ""
+
+
+@app.command(name="foundry-build")
+def foundry_build_cmd(
+    config: ConfigOption,
+    message: Annotated[
+        str, typer.Option("--message", "-m", help="Commit message for the pushed change")
+    ] = "autoresearch: trigger training build",
+    no_push: Annotated[
+        bool, typer.Option("--no-push", help="Skip git push; build the already-published code")
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Rebuild even if Foundry considers the output up to date")
+    ] = False,
+    timeout_s: Annotated[
+        int | None, typer.Option(min=1, help="Override the build timeout (seconds)")
+    ] = None,
+) -> None:
+    """Push the transforms repo and trigger a Foundry build of the forecasts dataset.
+
+    This is the manual 'train on Foundry' step: it publishes the current transform
+    code and runs a build on Foundry compute, then reports the result.
+    """
+    from .foundry_build import (
+        FoundryBuildError,
+        create_build_when_ready,
+        push_repo,
+        wait_for_build,
+    )
+
+    _load_env()
+    cfg = load_config(config)
+    if cfg.runtime != "foundry" or cfg.foundry is None:
+        raise typer.BadParameter("config is not runtime: foundry (run foundry-setup first)")
+    fdry = cfg.foundry
+    target = fdry.datasets.forecasts
+    if not target:
+        raise typer.BadParameter("foundry.datasets.forecasts RID is unset; run foundry-setup first")
+    repo_dir = cfg.resolve(fdry.repo_dir)
+
+    try:
+        if not no_push:
+            console.print(f"[bold]Pushing[/bold] {repo_dir} → Foundry branch [cyan]{fdry.branch}[/cyan]")
+            sha = push_repo(repo_dir, branch=fdry.branch, message=message)
+            console.print(f"  pushed{f' commit {sha[:8]}' if sha else ' (nothing new to commit)'}")
+        console.print(f"[bold]Triggering build[/bold] of forecasts [dim]{target}[/dim]")
+
+        def on_wait(elapsed: float) -> None:
+            console.print(f"  [{elapsed:6.0f}s] waiting for Foundry to publish the transform…")
+
+        build_rid = create_build_when_ready(
+            [target], branch=fdry.branch, force=force, on_wait=on_wait
+        )
+        console.print(f"  build {build_rid}")
+
+        def on_status(status: str, elapsed: float) -> None:
+            console.print(f"  [{elapsed:6.0f}s] {status}")
+
+        result = wait_for_build(
+            build_rid,
+            timeout_s=timeout_s or fdry.build_timeout_s,
+            poll_s=fdry.poll_s,
+            on_status=on_status,
+        )
+        console.print(f"[green]Build {result.status}[/green] — forecasts written to {target}")
+    except (FoundryBuildError, FoundryError) as exc:
+        console.print(f"[red]Foundry build failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+@app.command(name="foundry-score")
+def foundry_score_cmd(
+    config: ConfigOption,
+    holdout: Annotated[
+        bool, typer.Option("--holdout", help="Also score the sealed holdout split")
+    ] = False,
+) -> None:
+    """Read the forecasts + sealed actuals back from Foundry and print the metrics."""
+    from .harness import forecasting_metrics
+
+    _load_env()
+    cfg = load_config(config)
+    if cfg.runtime != "foundry" or cfg.foundry is None:
+        raise typer.BadParameter("config is not runtime: foundry")
+    fdry = cfg.foundry
+    d = cfg.data
+    keys = [d.id_column, d.date_column]
+
+    forecasts = read_dataset(fdry.datasets.forecasts, branch=fdry.branch)
+    forecasts[d.date_column] = pd.to_datetime(forecasts[d.date_column], utc=True).dt.tz_localize(None)
+
+    table = Table(title="Foundry evaluation", show_edge=False)
+    table.add_column("Split")
+    table.add_column("Rows", justify="right")
+    table.add_column(cfg.metric.name, justify="right")
+    table.add_column("mape", justify="right")
+    table.add_column("rmse", justify="right")
+    table.add_column("bias%", justify="right")
+
+    def score(rid: str, label: str) -> None:
+        actuals = read_dataset(rid, branch=fdry.branch)
+        actuals[d.date_column] = pd.to_datetime(actuals[d.date_column], utc=True).dt.tz_localize(None)
+        merged = actuals.merge(forecasts[[*keys, "forecast"]], on=keys, validate="one_to_one")
+        met = forecasting_metrics(
+            merged[d.target_column].to_numpy(float), merged["forecast"].to_numpy(float)
+        )
+        table.add_row(
+            label,
+            f"{len(merged):,}",
+            f"{met['wmape']:.4f}",
+            f"{met['mape']:.4f}",
+            f"{met['rmse']:.3f}",
+            f"{met['bias_pct']:.2f}",
+        )
+
+    score(fdry.datasets.validation_actuals, "validation")
+    if holdout:
+        score(fdry.datasets.holdout_actuals, "holdout")
+    console.print(table)
 
 
 @app.command()
@@ -75,9 +370,13 @@ def resume(
     run_dir: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
     parallel: Annotated[int | None, typer.Option(min=1)] = None,
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
+    max_cost: Annotated[
+        float | None,
+        typer.Option(min=0.0, help="Stop before a new round once model spend (USD) hits this"),
+    ] = None,
 ) -> None:
     """Resume the latest or selected run: review the next proposed round, then continue."""
-    load_dotenv()
+    _load_env()
     cfg = load_config(config)
     store = _store_from(run_dir, config)
     completed = asyncio.run(
@@ -85,6 +384,7 @@ def resume(
             cfg,
             parallel=parallel,
             max_experiments=max_experiments,
+            max_cost=max_cost,
             resume_store=store,
             review=review_round,
         )
@@ -94,27 +394,97 @@ def resume(
 
 @app.command()
 def ingest(
-    csv: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="Sales CSV")],
+    source: Annotated[
+        str,
+        typer.Argument(
+            help="Sales CSV path, or a Foundry dataset: foundry://ri.foundry.main.dataset.<uuid>"
+        ),
+    ],
     name: Annotated[str, typer.Option("--name", "-n", help="Task name")],
     tasks_root: Annotated[Path, typer.Option(help="Task output directory")] = Path("tasks"),
     validation_days: Annotated[int | None, typer.Option(min=1)] = None,
     holdout_days: Annotated[int | None, typer.Option(min=1)] = None,
     overwrite: Annotated[bool, typer.Option(help="Replace an existing task")] = False,
+    branch: Annotated[
+        str | None, typer.Option(help="Foundry branch to read (default: the dataset default)")
+    ] = None,
+    id_column: Annotated[
+        str | None, typer.Option(help="Source column to use as sku_name")
+    ] = None,
+    date_column: Annotated[str | None, typer.Option(help="Source column to use as date")] = None,
+    target_column: Annotated[
+        str | None, typer.Option(help="Source column to use as sales")
+    ] = None,
+    price_column: Annotated[
+        str | None, typer.Option(help="Source column to use as selling_price")
+    ] = None,
+    max_drop_pct: Annotated[
+        float,
+        typer.Option(min=0.0, max=100.0, help="Refuse ingest if more than this % of rows drop"),
+    ] = 30.0,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the data-quality confirmation prompt")
+    ] = False,
 ) -> None:
-    """Turn a sales CSV into a protected forecasting task."""
-    preview = preview_csv(csv)
-    for warning in preview.warnings:
-        console.print(f"[yellow]! {warning}[/yellow]")
+    """Turn a sales history (local CSV or Foundry dataset) into a protected forecasting task."""
+    _load_env()
+    try:
+        rid = parse_dataset_reference(source)
+    except FoundryError as exc:
+        console.print(f"[red]x {exc}[/red]")
+        raise typer.Exit(1) from None
+
+    if rid:
+        console.print(f"Reading Foundry dataset [bold]{rid}[/bold]" + (f" ({branch})" if branch else ""))
+        try:
+            frame = read_dataset(rid, branch=branch)
+        except FoundryError as exc:
+            console.print(f"[red]x {exc}[/red]")
+            raise typer.Exit(1) from None
+        console.print(f"Downloaded [bold]{len(frame)}[/bold] rows from Foundry")
+    else:
+        path = Path(source)
+        if not path.is_file():
+            raise typer.BadParameter(f"'{source}' is not a file or a Foundry dataset reference")
+        try:
+            frame = pd.read_csv(path)
+        except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
+            console.print(f"[red]x could not read CSV: {exc}[/red]")
+            raise typer.Exit(1) from None
+
+    try:
+        frame = apply_column_mapping(
+            frame,
+            id_column=id_column,
+            date_column=date_column,
+            target_column=target_column,
+            price_column=price_column,
+        )
+    except ValueError as exc:
+        console.print(f"[red]x {exc}[/red]")
+        raise typer.Exit(1) from None
+
+    preview = preview_frame(frame)
+    _print_quality_gate(preview)
     if not preview.ok:
         for error in preview.errors:
             console.print(f"[red]x {error}[/red]")
         raise typer.Exit(1)
     console.print(
-        f"Found [bold]{preview.rows}[/bold] rows, [bold]{preview.skus}[/bold] items, "
+        f"Found [bold]{preview.rows}[/bold] clean rows, [bold]{preview.skus}[/bold] items, "
         f"{preview.distinct_dates} dates ({preview.date_min} to {preview.date_max})"
     )
-    result = ingest_csv(
-        csv,
+    if preview.dropped_pct > max_drop_pct:
+        console.print(
+            f"[red]x {preview.dropped_pct:.1f}% of rows would be dropped, above the "
+            f"--max-drop-pct {max_drop_pct:.0f}% limit. Fix the source or raise the limit.[/red]"
+        )
+        raise typer.Exit(1)
+    if not yes and not typer.confirm("Proceed with ingestion using the cleaned data?"):
+        console.print("Ingestion cancelled. No task was created.")
+        raise typer.Exit(0)
+    result = ingest_frame(
+        frame,
         name=name,
         tasks_root=tasks_root,
         validation_days=validation_days,
@@ -127,13 +497,11 @@ def ingest(
 @app.command()
 def metric(
     config: ConfigOption,
-    description: Annotated[
-        str, typer.Argument(help="Plain-English evaluation metric")
-    ],
+    description: Annotated[str, typer.Argument(help="Plain-English evaluation metric")],
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
 ) -> None:
     """Create and verify a custom metric from plain English."""
-    load_dotenv()
+    _load_env()
     cfg = load_config(config)
     interpreter = MetricInterpreter(cfg.director.model, cfg.director.temperature)
     spec, validation = asyncio.run(interpreter.interpret(description, eval_columns(cfg)))
@@ -162,37 +530,35 @@ def list_skills(
     console.print(table)
 
 
-_APPROVALS = {
-    "approve", "approved", "approve all", "go", "go ahead", "yes", "y", "ok", "okay",
-    "start", "run", "run it", "launch", "proceed", "do it", "ship it", "lgtm",
-    "looks good", "looks good to me", "sounds good",
-}
-_STOPS = {"stop", "quit", "exit", "end", "done", "no", "cancel", "abort"}
-
-
 def parse_review_reply(text: str) -> ReviewDecision:
     """Whole-message approval/stop phrases decide; anything else is revision feedback."""
-    normalized = " ".join(text.lower().replace("!", "").replace(".", "").split())
-    if normalized in _APPROVALS:
+    verdict = parse_reply(text)
+    if verdict == "approve":
         return ReviewDecision("approve")
-    if normalized in _STOPS:
+    if verdict == "stop":
         return ReviewDecision("stop")
     return ReviewDecision("revise", feedback=text)
 
 
-def review_round(round_number: int, ideas: list[Idea]) -> ReviewDecision:
-    """Console review gate: show the proposed round, collect the human verdict."""
+def review_round(round_number: int, ideas: list[Idea], plan_path: Path) -> ReviewDecision:
+    """Console review gate: show the proposed round and its editable plan file."""
     table = Table(title=f"Proposed round {round_number} ({len(ideas)} researches in parallel)")
     for column in ("#", "Experiment", "Hypothesis", "Skills"):
         table.add_column(column)
     for index, idea in enumerate(ideas, 1):
-        table.add_row(
-            str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-"
-        )
+        table.add_row(str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-")
     console.print(table)
     console.print(
-        "[bold]Review:[/bold] type [green]approve[/green] to launch, [red]stop[/red] to end "
-        "the run, or feedback to revise the proposal."
+        Panel(
+            f"[bold]{plan_path}[/bold] (opened in your editor)\n"
+            "Edit the file freely - the edited file is exactly what runs.\n"
+            "Reply [green]execute[/green] to launch, [red]stop[/red] to end the run, or "
+            "give feedback to revise the plan.\n"
+            "While the round runs you get a live dashboard: [bold]1-9/arrows[/bold] select "
+            "an agent, [bold]x[/bold] cancels it (the others keep going), [bold]q[/bold] "
+            "stops the whole round, [bold]?[/bold] shows help.",
+            title=f"Round {round_number} plan written",
+        )
     )
     return parse_review_reply(input_box(console))
 
@@ -205,21 +571,29 @@ def start(
             exists=True, file_okay=False, help="Project repo to research (default: cwd)"
         ),
     ] = None,
+    max_cost: Annotated[
+        float | None,
+        typer.Option(min=0.0, help="Stop before a new round once model spend (USD) hits this"),
+    ] = None,
 ) -> None:
     """Point the Research Director at a project, lock in goal and baseline, and research."""
-    load_dotenv()
+    _load_env()
     repo = (repo or Path(".")).resolve()
     settings = SessionSettings()
     session = SetupSession(openrouter_client(), console, settings=settings, repo=repo)
     console.print(f"Project: [bold]{repo}[/bold]")
     console.print(
         Panel(
-            "The Research Director explores your project itself. Set the two things it "
-            "needs with slash commands or just say them:\n"
+            "The Research Director surveys your project itself. Set what it needs with "
+            "slash commands or just say it - type [bold cyan]/[/bold cyan] to see the "
+            "command menu:\n"
             "  [bold cyan]/goal[/bold cyan] reduce wmape        "
             "[bold cyan]/baseline[/bold cyan] models/arima.py\n"
-            "Once both are clear it locks in, evaluates the baseline, and starts round 1. "
-            "After each round you review its next proposals before they run.",
+            "Once goal, baseline, and metric are settled it evaluates the baseline, opens "
+            "a session folder like research/001-reduce-wmape/, and pops the round-1 plan "
+            "open in your editor. You edit it, type execute, and the round runs. Each "
+            "round adds round-N-plan.md and round-N-findings.md there, indexed by the "
+            "session's README.md - a lab notebook of all the research ever tried.",
             title="Research setup",
         )
     )
@@ -233,6 +607,9 @@ def start(
     except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
         console.print(f"[bold red]Setup failed:[/bold red] {exc}")
         raise typer.Exit(1) from None
+    if not ideas:
+        console.print("Setup ended without launching. Nothing is running.")
+        return
 
     assert session.config_path is not None
     try:
@@ -240,12 +617,16 @@ def start(
             run_research(
                 load_config(session.config_path),
                 initial_ideas=ideas,
+                initial_plan_path=session.plan_path,
+                session_dir=session.session_dir,
+                max_cost=max_cost,
                 review=review_round,
             )
         )
     except KeyboardInterrupt:
-        console.print("\nRun interrupted. Resume later with: autoresearch resume -c "
-                      f"{session.config_path}")
+        console.print(
+            f"\nRun interrupted. Resume later with: autoresearch resume -c {session.config_path}"
+        )
         raise typer.Exit(130) from None
     except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
         console.print(f"[bold red]Research run failed:[/bold red] {exc}")
@@ -279,12 +660,18 @@ def leaderboard(
     metric = state.get("primary_metric", "wmape")
     table = Table(title=f"{state.get('task', 'Autoresearch')} leaderboard")
     for column in (
-        "Rank", "ID", "Experiment", "Skills", metric.upper(), "RMSE", "Holdout", "Promoted"
+        "Rank",
+        "ID",
+        "Experiment",
+        "Skills",
+        metric.upper(),
+        "RMSE",
+        "Holdout",
+        "Cost",
+        "Promoted",
     ):
         table.add_column(column)
-    for rank, item in enumerate(
-        store.leaderboard(metric, state.get("metric_direction", "min")), 1
-    ):
+    for rank, item in enumerate(store.leaderboard(metric, state.get("metric_direction", "min")), 1):
         table.add_row(
             str(rank),
             item.id,
@@ -293,6 +680,7 @@ def leaderboard(
             f"{item.metrics.get(metric, float('nan')):.6f}",
             f"{item.metrics.get('rmse', float('nan')):.3f}",
             f"{item.holdout_metrics.get('wmape', float('nan')):.6f}",
+            format_cost(item.metadata.get("cost_usd", 0.0) or 0.0),
             "yes" if item.promoted else "",
         )
     console.print(table)
@@ -339,10 +727,37 @@ def status(
 
 
 @app.command()
+def doctor(
+    no_api: Annotated[
+        bool, typer.Option("--no-api", help="Skip the live OpenRouter key check")
+    ] = False,
+) -> None:
+    """Check that tools and credentials needed to run research are in place."""
+    _load_env()
+    symbols = {"ok": "[green]✓[/green]", "warn": "[yellow]![/yellow]", "fail": "[red]✗[/red]"}
+    table = Table(title="autoresearch doctor", show_edge=False)
+    table.add_column("")
+    table.add_column("Check")
+    table.add_column("Detail")
+    checks = run_checks(check_api=not no_api)
+    for check in checks:
+        table.add_row(symbols[check.status], check.name, check.detail)
+    console.print(table)
+    failures = [c for c in checks if c.status == "fail"]
+    if failures:
+        console.print(
+            f"\n[red]{len(failures)} problem(s) must be fixed before a run.[/red] "
+            "See the setup steps in the README."
+        )
+        raise typer.Exit(1)
+    console.print("\n[green]Ready to run.[/green]")
+
+
+@app.command()
 def stop() -> None:
-    """Request that a running orchestrator stop after its current round."""
+    """Stop a running orchestrator: mid-round agents are cancelled within seconds."""
     Path(".autoresearch-stop").write_text("stop\n")
-    console.print("Stop requested.")
+    console.print("Stop requested. Running agents will be cancelled and recorded as such.")
 
 
 if __name__ == "__main__":

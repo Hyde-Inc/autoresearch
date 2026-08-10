@@ -21,6 +21,6 @@ def test_idea_tracks_skills() -> None:
         title="Calibrate bias",
         hypothesis="Calibration will reduce bias.",
         instructions="Apply a residual correction.",
-        skills_used=["bias-correction"],
+        skills_used=["ensembling"],
     )
-    assert idea.skills_used == ["bias-correction"]
+    assert idea.skills_used == ["ensembling"]

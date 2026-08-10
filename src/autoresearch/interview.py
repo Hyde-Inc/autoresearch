@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -28,12 +29,32 @@ from . import eda
 from .chat import StreamingChat, TurnRenderer, input_box
 from .config import DEFAULT_MODEL, TaskConfig, load_config
 from .discover import read_repo_file, render_inventory, repo_inventory
+from .editor import open_in_editor
 from .metrics import MetricInterpreter, MetricSpec, MetricValidation, adopt_spec, eval_columns
 from .models import Idea
 from .orchestrator import validate_baseline
+from .plans import (
+    PlanError,
+    mark_executed,
+    new_session_dir,
+    parse_plan,
+    plan_path,
+    plans_dir_for_task,
+    refresh_session_readme,
+    render_plan,
+)
 from .prepare import prepare_workspace, write_baseline
+from .progress import Activity
 from .skills import ResearchSkill, load_skills
-from .slash import SessionSettings, handle_slash
+from .slash import (
+    COMMANDS,
+    MAX_PARALLEL,
+    MIN_PARALLEL,
+    SessionSettings,
+    handle_slash,
+    parse_reply,
+)
+from .survey import cached_survey, survey_repo
 
 MAX_TOOL_ROUNDS = 16
 
@@ -69,7 +90,9 @@ def apply_brief(config: TaskConfig, brief: ResearchBrief) -> None:
     raw["context"] = brief.context
     raw["guardrails"] = brief.guardrails
     raw["idea_hints"] = brief.idea_hints
-    if brief.metric_name and not brief.metric_description:
+    current = raw.get("metric") or {}
+    # Never clobber an already-adopted custom metric (it carries a definition path).
+    if not current.get("definition") and brief.metric_name and not brief.metric_description:
         raw["metric"] = {"name": brief.metric_name, "direction": "min"}
     config.config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
 
@@ -178,7 +201,14 @@ TOOLS = [
             "holdout_days": {"type": "integer", "minimum": 1},
             "name": {"type": "string", "description": "Optional task name"},
         },
-        ["train_data", "id_column", "date_column", "target_column", "validation_days", "holdout_days"],
+        [
+            "train_data",
+            "id_column",
+            "date_column",
+            "target_column",
+            "validation_days",
+            "holdout_days",
+        ],
     ),
     _tool(
         "write_baseline",
@@ -238,9 +268,11 @@ TOOLS = [
         ["text"],
     ),
     _tool(
-        "start_research",
-        "Launch the autonomous research run with the approved round-1 experiment plan. Call "
-        "only after the user approved the plan.",
+        "write_plan",
+        "Write the round-1 research plan to an editable markdown file in the project's "
+        "research/ folder (it opens in the user's editor). The user reviews and edits that "
+        "file, then replies 'execute' to launch; calling this again rewrites the same file "
+        "with your revision.",
         {"ideas": _IDEA_SCHEMA},
         ["ideas"],
     ),
@@ -257,7 +289,14 @@ _TOOL_LABELS = {
     "replace_baseline": "installing your baseline script",
     "evaluate_baseline": "running the protected baseline evaluation",
     "record_context": "recording that in the task context",
-    "start_research": "preparing the research run",
+    "write_plan": "writing the research plan file",
+}
+_ACTIVITY_PHASES = {
+    "prepare_workspace": "Preparing the protected workspace",
+    "write_baseline": "Building the baseline model",
+    "replace_baseline": "Installing the pinned baseline",
+    "evaluate_baseline": "Evaluating baseline on validation + hidden holdout",
+    "define_custom_metric": "Defining and verifying the custom metric",
 }
 
 _RUNTIME_CONTRACT = """\
@@ -298,10 +337,16 @@ class SetupSession:
         else:
             model = DEFAULT_MODEL
             temperature = 0.35
+        self.director_model = model
         self.chat = StreamingChat(client, model.removeprefix("openrouter/"), temperature)
         self.skills: list[ResearchSkill] = load_skills(self.config)
         self.pending_spec: MetricSpec | None = None
         self.final_ideas: list[Idea] | None = None
+        self.survey: str | None = cached_survey(self.repo)
+        self.session_dir: Path | None = None
+        self.plan_path: Path | None = None
+        self._survey_thread: threading.Thread | None = None
+        self._survey_outcome: dict = {}
 
     def _reload(self) -> None:
         assert self.config_path is not None
@@ -326,46 +371,77 @@ class SetupSession:
             "facts the user can correct. If the user gives an unclear or invalid answer, say "
             "what went wrong and ask again; never stop the session.\n\n"
             "The user edits run settings with slash commands (/goal, /baseline, /n_agents, "
-            "/metric, /guardrail, /rounds, /timeout). Changes arrive as [settings updated] "
+            "/metric, /guardrail, /rounds, /timeout, /budget). Changes arrive as [settings updated] "
             "notes in the conversation. Treat them as final decisions: do not re-confirm them, "
             "and never ask the user to approve something they already set.\n\n"
             f"Current settings:\n{self.settings.describe()}\n\n"
         )
         if self.config is None:
+            findings = f"Project inventory:\n{render_inventory(repo_inventory(self.repo))}"
+            if self.survey:
+                findings = (
+                    "Repository survey (a coding agent explored the project and wrote this "
+                    f"report):\n{self.survey}\n\n{findings}"
+                )
+            elif self.survey_pending:
+                findings = (
+                    "A coding agent is surveying the repository in the background; its "
+                    "report will appear in this context once ready. Do not wait for it or "
+                    "mention it - work from the inventory below and your read/EDA tools.\n\n"
+                    f"{findings}"
+                )
             flow = (
-                "No task workspace exists yet. Two things must be clear before research can "
-                "start: the goal and the baseline model. Everything else you decide "
-                "yourself.\n\n"
+                "No task workspace exists yet. Three things must be settled before research "
+                "can start: the goal, the baseline model, and the evaluation metric. "
+                "Everything else you decide yourself.\n\n"
                 "Your flow:\n"
-                "1. Explore the project yourself: read the README and model code with "
-                "read_file, profile candidate data files with explore_data. Identify the "
-                "training data, its id/date/target columns, and what models already exist.\n"
+                "1. Start from the repository findings below; verify anything load-bearing "
+                "or surprising with read_file and profile the data with explore_data. "
+                "Identify the training data, its id/date/target columns, and what models "
+                "already exist.\n"
                 "2. If the goal or baseline is still unclear after exploring, ask about that "
                 "one thing, sharing what you found in the project while you do. If a "
                 "settings note already pins them, they are decided.\n"
-                "3. The moment both goal and baseline are clear, LOCK IN and run the whole "
-                "launch sequence without asking for permission at any step:\n"
+                "3. Settle the metric BEFORE locking in. The standard metrics (wmape, mape, "
+                "rmse, bias_pct) need no confirmation. But if the user asked for a custom "
+                "metric (see the settings note) or the goal implies an asymmetric or "
+                "weighted objective - for example penalizing under-forecasting more than "
+                "over-forecasting - call define_custom_metric with a faithful description, "
+                "show the plain-English restatement, the hand-worked example, and the "
+                "verification checks, and get an explicit yes. Re-run define_custom_metric if "
+                "they want changes. Do not move on until a requested custom metric is "
+                "confirmed by the user.\n"
+                "4. The moment goal, baseline, and metric are settled, LOCK IN and run the "
+                "whole launch sequence without asking for permission at any step:\n"
                 "   a. Call prepare_workspace, stating your setup choices (data file, "
                 "columns, validation and holdout horizon matched to the business forecast "
                 "horizon) as brief facts.\n"
-                "   b. Call write_baseline. Port the pinned baseline script faithfully so "
+                "   b. If the user confirmed a custom metric, call adopt_custom_metric now so "
+                "the baseline and every experiment are scored with it.\n"
+                "   c. Call write_baseline. Port the pinned baseline script faithfully so "
                 "the research has to beat the user's current approach. If no baseline is "
                 "pinned and none exists in the repo, run the EDA you need (seasonality, "
                 "intermittency, drivers) and choose a simple, robust first model from your "
                 "skills; tell the user why.\n"
-                "   c. Call evaluate_baseline and interpret the numbers in one or two "
+                "   d. Call evaluate_baseline and interpret the numbers in one or two "
                 "sentences. If evaluation errors, fix the code with write_baseline and "
                 "retry.\n"
-                "   d. Call finalize_brief using the settings above (goal, metric, "
+                "   e. Call finalize_brief using the settings above (goal, metric, "
                 "guardrails) plus the business context you learned.\n"
-                f"   e. Propose exactly {self.settings.n_agents} round-1 experiment(s), "
+                f"   f. Propose exactly {self.settings.n_agents} round-1 experiment(s), "
                 "each a single testable change, citing which skills informed it, and call "
-                "start_research immediately with the ideas (fields: title, hypothesis, "
-                "instructions, category, skills_used). Announce the plan as you launch; do "
-                "not wait for approval - locking in was the approval.\n\n"
-                "After round 1 you will analyze results and propose the next round, which "
-                "the user reviews before it runs.\n\n"
-                f"Project inventory:\n{render_inventory(repo_inventory(self.repo))}\n\n"
+                "write_plan with the ideas (fields: title, hypothesis, instructions, "
+                "category, skills_used). This saves the plan as an editable markdown file. "
+                "After calling it, tell the user in one short message where the plan file "
+                "is and that they can edit it freely, then reply 'execute' to launch, give "
+                "feedback to revise, or 'stop'. Do not launch anything yourself - the "
+                "launch happens when they say execute.\n\n"
+                "If the user gives feedback on the plan, revise the ideas and call "
+                "write_plan again; it rewrites the same file.\n"
+                "Never call write_plan until a requested custom metric has been adopted.\n\n"
+                "After round 1 you will analyze results and write the next round's plan, "
+                "which the user reviews the same way before it runs.\n\n"
+                f"{findings}\n\n"
             )
         else:
             seed = self.config.resolve(self.config.workspace.seed)
@@ -393,21 +469,26 @@ class SetupSession:
                 "the numbers for the user in one or two sentences.\n"
                 f"4. Propose a round-1 plan of exactly {self.settings.n_agents} "
                 "experiment(s), each a single testable change, citing which skills informed "
-                "it. Once the user approves, call start_research with the ideas (fields: "
-                "title, hypothesis, instructions, category, skills_used).\n\n"
+                "it, and call write_plan with the ideas (fields: title, hypothesis, "
+                "instructions, category, skills_used). Tell the user where the plan file "
+                "is; they edit it and reply 'execute' to launch, give feedback to revise "
+                "(call write_plan again), or 'stop'.\n\n"
                 f"Current task config:\n{self.config.config_path.read_text()}\n"
                 f"Training data profile:\n{json.dumps(data_profile(self.config))}\n\n"
                 f"Agent task contract (TASK.md):\n{contract}\n\n"
             )
+            if self.survey:
+                flow += (
+                    "Repository survey (a coding agent explored the original project):\n"
+                    f"{self.survey}\n\n"
+                )
         return (
             style
             + flow
             + "Use record_context whenever the user shares a useful business fact such as "
             "current production performance.\n\n"
             "Guardrail expressions look like: rmse<=baseline*1.10, bias_pct within -8..8, "
-            "runtime_s<=600.\n\n"
-            + _RUNTIME_CONTRACT
-            + f"\n\nYour skill library:\n{skill_text}"
+            "runtime_s<=600.\n\n" + _RUNTIME_CONTRACT + f"\n\nYour skill library:\n{skill_text}"
         )
 
     def execute(self, name: str, arguments: dict) -> dict:
@@ -532,9 +613,18 @@ class SetupSession:
         return {"ok": True, "saved_to": str(self.config_path)}
 
     def _tool_define_custom_metric(self, description: str) -> dict:
-        config = self._require_config()
-        interpreter = MetricInterpreter(config.director.model, config.director.temperature)
-        spec, validation = asyncio.run(interpreter.interpret(description, eval_columns(config)))
+        # Runnable before the workspace exists so the metric can be confirmed up front.
+        # The worked-example verification does not need the real data; columns are advisory.
+        if self.config is not None:
+            model = self.config.director.model
+            temperature = self.config.director.temperature
+            columns = eval_columns(self.config)
+        else:
+            model = DEFAULT_MODEL
+            temperature = 0.35
+            columns = ["actual", "forecast"]
+        interpreter = MetricInterpreter(model, temperature)
+        spec, validation = asyncio.run(interpreter.interpret(description, columns))
         self.pending_spec = spec
         print_spec(self.console, spec, validation)
         return {
@@ -573,8 +663,14 @@ class SetupSession:
         self._reload()
         return {"ok": True}
 
-    def _tool_start_research(self, ideas: list[dict]) -> dict:
-        self._require_config()
+    def _tool_write_plan(self, ideas: list[dict]) -> dict:
+        config = self._require_config()
+        if self.settings.metric_description and config.metric.definition is None:
+            return {
+                "error": "a custom metric was requested but has not been adopted yet; call "
+                "define_custom_metric, get the user's confirmation, then adopt_custom_metric "
+                "before writing the plan",
+            }
         if not ideas:
             return {"error": "provide at least one experiment idea"}
         known = {skill.name for skill in self.skills}
@@ -583,20 +679,133 @@ class SetupSession:
             idea = Idea.model_validate(item)
             idea.skills_used = [name for name in idea.skills_used if name in known]
             parsed.append(idea)
-        self.final_ideas = parsed[: self.settings.n_agents]
-        table = Table(title="Approved round 1")
-        for column in ("Experiment", "Hypothesis", "Skills"):
+        parsed = parsed[: self.settings.n_agents]
+        if self.plan_path is None:
+            self.session_dir = new_session_dir(
+                plans_dir_for_task(config.root), self.settings.goal or config.goal
+            )
+            self.plan_path = plan_path(self.session_dir, round_number=1)
+        self.plan_path.write_text(
+            render_plan(
+                round_number=1,
+                ideas=parsed,
+                goal=self.settings.goal or config.goal,
+                metric=config.metric.name,
+                baseline=self.settings.baseline_path or "",
+                n_agents=len(parsed),
+                guardrails=config.guardrails,
+                timeout_s=self.settings.timeout_s,
+                budget_s=self.settings.budget_s,
+            )
+        )
+        refresh_session_readme(self.session_dir)
+        opened = open_in_editor(self.plan_path)
+        table = Table(title=f"Proposed round 1 ({len(parsed)} researches in parallel)")
+        for column in ("#", "Experiment", "Hypothesis", "Skills"):
             table.add_column(column)
-        for idea in self.final_ideas:
-            table.add_row(idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-")
+        for index, idea in enumerate(parsed, 1):
+            table.add_row(
+                str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-"
+            )
         self.console.print(table)
-        return {"ok": True, "experiments": len(self.final_ideas)}
+        opened_note = "Opened in your editor.\n" if opened else ""
+        self.console.print(
+            Panel(
+                f"[bold]{self.plan_path}[/bold]\n"
+                f"{opened_note}"
+                "Edit the file freely - reword, delete, or add experiments. The edited file "
+                "is exactly what runs.\n"
+                "Reply [green]execute[/green] to launch, [red]stop[/red] to end, or give "
+                "feedback to revise the plan.",
+                title="Research plan written",
+            )
+        )
+        return {
+            "ok": True,
+            "plan_path": str(self.plan_path),
+            "experiments": len(parsed),
+            "next": "tell the user where the plan file is and wait for execute/feedback/stop",
+        }
+
+    def _apply_plan_overrides(self, overrides: dict) -> None:
+        """Fold the human's frontmatter edits back into settings and the task config."""
+        if overrides.get("goal"):
+            self.settings.goal = str(overrides["goal"])
+        if overrides.get("n_agents"):
+            self.settings.n_agents = max(
+                MIN_PARALLEL, min(int(overrides["n_agents"]), MAX_PARALLEL)
+            )
+        if overrides.get("guardrails"):
+            self.settings.guardrails = [str(item) for item in overrides["guardrails"]]
+        if overrides.get("timeout_s"):
+            self.settings.timeout_s = max(60, int(overrides["timeout_s"]))
+        if overrides.get("budget_s"):
+            self.settings.budget_s = max(60, int(overrides["budget_s"]))
+        config = self._require_config()
+        raw = yaml.safe_load(config.config_path.read_text())
+        if self.settings.goal:
+            raw["goal"] = self.settings.goal
+        raw["guardrails"] = self.settings.guardrails
+        agents = raw.get("agents") or {}
+        agents["count"] = self.settings.n_agents
+        agents["timeout_s"] = self.settings.timeout_s
+        agents["budget_s"] = self.settings.budget_s
+        raw["agents"] = agents
+        metric = overrides.get("metric")
+        current = raw.get("metric") or {}
+        if metric in {"wmape", "mape", "rmse", "bias_pct"} and not current.get("definition"):
+            raw["metric"] = {"name": metric, "direction": "min"}
+        config.config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+        self._reload()
+
+    @property
+    def survey_pending(self) -> bool:
+        return self._survey_thread is not None
+
+    def start_survey(self) -> None:
+        """Send a coding agent to survey the repo in the background, Cursor-subagent
+        style: the chat opens immediately and the findings merge in when ready."""
+        if self.config is not None or self.survey or self._survey_thread:
+            return
+
+        def work() -> None:
+            try:
+                self._survey_outcome["text"] = survey_repo(self.repo, self.director_model)
+            except Exception as exc:  # noqa: BLE001 - survey is best-effort
+                self._survey_outcome["error"] = str(exc)
+
+        self._survey_thread = threading.Thread(target=work, name="repo-survey", daemon=True)
+        self._survey_thread.start()
+        self.console.print(
+            "[dim]A coding agent is surveying the repository in the background - "
+            "start typing, its findings will be folded in when ready.[/dim]"
+        )
+
+    def poll_survey(self) -> bool:
+        """Collect a finished background survey. Returns True when new findings landed."""
+        if self._survey_thread is None or self._survey_thread.is_alive():
+            return False
+        self._survey_thread = None
+        self.survey = self._survey_outcome.get("text")
+        if self.survey:
+            self.console.print(
+                "[dim]Repo survey ready - report added to the director's context "
+                "(saved to .autoresearch/survey.md).[/dim]"
+            )
+            return True
+        error = self._survey_outcome.get("error")
+        reason = f"survey failed ({error})" if error else "the agent produced no report"
+        self.console.print(
+            f"[dim]Repo survey skipped: {reason}; the director continues with the "
+            "static inventory and its own tools.[/dim]"
+        )
+        return False
 
     def next_user_message(self) -> str:
         """Read input, applying slash commands locally until a chat message arrives."""
         notes: list[str] = []
         while True:
-            text = input_box(self.console)
+            text = input_box(self.console, completions=COMMANDS)
             result = handle_slash(text, self.settings, self.console)
             if not result.handled:
                 if notes:
@@ -605,7 +814,38 @@ class SetupSession:
             if result.note:
                 notes.append(result.note)
 
+    def _gate_user_message(self) -> str | None:
+        """Next message for the director, or None when the plan gate resolved the session.
+
+        Once a plan file exists, 'execute' parses the (possibly hand-edited) file and
+        ends setup with the final ideas; 'stop' ends with none; anything else is
+        feedback passed through to the director.
+        """
+        while True:
+            text = self.next_user_message()
+            if self.plan_path is None:
+                return text
+            verdict = parse_reply(text)
+            if verdict == "revise":
+                return text
+            if verdict == "stop":
+                self.final_ideas = []
+                return None
+            try:
+                parsed = parse_plan(self.plan_path)
+            except PlanError as exc:
+                self.console.print(
+                    f"[yellow]! {exc}[/yellow]\n"
+                    "Fix the plan file and type execute again, or give feedback to revise it."
+                )
+                continue
+            self._apply_plan_overrides(parsed.overrides)
+            mark_executed(self.plan_path)
+            self.final_ideas = parsed.ideas
+            return None
+
     def run(self) -> list[Idea]:
+        self.start_survey()
         first = self.next_user_message()
         messages: list[dict] = [
             {"role": "system", "content": self.system_prompt()},
@@ -613,8 +853,11 @@ class SetupSession:
         ]
         tool_rounds = 0
         while True:
-            renderer = TurnRenderer(self.console)
-            message = self.chat.turn(messages, renderer, tools=TOOLS)
+            if self.poll_survey():
+                messages[0] = {"role": "system", "content": self.system_prompt()}
+            with Activity(self.console, "Research Director thinking") as activity:
+                renderer = TurnRenderer(self.console, on_first_token=activity.stop)
+                message = self.chat.turn(messages, renderer, tools=TOOLS)
             renderer.finish()
             messages.append(message)
             if message.get("tool_calls"):
@@ -629,7 +872,12 @@ class SetupSession:
                     except json.JSONDecodeError:
                         result: dict = {"error": "tool arguments were not valid JSON"}
                     else:
-                        result = self.execute(name, arguments)
+                        phase = _ACTIVITY_PHASES.get(name)
+                        if phase:
+                            with Activity(self.console, phase):
+                                result = self.execute(name, arguments)
+                        else:
+                            result = self.execute(name, arguments)
                     if "error" in result:
                         self.console.print(f"[yellow]! {result['error']}[/yellow]")
                     messages.append(
@@ -639,8 +887,9 @@ class SetupSession:
                             "content": json.dumps(result),
                         }
                     )
-                if self.final_ideas is not None:
-                    return self.final_ideas
                 continue
             tool_rounds = 0
-            messages.append({"role": "user", "content": self.next_user_message()})
+            reply = self._gate_user_message()
+            if reply is None:
+                return self.final_ideas or []
+            messages.append({"role": "user", "content": reply})

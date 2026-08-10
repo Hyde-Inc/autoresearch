@@ -10,8 +10,19 @@ from __future__ import annotations
 from pathlib import Path
 
 SKIP_DIRS = {
-    ".git", ".autoresearch", ".venv", "venv", "node_modules", "__pycache__",
-    ".pytest_cache", ".ruff_cache", "runs", ".idea", ".vscode", "dist",
+    ".git",
+    ".autoresearch",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    "runs",
+    ".idea",
+    ".vscode",
+    "dist",
+    "research",  # the human-facing lab notebook; keep it out of agent workspaces
 }
 DATA_SUFFIXES = {".csv", ".parquet", ".pq"}
 CODE_SUFFIXES = {".py", ".ipynb", ".sql", ".r"}

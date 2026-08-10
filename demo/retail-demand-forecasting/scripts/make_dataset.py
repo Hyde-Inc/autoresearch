@@ -1,8 +1,9 @@
 """Generate the synthetic daily sales history for this demo project.
 
-Kept intentionally small (24 SKUs x 14 months, ~10k rows) so experiments train
-in seconds, while staying realistic: weekly and annual seasonality, promo
-uplift, price changes, and a quarter of SKUs with intermittent demand.
+Kept intentionally tiny (8 SKUs x 32 weeks, 1,792 rows) so repeated protected
+training and evaluation stays quick during a live demo, while preserving
+weekly and longer seasonality, promo uplift, price changes, and a quarter of
+SKUs with intermittent demand.
 """
 
 from pathlib import Path
@@ -12,9 +13,9 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 SEED = 42
-N_SKUS = 24
-N_INTERMITTENT = 6
-N_DAYS = 420
+N_SKUS = 8
+N_INTERMITTENT = 2
+N_DAYS = 224
 
 
 def build() -> pd.DataFrame:

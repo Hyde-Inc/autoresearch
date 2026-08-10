@@ -1,9 +1,13 @@
 import asyncio
 from pathlib import Path
 
+import yaml
+
 from autoresearch.cli import parse_review_reply
+from autoresearch.config import load_config
 from autoresearch.models import Idea
 from autoresearch.orchestrator import ReviewDecision, _propose_round
+from autoresearch.plans import new_session_dir, plans_dir_for_task
 from autoresearch.skills import SkillSelection
 from autoresearch.store import RunStore
 
@@ -11,7 +15,7 @@ from autoresearch.store import RunStore
 def test_parse_review_reply_accepts_natural_phrases() -> None:
     assert parse_review_reply("Go ahead!").action == "approve"
     assert parse_review_reply("looks good").action == "approve"
-    assert parse_review_reply("approve").action == "approve"
+    assert parse_review_reply("execute").action == "approve"
     assert parse_review_reply("Stop.").action == "stop"
     decision = parse_review_reply("approve but drop the ensemble idea")
     assert decision.action == "revise"
@@ -20,6 +24,16 @@ def test_parse_review_reply_accepts_natural_phrases() -> None:
 
 def _idea(title: str) -> Idea:
     return Idea(title=title, hypothesis="h", instructions="i")
+
+
+def _config(tmp_path: Path):
+    task_root = tmp_path / "repo" / ".autoresearch" / "task"
+    task_root.mkdir(parents=True)
+    path = task_root / "task.yaml"
+    path.write_text(yaml.safe_dump({"name": "t", "goal": "reduce wmape"}))
+    config = load_config(path)
+    session_dir = new_session_dir(plans_dir_for_task(config.root), config.goal)
+    return config, session_dir
 
 
 class StubDirector:
@@ -36,49 +50,106 @@ class StubDirector:
         return self.batches[min(len(self.calls) - 1, len(self.batches) - 1)]
 
 
-def test_review_approve_returns_ideas(tmp_path: Path) -> None:
+def test_review_approve_runs_the_plan_file(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "run")
+    config, session_dir = _config(tmp_path)
     director = StubDirector([[_idea("a"), _idea("b")]])
-    ideas = asyncio.run(
-        _propose_round(
-            director, store, 2, "", 3, review=lambda round_number, ideas: ReviewDecision("approve")
-        )
+    seen: dict = {}
+
+    def review(round_number: int, ideas: list[Idea], plan_path: Path) -> ReviewDecision:
+        seen["plan_path"] = plan_path
+        assert plan_path.exists()
+        return ReviewDecision("approve")
+
+    ideas, plan_file = asyncio.run(
+        _propose_round(director, store, config, session_dir, 2, "", 3, review=review)
     )
     assert [idea.title for idea in ideas] == ["a", "b"]
     assert director.calls[0]["count_range"] == (2, 5)
     assert director.calls[0]["count"] is None
+    # The plan file lives in the session folder and is marked executed.
+    assert plan_file == seen["plan_path"]
+    assert plan_file == session_dir / "round-2-plan.md"
+    assert session_dir == tmp_path / "repo" / "research" / "001-reduce-wmape"
+    assert "status: executed" in plan_file.read_text()
+
+
+def test_review_approve_honors_hand_edits(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    config, session_dir = _config(tmp_path)
+    director = StubDirector([[_idea("a"), _idea("b")]])
+
+    def review(round_number: int, ideas: list[Idea], plan_path: Path) -> ReviewDecision:
+        # Human deletes experiment 2 and edits a guardrail before approving.
+        text = plan_path.read_text()
+        text = text[: text.index("## Experiment 2:")]
+        text = text.replace("guardrails: []", 'guardrails: ["runtime_s<=120"]')
+        plan_path.write_text(text)
+        return ReviewDecision("approve")
+
+    ideas, _ = asyncio.run(
+        _propose_round(director, store, config, session_dir, 2, "", 3, review=review)
+    )
+    assert [idea.title for idea in ideas] == ["a"]
+    assert config.guardrails == ["runtime_s<=120"]
 
 
 def test_review_feedback_revises_then_approves(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "run")
+    config, session_dir = _config(tmp_path)
     director = StubDirector([[_idea("first")], [_idea("revised"), _idea("extra")]])
     decisions = iter(
         [ReviewDecision("revise", feedback="drop the ensemble"), ReviewDecision("approve")]
     )
 
-    ideas = asyncio.run(
-        _propose_round(director, store, 3, "", 3, review=lambda r, i: next(decisions))
+    ideas, plan_file = asyncio.run(
+        _propose_round(
+            director,
+            store,
+            config,
+            session_dir,
+            3,
+            "",
+            3,
+            review=lambda r, i, p: next(decisions),
+        )
     )
     assert [idea.title for idea in ideas] == ["revised", "extra"]
     assert director.calls[1]["feedback"] == "drop the ensemble"
     assert [idea.title for idea in director.calls[1]["previous"]] == ["first"]
+    # The revision rewrote the same plan file rather than creating a second one.
+    assert len(list(plan_file.parent.glob("round-*-plan.md"))) == 1
 
 
 def test_review_stop_ends_run(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "run")
+    config, session_dir = _config(tmp_path)
     director = StubDirector([[_idea("a"), _idea("b")]])
-    ideas = asyncio.run(
+    ideas, _ = asyncio.run(
         _propose_round(
-            director, store, 2, "", 3, review=lambda round_number, ideas: ReviewDecision("stop")
+            director,
+            store,
+            config,
+            session_dir,
+            2,
+            "",
+            3,
+            review=lambda r, i, p: ReviewDecision("stop"),
         )
     )
     assert ideas == []
 
 
-def test_no_reviewer_keeps_autonomous_exact_count(tmp_path: Path) -> None:
+def test_no_reviewer_still_records_the_plan(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "run")
+    config, session_dir = _config(tmp_path)
     director = StubDirector([[_idea("a"), _idea("b"), _idea("c")]])
-    ideas = asyncio.run(_propose_round(director, store, 2, "", 3, review=None))
+    ideas, plan_file = asyncio.run(
+        _propose_round(director, store, config, session_dir, 2, "", 3, review=None)
+    )
     assert len(ideas) == 3
     assert director.calls[0]["count"] == 3
     assert director.calls[0]["count_range"] is None
+    # Autonomous runs still archive the plan for the lab notebook.
+    assert plan_file.exists()
+    assert "status: executed" in plan_file.read_text()

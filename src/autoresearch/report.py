@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .costs import format_cost
 from .store import RunStore
 
 
@@ -26,7 +27,11 @@ def build_report(run_dir: Path) -> str:
         f"- Passing: {sum(item.status == 'passed' for item in attempts)}",
         f"- Rejected: {sum(item.status == 'rejected' for item in attempts)}",
         f"- Failed: {sum(item.status == 'failed' for item in attempts)}",
+        f"- Cancelled: {sum(item.status == 'cancelled' for item in attempts)}",
     ]
+    total_cost = sum(item.metadata.get("cost_usd", 0.0) or 0.0 for item in attempts)
+    if total_cost > 0 or state.get("cost_usd"):
+        lines.append(f"- Total model spend: {format_cost(total_cost)}")
     if improvement is not None:
         lines.extend(
             [
@@ -56,6 +61,9 @@ def build_report(run_dir: Path) -> str:
     for item in attempts:
         result = item.metrics.get(metric)
         suffix = f", {metric}={result:.6f}" if result is not None else ""
+        cost = item.metadata.get("cost_usd", 0.0) or 0.0
+        if cost > 0:
+            suffix += f", cost {format_cost(cost)}"
         lines.append(f"- `{item.id}` {item.idea.title}: **{item.status}**{suffix}")
         if item.idea.skills_used:
             lines.append(f"  - Skills: {', '.join(item.idea.skills_used)}")

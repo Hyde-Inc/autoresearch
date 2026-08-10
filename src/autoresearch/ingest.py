@@ -1,4 +1,4 @@
-"""CSV ingestion: turn a standard-schema sales export into a runnable task.
+"""Data ingestion: turn a standard-schema sales history into a runnable task.
 
 The product's fixed input schema is:
 
@@ -9,6 +9,10 @@ and show the user what was found. ``ingest_csv`` cleans the data, splits it
 chronologically into train / validation / holdout, and writes a complete task
 directory (seed workspace, private actuals, and task.yaml) that the existing
 orchestrator can run unchanged.
+
+Sources that are not local CSV files (e.g. Foundry datasets) arrive as
+DataFrames: ``apply_column_mapping`` renames source columns onto the standard
+schema, and ``preview_frame`` / ``ingest_frame`` run the same pipeline.
 """
 
 from __future__ import annotations
@@ -44,6 +48,25 @@ class Preview:
     warnings: list[str] = field(default_factory=list)
     suggested_validation_days: int = 0
     suggested_holdout_days: int = 0
+    raw_rows: int = 0
+    """Rows in the source before any cleaning."""
+    null_counts: dict[str, int] = field(default_factory=dict)
+    """Per required column: rows that are missing, blank, or wrong-typed."""
+    dropped_rows: int = 0
+    dropped_pct: float = 0.0
+
+
+def _quality_counts(frame: pd.DataFrame) -> dict[str, int]:
+    """Per required column, how many rows are unusable (null / blank / wrong type)."""
+    normed = frame.copy()
+    normed.columns = [str(c).strip() for c in normed.columns]
+    counts: dict[str, int] = {}
+    counts[DATE_COLUMN] = int(pd.to_datetime(normed[DATE_COLUMN], errors="coerce").isna().sum())
+    for column in NUMERIC_COLUMNS:
+        counts[column] = int(pd.to_numeric(normed[column], errors="coerce").isna().sum())
+    stripped = normed[ID_COLUMN].astype("string").str.strip()
+    counts[ID_COLUMN] = int((stripped.isna() | stripped.eq("")).sum())
+    return counts
 
 
 @dataclass
@@ -71,6 +94,38 @@ def _read_csv(data: str | bytes | Path) -> pd.DataFrame:
     if isinstance(data, bytes):
         return pd.read_csv(io.BytesIO(data))
     return pd.read_csv(io.StringIO(data))
+
+
+def apply_column_mapping(
+    frame: pd.DataFrame,
+    *,
+    id_column: str | None = None,
+    date_column: str | None = None,
+    target_column: str | None = None,
+    price_column: str | None = None,
+) -> pd.DataFrame:
+    """Rename source columns onto the standard schema, validating they exist."""
+    mapping = {
+        source: standard
+        for source, standard in (
+            (id_column, ID_COLUMN),
+            (date_column, DATE_COLUMN),
+            (target_column, TARGET_COLUMN),
+            (price_column, "selling_price"),
+        )
+        if source and source != standard
+    }
+    if not mapping:
+        return frame
+    frame = frame.copy()
+    frame.columns = [str(c).strip() for c in frame.columns]
+    missing = [source for source in mapping if source not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"column(s) not found in the data: {', '.join(missing)} "
+            f"(available: {', '.join(frame.columns)})"
+        )
+    return frame.rename(columns=mapping)
 
 
 def _clean(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -128,7 +183,11 @@ def preview_csv(data: str | bytes | Path) -> Preview:
         frame = _read_csv(data)
     except Exception as exc:  # noqa: BLE001
         return Preview(ok=False, errors=[f"could not read CSV: {exc}"])
+    return preview_frame(frame)
 
+
+def preview_frame(frame: pd.DataFrame) -> Preview:
+    """Validate and summarise an already-loaded sales history."""
     columns = [str(c).strip() for c in frame.columns]
     missing = [c for c in REQUIRED_COLUMNS if c not in columns]
     if missing:
@@ -139,7 +198,11 @@ def preview_csv(data: str | bytes | Path) -> Preview:
             errors=[f"missing required column(s): {', '.join(missing)}"],
         )
 
+    null_counts = _quality_counts(frame)
     cleaned, warnings = _clean(frame)
+    raw_rows = len(frame)
+    dropped_rows = raw_rows - len(cleaned)
+    dropped_pct = (dropped_rows / raw_rows * 100) if raw_rows else 0.0
     if cleaned.empty:
         return Preview(
             ok=False,
@@ -147,6 +210,10 @@ def preview_csv(data: str | bytes | Path) -> Preview:
             rows=len(frame),
             errors=["no usable rows remain after cleaning"],
             warnings=warnings,
+            raw_rows=raw_rows,
+            null_counts=null_counts,
+            dropped_rows=dropped_rows,
+            dropped_pct=dropped_pct,
         )
 
     distinct_dates = int(cleaned[DATE_COLUMN].nunique())
@@ -175,6 +242,10 @@ def preview_csv(data: str | bytes | Path) -> Preview:
         warnings=warnings,
         suggested_validation_days=horizon,
         suggested_holdout_days=horizon,
+        raw_rows=raw_rows,
+        null_counts=null_counts,
+        dropped_rows=dropped_rows,
+        dropped_pct=dropped_pct,
     )
 
 
@@ -257,9 +328,12 @@ name = "{name}-experiment"
 version = "0.1.0"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+  "catboost>=1.2",
+  "lightgbm>=4.5",
   "numpy>=2.0",
   "pandas>=2.2",
   "pyarrow>=17",
+  "scikit-learn>=1.5",
   "statsmodels>=0.14",
   "xgboost>=2.1",
 ]
@@ -298,7 +372,26 @@ def ingest_csv(
     overwrite: bool = False,
 ) -> IngestResult:
     """Create a complete task directory from a standard-schema sales CSV."""
-    frame = _read_csv(data)
+    return ingest_frame(
+        _read_csv(data),
+        name=name,
+        tasks_root=tasks_root,
+        validation_days=validation_days,
+        holdout_days=holdout_days,
+        overwrite=overwrite,
+    )
+
+
+def ingest_frame(
+    frame: pd.DataFrame,
+    *,
+    name: str,
+    tasks_root: Path,
+    validation_days: int | None = None,
+    holdout_days: int | None = None,
+    overwrite: bool = False,
+) -> IngestResult:
+    """Create a complete task directory from an already-loaded sales history."""
     missing = [c for c in REQUIRED_COLUMNS if c not in [str(c).strip() for c in frame.columns]]
     if missing:
         raise ValueError(f"missing required column(s): {', '.join(missing)}")
@@ -380,7 +473,7 @@ def ingest_csv(
         "secondary_metrics": ["mape", "rmse", "bias_pct", "runtime_s"],
         "guardrails": ["runtime_s<=600"],
         "director": {"model": DEFAULT_MODEL, "temperature": 0.35},
-        "agents": {"model": DEFAULT_MODEL, "count": 3, "timeout_s": 900},
+        "agents": {"model": DEFAULT_MODEL, "count": 3, "timeout_s": 1200, "budget_s": 3600},
         "budget": {"max_experiments": 12, "train_timeout_s": 600, "rounds": 4},
         "data": {
             "train": "seed/data/train.parquet",

@@ -1,0 +1,14 @@
+[project]
+name = "pan-india-demo-experiment"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "catboost>=1.2",
+  "lightgbm>=4.5",
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "pyarrow>=17",
+  "scikit-learn>=1.5",
+  "statsmodels>=0.14",
+  "xgboost>=2.1",
+]

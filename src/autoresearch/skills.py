@@ -67,6 +67,16 @@ def skill_index(skills: list[ResearchSkill]) -> str:
     return "\n".join(f"- {skill.name}: {skill.description}" for skill in skills)
 
 
+def named_skill_context(names: Iterable[str], skills: list[ResearchSkill]) -> str:
+    """Render full playbooks for known names, preserving the requested order."""
+    by_name = {skill.name: skill for skill in skills}
+    return "\n\n".join(
+        f"## Skill: {by_name[name].name}\n\n{by_name[name].body}"
+        for name in names
+        if name in by_name
+    )
+
+
 async def select_skills(
     situation: str,
     skills: list[ResearchSkill],

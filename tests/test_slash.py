@@ -42,12 +42,17 @@ def test_metric_guardrail_rounds_timeout() -> None:
     handle_slash("/guardrail bias_pct within -8..8", settings, console)
     handle_slash("/rounds 2", settings, console)
     handle_slash("/timeout 300", settings, console)
+    handle_slash("/budget 1800", settings, console)
     assert settings.metric == "rmse"
     assert "bias_pct within -8..8" in settings.guardrails
     assert settings.rounds == 2
     assert settings.timeout_s == 300
-    assert handle_slash("/metric accuracy", settings, console).note is None
-    assert settings.metric == "rmse"
+    assert settings.budget_s == 1800
+    # Anything that is not a standard metric becomes a custom metric description
+    # for the director to define and verify before lock-in.
+    custom = handle_slash("/metric penalize under-forecast 3x", settings, console)
+    assert settings.metric_description == "penalize under-forecast 3x"
+    assert "define_custom_metric" in custom.note
 
 
 def test_unknown_command_and_help_are_handled_locally() -> None:
@@ -59,8 +64,8 @@ def test_unknown_command_and_help_are_handled_locally() -> None:
 
 
 def test_overrides_shape_matches_task_config() -> None:
-    settings = SessionSettings(n_agents=2, metric="wmape", rounds=3, timeout_s=600)
+    settings = SessionSettings(n_agents=2, metric="wmape", rounds=3, timeout_s=600, budget_s=2400)
     overrides = settings.overrides()
-    assert overrides["agents"] == {"count": 2, "timeout_s": 600}
+    assert overrides["agents"] == {"count": 2, "timeout_s": 600, "budget_s": 2400}
     assert overrides["budget"] == {"rounds": 3}
     assert overrides["metric"] == {"name": "wmape", "direction": "min"}

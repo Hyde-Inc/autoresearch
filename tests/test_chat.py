@@ -1,6 +1,16 @@
+import io
 from types import SimpleNamespace
 
-from autoresearch.chat import accumulate_stream
+from prompt_toolkit.document import Document
+from rich.console import Console
+
+from autoresearch.chat import (
+    SlashCompleter,
+    TurnRenderer,
+    _accept_selected_completion,
+    accumulate_stream,
+)
+from autoresearch.slash import COMMANDS
 
 
 class Recorder:
@@ -54,3 +64,48 @@ def test_accumulate_stream_without_tools_or_content() -> None:
     listener = Recorder()
     message = accumulate_stream([_chunk(reasoning="hmm")], listener)
     assert message == {"role": "assistant", "content": None}
+
+
+def _completions(text: str) -> list[str]:
+    completer = SlashCompleter(COMMANDS)
+    return [item.text for item in completer.get_completions(Document(text, len(text)), None)]
+
+
+def test_typing_slash_pops_the_full_command_menu() -> None:
+    assert _completions("/") == [usage.split()[0] for usage, _ in COMMANDS]
+
+
+def test_menu_filters_as_you_type_and_stays_out_of_plain_text() -> None:
+    assert _completions("/g") == ["/goal", "/guardrail"]
+    assert _completions("/GOAL") == ["/goal"]
+    assert _completions("reduce wmape") == []  # plain chat: no menu
+    assert _completions("/goal reduce") == []  # argument typing: menu closed
+
+
+def test_enter_accepts_selected_completion_without_submitting_prefix() -> None:
+    applied = []
+    inserted = []
+    completion = SimpleNamespace(text="/metric")
+    buffer = SimpleNamespace(
+        complete_state=SimpleNamespace(current_completion=completion),
+        apply_completion=applied.append,
+        insert_text=inserted.append,
+    )
+    _accept_selected_completion(SimpleNamespace(current_buffer=buffer))
+    assert applied == [completion]
+    assert inserted == [" "]
+
+
+def test_turn_renderer_renders_markdown_and_wraps_complete_words() -> None:
+    output = io.StringIO()
+    renderer = TurnRenderer(Console(file=output, width=45, color_system=None))
+    renderer.on_content(
+        "Baseline **WMAPE** is **0.104**. This sentence should wrap cleanly "
+        "between words instead of splitting them.\n\n1. **Global XGBoost**"
+    )
+    renderer.finish()
+    rendered = output.getvalue()
+    assert "**" not in rendered
+    assert "Baseline WMAPE is 0.104" in rendered
+    assert "1 Global XGBoost" in rendered
+    assert "instead\nof splitting" in rendered
