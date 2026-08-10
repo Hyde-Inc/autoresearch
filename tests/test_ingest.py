@@ -3,7 +3,13 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from autoresearch.ingest import apply_column_mapping, ingest_csv, ingest_frame, preview_csv
+from autoresearch.ingest import (
+    apply_column_mapping,
+    ingest_csv,
+    ingest_frame,
+    preview_csv,
+    preview_frame,
+)
 
 
 def test_ingest_csv_creates_runnable_task(tmp_path: Path) -> None:
@@ -62,3 +68,26 @@ def test_apply_column_mapping_rejects_unknown_columns() -> None:
     frame = pd.DataFrame({"date": [], "sku_name": [], "sales": [], "selling_price": []})
     with pytest.raises(ValueError, match="not found in the data: nope"):
         apply_column_mapping(frame, id_column="nope")
+
+
+def test_preview_reports_per_column_quality_and_drops() -> None:
+    dates = pd.date_range("2025-01-01", periods=10)
+    rows = [
+        {"date": date, "sku_name": sku, "sales": 10 + i, "selling_price": 5.0}
+        for i, date in enumerate(dates)
+        for sku in ("a", "b")
+    ]
+    # Inject unusable values: a bad date, a non-numeric price, and a blank sku.
+    rows.append({"date": "not-a-date", "sku_name": "a", "sales": 1, "selling_price": 5.0})
+    rows.append({"date": dates[0], "sku_name": "b", "sales": 2, "selling_price": "free"})
+    rows.append({"date": dates[0], "sku_name": "  ", "sales": 3, "selling_price": 5.0})
+    frame = pd.DataFrame(rows)
+
+    preview = preview_frame(frame)
+
+    assert preview.raw_rows == len(frame)
+    assert preview.null_counts["date"] == 1
+    assert preview.null_counts["selling_price"] == 1
+    assert preview.null_counts["sku_name"] == 1
+    assert preview.dropped_rows == 3
+    assert 0 < preview.dropped_pct < 100

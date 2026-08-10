@@ -48,6 +48,25 @@ class Preview:
     warnings: list[str] = field(default_factory=list)
     suggested_validation_days: int = 0
     suggested_holdout_days: int = 0
+    raw_rows: int = 0
+    """Rows in the source before any cleaning."""
+    null_counts: dict[str, int] = field(default_factory=dict)
+    """Per required column: rows that are missing, blank, or wrong-typed."""
+    dropped_rows: int = 0
+    dropped_pct: float = 0.0
+
+
+def _quality_counts(frame: pd.DataFrame) -> dict[str, int]:
+    """Per required column, how many rows are unusable (null / blank / wrong type)."""
+    normed = frame.copy()
+    normed.columns = [str(c).strip() for c in normed.columns]
+    counts: dict[str, int] = {}
+    counts[DATE_COLUMN] = int(pd.to_datetime(normed[DATE_COLUMN], errors="coerce").isna().sum())
+    for column in NUMERIC_COLUMNS:
+        counts[column] = int(pd.to_numeric(normed[column], errors="coerce").isna().sum())
+    stripped = normed[ID_COLUMN].astype("string").str.strip()
+    counts[ID_COLUMN] = int((stripped.isna() | stripped.eq("")).sum())
+    return counts
 
 
 @dataclass
@@ -179,7 +198,11 @@ def preview_frame(frame: pd.DataFrame) -> Preview:
             errors=[f"missing required column(s): {', '.join(missing)}"],
         )
 
+    null_counts = _quality_counts(frame)
     cleaned, warnings = _clean(frame)
+    raw_rows = len(frame)
+    dropped_rows = raw_rows - len(cleaned)
+    dropped_pct = (dropped_rows / raw_rows * 100) if raw_rows else 0.0
     if cleaned.empty:
         return Preview(
             ok=False,
@@ -187,6 +210,10 @@ def preview_frame(frame: pd.DataFrame) -> Preview:
             rows=len(frame),
             errors=["no usable rows remain after cleaning"],
             warnings=warnings,
+            raw_rows=raw_rows,
+            null_counts=null_counts,
+            dropped_rows=dropped_rows,
+            dropped_pct=dropped_pct,
         )
 
     distinct_dates = int(cleaned[DATE_COLUMN].nunique())
@@ -215,6 +242,10 @@ def preview_frame(frame: pd.DataFrame) -> Preview:
         warnings=warnings,
         suggested_validation_days=horizon,
         suggested_holdout_days=horizon,
+        raw_rows=raw_rows,
+        null_counts=null_counts,
+        dropped_rows=dropped_rows,
+        dropped_pct=dropped_pct,
     )
 
 

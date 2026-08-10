@@ -26,6 +26,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .agent_status import CANCELLED, FAILED, PASSED, REJECTED, TRAINING, AgentStatus
+from .costs import format_cost
 
 _PHASE_STYLES = {
     PASSED: "bold green",
@@ -104,11 +105,14 @@ class AgentDashboard:
                 Text(agent.action, style="dim" if agent.done else ""),
                 agent.elapsed,
             )
-        parts: list[RenderableType] = [Text(self.header, style="bold"), Text(), table, Text()]
+        total_cost = sum(agent.cost_usd for agent in self.agents)
+        header = f"{self.header} · spend {format_cost(total_cost)}"
+        parts: list[RenderableType] = [Text(header, style="bold"), Text(), table, Text()]
         selected = self.agents[self.selected] if self.agents else None
         if selected is not None:
             trail = " → ".join(selected.trail) or "waiting for the first event"
-            parts.append(Text(f"Selected: {trail}", style="italic"))
+            spent = format_cost(selected.cost_usd)
+            parts.append(Text(f"Selected: {trail} · spend {spent}", style="italic"))
             if selected.log_path is not None:
                 parts.append(Text(f"Log: {selected.log_path}", style="dim"))
         if self.show_help:
@@ -120,10 +124,12 @@ class AgentDashboard:
 
     def _summary_line(self) -> str:
         chunks = [
-            f"{agent.index} {agent.title[:28]}: {agent.phase} ({agent.action}, {agent.elapsed})"
+            f"{agent.index} {agent.title[:28]}: {agent.phase} "
+            f"({agent.action}, {agent.elapsed}, {format_cost(agent.cost_usd)})"
             for agent in self.agents
         ]
-        return "[dashboard] " + " | ".join(chunks)
+        total = format_cost(sum(agent.cost_usd for agent in self.agents))
+        return f"[dashboard] spend {total} | " + " | ".join(chunks)
 
     # ------------------------------------------------------------------ keys
 

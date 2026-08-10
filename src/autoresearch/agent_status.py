@@ -17,6 +17,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .costs import event_cost
+
 SETTING_UP = "Setting up"
 EXPLORING = "Exploring"
 EDITING = "Editing"
@@ -123,6 +125,7 @@ class AgentStatus:
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
     cancel_requested: bool = False
+    cost_usd: float = 0.0
     trail: deque[str] = field(default_factory=lambda: deque(maxlen=8))
 
     @property
@@ -160,6 +163,7 @@ class AgentStatus:
 
     def apply_event(self, event: object) -> None:
         """Fold one streamed OpenCode event into this row."""
+        self.cost_usd += event_cost(event)
         phase, action = classify_event(event)
         if phase or action:
             self.set(phase, action)

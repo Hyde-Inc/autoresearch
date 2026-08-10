@@ -14,9 +14,10 @@ from rich.table import Table
 
 from .chat import input_box
 from .config import load_config
+from .costs import format_cost
 from .director import openrouter_client
 from .foundry import FoundryError, parse_dataset_reference, read_dataset
-from .ingest import apply_column_mapping, ingest_frame, preview_frame
+from .ingest import Preview, apply_column_mapping, ingest_frame, preview_frame
 from .interview import SetupSession, print_spec
 from .metrics import MetricInterpreter, adopt_spec, eval_columns
 from .models import Idea
@@ -43,6 +44,27 @@ def _load_env() -> None:
     load_dotenv(find_dotenv(usecwd=True))
 
 
+def _print_quality_gate(preview: Preview) -> None:
+    """Show a per-column data-quality summary and any cleaning warnings."""
+    if preview.raw_rows:
+        table = Table(title="Data quality", show_edge=False)
+        table.add_column("Column")
+        table.add_column("Unusable rows", justify="right")
+        table.add_column("% of source", justify="right")
+        for column, count in preview.null_counts.items():
+            pct = (count / preview.raw_rows * 100) if preview.raw_rows else 0.0
+            style = "red" if pct >= 20 else ("yellow" if count else "green")
+            table.add_row(column, f"[{style}]{count}[/{style}]", f"[{style}]{pct:.1f}%[/{style}]")
+        console.print(table)
+        drop_style = "red" if preview.dropped_pct >= 20 else "yellow" if preview.dropped_rows else "green"
+        console.print(
+            f"[{drop_style}]{preview.dropped_rows} of {preview.raw_rows} rows "
+            f"({preview.dropped_pct:.1f}%) dropped during cleaning[/{drop_style}]"
+        )
+    for warning in preview.warnings:
+        console.print(f"[yellow]! {warning}[/yellow]")
+
+
 def _store_from(run_dir: Path | None, config: Path | None = None) -> RunStore:
     if run_dir:
         return RunStore(run_dir)
@@ -65,6 +87,10 @@ def run(
     ] = None,
     parallel: Annotated[int | None, typer.Option(min=1)] = None,
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
+    max_cost: Annotated[
+        float | None,
+        typer.Option(min=0.0, help="Stop before a new round once model spend (USD) hits this"),
+    ] = None,
 ) -> None:
     """Start a new autonomous research run."""
     _load_env()
@@ -76,6 +102,7 @@ def run(
             guardrails=guardrail,
             parallel=parallel,
             max_experiments=max_experiments,
+            max_cost=max_cost,
         )
     )
     console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
@@ -87,6 +114,10 @@ def resume(
     run_dir: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
     parallel: Annotated[int | None, typer.Option(min=1)] = None,
     max_experiments: Annotated[int | None, typer.Option(min=1)] = None,
+    max_cost: Annotated[
+        float | None,
+        typer.Option(min=0.0, help="Stop before a new round once model spend (USD) hits this"),
+    ] = None,
 ) -> None:
     """Resume the latest or selected run: review the next proposed round, then continue."""
     _load_env()
@@ -97,6 +128,7 @@ def resume(
             cfg,
             parallel=parallel,
             max_experiments=max_experiments,
+            max_cost=max_cost,
             resume_store=store,
             review=review_round,
         )
@@ -130,6 +162,13 @@ def ingest(
     price_column: Annotated[
         str | None, typer.Option(help="Source column to use as selling_price")
     ] = None,
+    max_drop_pct: Annotated[
+        float,
+        typer.Option(min=0.0, max=100.0, help="Refuse ingest if more than this % of rows drop"),
+    ] = 30.0,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the data-quality confirmation prompt")
+    ] = False,
 ) -> None:
     """Turn a sales history (local CSV or Foundry dataset) into a protected forecasting task."""
     _load_env()
@@ -170,16 +209,24 @@ def ingest(
         raise typer.Exit(1) from None
 
     preview = preview_frame(frame)
-    for warning in preview.warnings:
-        console.print(f"[yellow]! {warning}[/yellow]")
+    _print_quality_gate(preview)
     if not preview.ok:
         for error in preview.errors:
             console.print(f"[red]x {error}[/red]")
         raise typer.Exit(1)
     console.print(
-        f"Found [bold]{preview.rows}[/bold] rows, [bold]{preview.skus}[/bold] items, "
+        f"Found [bold]{preview.rows}[/bold] clean rows, [bold]{preview.skus}[/bold] items, "
         f"{preview.distinct_dates} dates ({preview.date_min} to {preview.date_max})"
     )
+    if preview.dropped_pct > max_drop_pct:
+        console.print(
+            f"[red]x {preview.dropped_pct:.1f}% of rows would be dropped, above the "
+            f"--max-drop-pct {max_drop_pct:.0f}% limit. Fix the source or raise the limit.[/red]"
+        )
+        raise typer.Exit(1)
+    if not yes and not typer.confirm("Proceed with ingestion using the cleaned data?"):
+        console.print("Ingestion cancelled. No task was created.")
+        raise typer.Exit(0)
     result = ingest_frame(
         frame,
         name=name,
@@ -268,6 +315,10 @@ def start(
             exists=True, file_okay=False, help="Project repo to research (default: cwd)"
         ),
     ] = None,
+    max_cost: Annotated[
+        float | None,
+        typer.Option(min=0.0, help="Stop before a new round once model spend (USD) hits this"),
+    ] = None,
 ) -> None:
     """Point the Research Director at a project, lock in goal and baseline, and research."""
     _load_env()
@@ -312,6 +363,7 @@ def start(
                 initial_ideas=ideas,
                 initial_plan_path=session.plan_path,
                 session_dir=session.session_dir,
+                max_cost=max_cost,
                 review=review_round,
             )
         )
@@ -359,6 +411,7 @@ def leaderboard(
         metric.upper(),
         "RMSE",
         "Holdout",
+        "Cost",
         "Promoted",
     ):
         table.add_column(column)
@@ -371,6 +424,7 @@ def leaderboard(
             f"{item.metrics.get(metric, float('nan')):.6f}",
             f"{item.metrics.get('rmse', float('nan')):.3f}",
             f"{item.holdout_metrics.get('wmape', float('nan')):.6f}",
+            format_cost(item.metadata.get("cost_usd", 0.0) or 0.0),
             "yes" if item.promoted else "",
         )
     console.print(table)

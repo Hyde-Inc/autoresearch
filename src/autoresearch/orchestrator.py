@@ -21,6 +21,7 @@ from .agent_status import (
     AgentStatus,
 )
 from .config import TaskConfig
+from .costs import format_cost, log_cost
 from .dashboard import AgentDashboard
 from .director import ResearchDirector, openrouter_client
 from .editor import open_in_editor
@@ -163,6 +164,14 @@ async def _execute_attempt(
             # run_worker never returned, but its worktree may already exist.
             await remove_worktree_path(repo, store.worktrees_dir / attempt_id)
     finally:
+        cost = log_cost(store.logs_dir / f"{attempt_id}.jsonl")
+        attempt.metadata["cost_usd"] = round(cost.cost_usd, 6)
+        attempt.metadata["tokens"] = {
+            "input": cost.input_tokens,
+            "output": cost.output_tokens,
+            "reasoning": cost.reasoning_tokens,
+        }
+        tracker.cost_usd = cost.cost_usd
         store.save_attempt(attempt)
     return attempt, worker
 
@@ -398,6 +407,7 @@ async def run_research(
     guardrails: list[str] | None = None,
     parallel: int | None = None,
     max_experiments: int | None = None,
+    max_cost: float | None = None,
     resume_store: RunStore | None = None,
     initial_ideas: list[Idea] | None = None,
     initial_plan_path: Path | None = None,
@@ -476,10 +486,22 @@ async def run_research(
     )
     director = ResearchDirector(config)
     stop_requested = False
+
+    def total_spend() -> float:
+        return sum(a.metadata.get("cost_usd", 0.0) or 0.0 for a in store.load_attempts())
+
     try:
         while completed < maximum and round_number < config.budget.rounds:
             if Path(".autoresearch-stop").exists():
                 stop_requested = True
+                break
+            spent = total_spend()
+            if max_cost is not None and spent >= max_cost:
+                stop_requested = True
+                console.print(
+                    f"[bold]Cost cap reached[/bold]: spent {format_cost(spent)} of "
+                    f"{format_cost(max_cost)} budget - stopping before the next round."
+                )
                 break
             round_number += 1
             count = min(parallel, maximum - completed)
@@ -575,6 +597,7 @@ async def run_research(
                     "incumbent_ref": incumbent_ref,
                     "round": round_number,
                     "completed": completed,
+                    "cost_usd": round(total_spend(), 6),
                     "session_dir": str(session_dir),
                 }
             )
@@ -589,6 +612,8 @@ async def run_research(
             if stop_requested or Path(".autoresearch-stop").exists()
             else "completed"
         )
+        state["cost_usd"] = round(total_spend(), 6)
         store.save_state(state)
         Path(".autoresearch-stop").unlink(missing_ok=True)
+        console.print(f"[bold]Total model spend[/bold]: {format_cost(total_spend())}")
     return store
