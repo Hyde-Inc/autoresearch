@@ -49,11 +49,15 @@ def test_builtin_library_has_grounded_model_family_playbooks() -> None:
     by_name = {skill.name: skill for skill in skills}
     assert set(by_name) == {
         "boosting-demand-models",
+        "cannibalization-effects",
         "chronos-playbook",
         "ensembling",
+        "feature-selection-tree-models",
         "intermittent-demand",
         "model-ladder",
+        "payday-sale-effects",
         "retail-demand-data",
+        "seasonality-transition-effects",
         "statistical-demand-models",
         "temporal-validation-and-leakage",
     }
