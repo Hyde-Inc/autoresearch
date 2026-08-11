@@ -41,6 +41,7 @@ from .plans import (
 )
 from .progress import Activity
 from .store import RunStore
+from .ui import THEME
 from .worker import (
     WorkerResult,
     _run,
@@ -50,7 +51,7 @@ from .worker import (
     run_worker,
 )
 
-console = Console()
+console = Console(theme=THEME)
 
 PROPOSALS_MIN = 2
 PROPOSALS_MAX = 5

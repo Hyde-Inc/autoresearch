@@ -27,9 +27,10 @@ from .report import build_report
 from .skills import load_skills
 from .slash import SessionSettings, parse_reply, print_help
 from .store import RunStore, latest_run
+from .ui import THEME
 
 app = typer.Typer(no_args_is_help=True, help="Parallel autonomous ML experimentation.")
-console = Console()
+console = Console(theme=THEME)
 ConfigOption = Annotated[
     Path, typer.Option("--config", "-c", exists=True, dir_okay=False, help="Task YAML")
 ]

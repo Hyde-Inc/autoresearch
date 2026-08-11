@@ -89,7 +89,8 @@ class AgentDashboard:
         # produce a table wider than a narrow Cursor terminal; terminal-level
         # wrapping then made Rich miscount rows and leave old Live frames
         # behind on screen.
-        table = Table(box=box.SQUARE, show_lines=True, header_style="bold", expand=True)
+        # header_style comes from the shared theme (deep blue, light-mode safe).
+        table = Table(box=box.SQUARE, show_lines=True, expand=True)
         table.add_column("#", justify="right", width=3)
         table.add_column(
             "Experiment", min_width=16, ratio=3, no_wrap=True, overflow="ellipsis"
