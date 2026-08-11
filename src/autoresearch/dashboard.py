@@ -40,6 +40,21 @@ _PHASE_STYLES = {
 _DEFAULT_PHASE_STYLE = "dark_cyan"
 _MUTED = "grey42"
 
+def _sane_line_mode(attrs: list) -> list:
+    """Return termios attrs with line-input flags forced on.
+
+    Guards against a dirty snapshot (e.g. a crashed run left the tty raw):
+    without ICRNL/ICANON/ECHO, Enter arrives as a raw \\r that echoes as ^M
+    and ``input()`` never returns."""
+    import termios
+
+    attrs = list(attrs)
+    attrs[0] |= termios.ICRNL
+    attrs[1] |= termios.OPOST
+    attrs[3] |= termios.ICANON | termios.ECHO
+    return attrs
+
+
 _LEGEND = "[1-9/↑↓] select   [c] chat   [x] cancel selected   [q] stop round   [?] help"
 _HELP_LINES = (
     "1-9 or ↑/↓  select an agent row",
@@ -110,11 +125,11 @@ class AgentDashboard:
                 Text(agent.action, style=_MUTED if agent.done else ""),
                 agent.elapsed,
             )
-        parts: list[RenderableType] = [Text(self.header, style="bold"), Text(), table, Text()]
+        parts: list[RenderableType] = [Text(self.header, style="bold grey19"), Text(), table, Text()]
         selected = self.agents[self.selected] if self.agents else None
         if selected is not None:
             trail = " → ".join(selected.trail) or "waiting for the first event"
-            parts.append(Text(f"Selected: {trail}", style="italic"))
+            parts.append(Text(f"Selected: {trail}", style="italic grey19"))
             if selected.log_path is not None:
                 parts.append(Text(f"Log: {selected.log_path}", style=_MUTED))
         if self.show_help:
@@ -191,7 +206,8 @@ class AgentDashboard:
         with contextlib.suppress(Exception):
             import termios
 
-            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._saved_termios)
+            attrs = _sane_line_mode(self._saved_termios)
+            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, attrs)
 
     def _enter_cbreak(self) -> None:
         if self._stdin_fd is None:
@@ -234,7 +250,7 @@ class AgentDashboard:
                         self.handle_key(key)
         finally:
             with contextlib.suppress(Exception):
-                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                termios.tcsetattr(fd, termios.TCSADRAIN, _sane_line_mode(saved))
 
     # --------------------------------------------------------- lifecycle
 

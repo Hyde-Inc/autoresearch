@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -14,7 +15,6 @@ from rich.table import Table
 
 from .chat import input_box
 from .config import load_config
-from .costs import format_cost
 from .director import openrouter_client
 from .doctor import run_checks
 from .foundry import FoundryError, parse_dataset_reference, read_dataset
@@ -74,7 +74,8 @@ def _store_from(run_dir: Path | None, config: Path | None = None) -> RunStore:
         cfg = load_config(config)
         found = latest_run(cfg.resolve(cfg.workspace.runs), cfg.name)
     else:
-        found = latest_run(Path("runs"))
+        # `start`-created tasks keep runs under the hidden .autoresearch/runs.
+        found = latest_run(Path("runs")) or latest_run(Path(".autoresearch/runs"))
     if found is None:
         raise typer.BadParameter("no run found; pass --run-dir")
     return RunStore(found)
@@ -107,7 +108,7 @@ def run(
             max_cost=max_cost,
         )
     )
-    console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
+    console.print(f"Run complete: [bold grey19]{store.run_dir}[/bold grey19]")
 
 
 @app.command(name="foundry-setup")
@@ -211,7 +212,7 @@ def foundry_setup(
         refs = dict(rids)
         data_home = "existing project datasets, wired by RID"
     else:
-        console.print("[bold]Generating synthetic demand history[/bold]")
+        console.print("[bold grey19]Generating synthetic demand history[/bold grey19]")
         history = setup.generate_history(n_skus=n_skus, n_days=n_days)
         frames = setup.chronological_split(
             history, validation_days=validation_days, holdout_days=holdout_days
@@ -226,7 +227,7 @@ def foundry_setup(
             summary.add_row(key, f"{len(frames[key]):,}")
         console.print(summary)
 
-        console.print(f"[bold]Provisioning datasets under[/bold] {datasets_path}")
+        console.print(f"[bold grey19]Provisioning datasets under[/bold grey19] {datasets_path}")
         try:
             result = setup.provision(frames, project_folder_rid=project, branch=branch)
         except FoundryError as exc:
@@ -244,7 +245,7 @@ def foundry_setup(
             table.add_row(key, rid)
     console.print(table)
 
-    console.print("[bold]Scaffolding the repo[/bold]")
+    console.print("[bold grey19]Scaffolding the repo[/bold grey19]")
     transform_rel, actions = setup.scaffold(
         repo,
         refs,
@@ -260,7 +261,7 @@ def foundry_setup(
     if no_push:
         console.print("[dark_orange3]--no-push: remember to push before running[/dark_orange3]")
     else:
-        console.print(f"[bold]Pushing to Foundry[/bold] ({branch}) so the baseline publishes")
+        console.print(f"[bold grey19]Pushing to Foundry[/bold grey19] ({branch}) so the baseline publishes")
         try:
             push_repo(repo, branch=branch, message="autoresearch: install baseline transform")
         except FoundryBuildError as exc:
@@ -273,9 +274,10 @@ def foundry_setup(
         "runtime": "foundry",
         "metric": {"name": metric_name, "direction": "min"},
         "data": {"id_column": id_col, "date_column": date_col, "target_column": target_col},
-        # Foundry sessions are slower per iteration (publish + build), so cap
-        # the per-session and per-experiment budgets to keep spend predictable.
-        "agents": {"count": 3, "timeout_s": 900, "budget_s": 1800},
+        # Foundry sessions are slower per iteration (publish + build) and the
+        # transforms repos are larger to explore, so give coding sessions more
+        # headroom than the local defaults while keeping spend bounded.
+        "agents": {"count": 3, "timeout_s": 1500, "budget_s": 3000},
         "budget": {"rounds": 3, "max_experiments": 9},
         "workspace": {
             "seed": str(repo),
@@ -293,7 +295,7 @@ def foundry_setup(
     write_config = write_config.resolve()
     write_config.write_text(yaml.safe_dump(task, sort_keys=False))
     console.print(f"\n[green]Wrote task config:[/green] {write_config}")
-    console.print(f"Next: [bold]autoresearch run -c {write_config}[/bold]")
+    console.print(f"Next: [bold grey19]autoresearch run -c {write_config}[/bold grey19]")
 
 
 def _repo_rid_from_git(repo: Path) -> str:
@@ -330,6 +332,13 @@ def foundry_build_cmd(
             help="Build the whole pipeline (preprocessing -> model -> evaluation), not just forecasts",
         ),
     ] = False,
+    no_wait: Annotated[
+        bool,
+        typer.Option(
+            "--no-wait",
+            help="Trigger the build and return immediately instead of polling to completion",
+        ),
+    ] = False,
     timeout_s: Annotated[
         int | None, typer.Option(min=1, help="Override the build timeout (seconds)")
     ] = None,
@@ -361,10 +370,10 @@ def foundry_build_cmd(
 
     try:
         if not no_push:
-            console.print(f"[bold]Pushing[/bold] {repo_dir} → Foundry branch [blue]{fdry.branch}[/blue]")
+            console.print(f"[bold grey19]Pushing[/bold grey19] {repo_dir} → Foundry branch [blue]{fdry.branch}[/blue]")
             sha = push_repo(repo_dir, branch=fdry.branch, message=message)
             console.print(f"  pushed{f' commit {sha[:8]}' if sha else ' (nothing new to commit)'}")
-        console.print(f"[bold]Triggering build[/bold] of {label} ({len(targets)} targets)")
+        console.print(f"[bold grey19]Triggering build[/bold grey19] of {label} ({len(targets)} targets)")
 
         def on_wait(elapsed: float) -> None:
             console.print(f"  [{elapsed:6.0f}s] waiting for Foundry to publish the transform…")
@@ -373,6 +382,17 @@ def foundry_build_cmd(
             targets, branch=fdry.branch, force=force, on_wait=on_wait
         )
         console.print(f"  build {build_rid}")
+        if no_wait:
+            hostname = os.getenv("FOUNDRY_HOSTNAME", "").strip()
+            hostname = hostname.removeprefix("https://").removeprefix("http://").rstrip("/")
+            if hostname:
+                console.print(
+                    "  watch it live: "
+                    f"https://{hostname}/workspace/data-integration/dataset/preview/"
+                    f"{fdry.datasets.forecasts}/{fdry.branch}"
+                )
+            console.print("[green4]Build triggered[/green4] — running on Foundry now")
+            return
 
         def on_status(status: str, elapsed: float) -> None:
             console.print(f"  [{elapsed:6.0f}s] {status}")
@@ -465,7 +485,7 @@ def resume(
             review=review_round,
         )
     )
-    console.print(f"Run complete: [bold]{completed.run_dir}[/bold]")
+    console.print(f"Run complete: [bold grey19]{completed.run_dir}[/bold grey19]")
 
 
 @app.command()
@@ -511,13 +531,13 @@ def ingest(
         raise typer.Exit(1) from None
 
     if rid:
-        console.print(f"Reading Foundry dataset [bold]{rid}[/bold]" + (f" ({branch})" if branch else ""))
+        console.print(f"Reading Foundry dataset [bold grey19]{rid}[/bold grey19]" + (f" ({branch})" if branch else ""))
         try:
             frame = read_dataset(rid, branch=branch)
         except FoundryError as exc:
             console.print(f"[red]x {exc}[/red]")
             raise typer.Exit(1) from None
-        console.print(f"Downloaded [bold]{len(frame)}[/bold] rows from Foundry")
+        console.print(f"Downloaded [bold grey19]{len(frame)}[/bold grey19] rows from Foundry")
     else:
         path = Path(source)
         if not path.is_file():
@@ -547,7 +567,7 @@ def ingest(
             console.print(f"[red]x {error}[/red]")
         raise typer.Exit(1)
     console.print(
-        f"Found [bold]{preview.rows}[/bold] clean rows, [bold]{preview.skus}[/bold] items, "
+        f"Found [bold grey19]{preview.rows}[/bold grey19] clean rows, [bold grey19]{preview.skus}[/bold grey19] items, "
         f"{preview.distinct_dates} dates ({preview.date_min} to {preview.date_max})"
     )
     if preview.dropped_pct > max_drop_pct:
@@ -626,13 +646,13 @@ def review_round(round_number: int, ideas: list[Idea], plan_path: Path) -> Revie
     console.print(table)
     console.print(
         Panel(
-            f"[bold]{plan_path}[/bold] (opened in your editor)\n"
+            f"[bold grey19]{plan_path}[/bold grey19] (opened in your editor)\n"
             "Edit the file freely - the edited file is exactly what runs.\n"
             "Reply [green]execute[/green] to launch, [red]stop[/red] to end the run, or "
             "give feedback to revise the plan.\n"
-            "While the round runs you get a live dashboard: [bold]1-9/arrows[/bold] select "
-            "an agent, [bold]x[/bold] cancels it (the others keep going), [bold]q[/bold] "
-            "stops the whole round, [bold]?[/bold] shows help.",
+            "While the round runs you get a live dashboard: [bold grey19]1-9/arrows[/bold grey19] select "
+            "an agent, [bold grey19]x[/bold grey19] cancels it (the others keep going), [bold grey19]q[/bold grey19] "
+            "stops the whole round, [bold grey19]?[/bold grey19] shows help.",
             title=f"Round {round_number} plan written",
         )
     )
@@ -657,7 +677,7 @@ def start(
     repo = (repo or Path(".")).resolve()
     settings = SessionSettings()
     session = SetupSession(openrouter_client(), console, settings=settings, repo=repo)
-    console.print(f"Project: [bold]{repo}[/bold]")
+    console.print(f"Project: [bold grey19]{repo}[/bold grey19]")
     console.print(
         Panel(
             "The Research Director surveys your project itself. Set what it needs with "
@@ -707,7 +727,7 @@ def start(
     except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
         console.print(f"[bold red]Research run failed:[/bold red] {exc}")
         raise typer.Exit(1) from None
-    console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
+    console.print(f"Run complete: [bold grey19]{store.run_dir}[/bold grey19]")
 
 
 @app.command()
@@ -743,7 +763,6 @@ def leaderboard(
         metric.upper(),
         "RMSE",
         "Holdout",
-        "Cost",
         "Promoted",
     ):
         table.add_column(column)
@@ -756,7 +775,6 @@ def leaderboard(
             f"{item.metrics.get(metric, float('nan')):.6f}",
             f"{item.metrics.get('rmse', float('nan')):.3f}",
             f"{item.holdout_metrics.get('wmape', float('nan')):.6f}",
-            format_cost(item.metadata.get("cost_usd", 0.0) or 0.0),
             "yes" if item.promoted else "",
         )
     console.print(table)

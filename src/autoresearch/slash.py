@@ -115,7 +115,7 @@ def print_help(console: Console) -> None:
 
 def print_status(console: Console, settings: SessionSettings) -> None:
     table = Table(title="Current settings", show_header=False)
-    table.add_column(style="bold")
+    table.add_column(style="bold grey19")
     table.add_column()
     table.add_row("goal", settings.goal or "[dim]not set[/dim]")
     table.add_row("baseline", settings.baseline_path or "[dim]not pinned[/dim]")

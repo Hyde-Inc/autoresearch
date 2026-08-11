@@ -115,7 +115,7 @@ class RoundChat:
         )
         while True:
             try:
-                question = console.input("\n[bold]chat >[/bold] ").strip()
+                question = console.input("\n[bold grey19]chat >[/bold grey19] ").strip()
             except (EOFError, KeyboardInterrupt):
                 return
             if not question or question.lower() in {"back", "exit", "quit"}:

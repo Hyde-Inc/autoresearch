@@ -380,6 +380,18 @@ class TestScaffold:
         contract = (repo / "AUTORESEARCH.md").read_text()
         assert "`item_id` (str), `ds` (date), `demand` (float)" in contract
 
+    def test_pipeline_targets_skip_sales_train_without_raw_feed(self) -> None:
+        from autoresearch.config import FoundryDatasets
+
+        provisioned = FoundryDatasets(
+            sales_raw="ri.raw", sales_train="ri.train", forecasts="ri.fcst",
+            evaluation_metrics="ri.eval",
+        )
+        assert provisioned.pipeline_targets() == ["ri.train", "ri.fcst", "ri.eval"]
+        existing = FoundryDatasets(sales_train="ri.train", forecasts="ri.fcst")
+        # No sales_raw -> sales_train is data, not a transform output.
+        assert existing.pipeline_targets() == ["ri.fcst"]
+
     def test_make_raw_injects_quality_issues(self) -> None:
         from autoresearch.foundry_setup import generate_history, make_raw
 

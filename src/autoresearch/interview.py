@@ -116,8 +116,8 @@ def append_context(config: TaskConfig, text: str) -> None:
 
 
 def print_spec(console: Console, spec: MetricSpec, validation: MetricValidation) -> None:
-    console.print(f"\n[bold]Metric:[/bold] {spec.name} ({spec.direction}imize)")
-    console.print(f"[bold]Understanding:[/bold] {spec.understanding}")
+    console.print(f"\n[bold grey19]Metric:[/bold grey19] {spec.name} ({spec.direction}imize)")
+    console.print(f"[bold grey19]Understanding:[/bold grey19] {spec.understanding}")
     table = Table(title="Hand-worked example")
     columns = list(spec.example.rows[0])
     for column in columns:
@@ -127,7 +127,7 @@ def print_spec(console: Console, spec: MetricSpec, validation: MetricValidation)
     console.print(table)
     for step in spec.example.steps:
         console.print(f"  - {step}")
-    console.print(f"[bold]Hand-computed value:[/bold] {spec.example.value}")
+    console.print(f"[bold grey19]Hand-computed value:[/bold grey19] {spec.example.value}")
     for check in validation.checks:
         color = "green" if check.passed else "red"
         console.print(f"[{color}]{check.name}[/{color}]: {check.detail}")
@@ -559,12 +559,12 @@ class SetupSession:
         self.skills = load_skills(self.config)
         self.console.print(
             Panel(
-                f"[bold]Train[/bold] {prepared.train_rows:,} rows through {prepared.train_end}\n"
-                f"[bold]Validation[/bold] {prepared.validation_rows:,} rows through "
+                f"[bold grey19]Train[/bold grey19] {prepared.train_rows:,} rows through {prepared.train_end}\n"
+                f"[bold grey19]Validation[/bold grey19] {prepared.validation_rows:,} rows through "
                 f"{prepared.validation_end}\n"
-                f"[bold]Hidden holdout[/bold] {prepared.holdout_rows:,} rows through "
+                f"[bold grey19]Hidden holdout[/bold grey19] {prepared.holdout_rows:,} rows through "
                 f"{prepared.holdout_end}\n"
-                f"[bold]Items[/bold] {prepared.items}",
+                f"[bold grey19]Items[/bold grey19] {prepared.items}",
                 title=f"Protected task workspace ({prepared.task_dir})",
             )
         )
@@ -603,10 +603,10 @@ class SetupSession:
         apply_brief(config, brief)
         self._reload()
         body = (
-            f"[bold]Goal[/bold]\n{goal}\n\n[bold]Business context[/bold]\n{context}\n\n"
-            f"[bold]Metric[/bold]\n{metric_name}\n\n[bold]Guardrails[/bold]\n"
+            f"[bold grey19]Goal[/bold grey19]\n{goal}\n\n[bold grey19]Business context[/bold grey19]\n{context}\n\n"
+            f"[bold grey19]Metric[/bold grey19]\n{metric_name}\n\n[bold grey19]Guardrails[/bold grey19]\n"
             + "\n".join(f"- {item}" for item in guardrails)
-            + "\n\n[bold]Research directions[/bold]\n"
+            + "\n\n[bold grey19]Research directions[/bold grey19]\n"
             + "\n".join(f"- {item}" for item in idea_hints)
         )
         self.console.print(Panel(body, title="Research brief (saved)"))
@@ -651,8 +651,8 @@ class SetupSession:
             return {"error": result.error}
         self.console.print(
             Panel(
-                f"[bold]Validation[/bold]  {json.dumps(result.metrics)}\n"
-                f"[bold]Hidden holdout[/bold]  {json.dumps(result.holdout_metrics)}",
+                f"[bold grey19]Validation[/bold grey19]  {json.dumps(result.metrics)}\n"
+                f"[bold grey19]Hidden holdout[/bold grey19]  {json.dumps(result.holdout_metrics)}",
                 title="Protected baseline evaluation",
             )
         )
@@ -711,7 +711,7 @@ class SetupSession:
         opened_note = "Opened in your editor.\n" if opened else ""
         self.console.print(
             Panel(
-                f"[bold]{self.plan_path}[/bold]\n"
+                f"[bold grey19]{self.plan_path}[/bold grey19]\n"
                 f"{opened_note}"
                 "Edit the file freely - reword, delete, or add experiments. The edited file "
                 "is exactly what runs.\n"

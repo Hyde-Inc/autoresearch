@@ -62,8 +62,14 @@ class FoundryDatasets(BaseModel):
     evaluation_metrics: str = ""
 
     def pipeline_targets(self) -> list[str]:
-        """Every buildable output of the pipeline (for a full rebuild)."""
-        return [rid for rid in (self.sales_train, self.forecasts, self.evaluation_metrics) if rid]
+        """Every buildable output of the pipeline (for a full rebuild).
+
+        ``sales_train`` is a build target only when a raw feed is wired -
+        without ``sales_raw`` there is no preprocessing transform producing it
+        (it is an existing dataset), and asking Foundry to build it would hang
+        on a missing job spec."""
+        targets = [self.sales_train] if self.sales_raw and self.sales_train else []
+        return targets + [rid for rid in (self.forecasts, self.evaluation_metrics) if rid]
 
 
 class FoundryRuntimeConfig(BaseModel):
