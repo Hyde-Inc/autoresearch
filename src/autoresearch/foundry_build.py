@@ -24,6 +24,12 @@ from . import foundry
 
 _TERMINAL = {"SUCCEEDED", "FAILED", "CANCELED", "CANCELLED", "ABORTED"}
 
+# CLI control files that live in the working directory. When a Foundry task is
+# run from the transforms repo itself they sit inside the worktree, and staging
+# them would publish them to Foundry master - a committed ``.autoresearch-stop``
+# then halts every later run right after the baseline.
+_NEVER_COMMIT = (".autoresearch-stop", ".autoresearch")
+
 
 class FoundryBuildError(RuntimeError):
     """A push or build step failed in a way the user can act on."""
@@ -65,10 +71,13 @@ def push_repo(repo_dir: str | Path, *, branch: str = "master", message: str) -> 
     if not (repo / ".git").exists():
         raise FoundryBuildError(f"{repo} is not a git repository")
 
-    _git(repo, "add", "-A")
-    status = _git(repo, "status", "--porcelain")
+    excludes = [f":(exclude){name}" for name in _NEVER_COMMIT]
+    _git(repo, "add", "-A", "--", ".", *excludes)
+    for name in _NEVER_COMMIT:
+        _git(repo, "rm", "--cached", "-r", "--ignore-unmatch", "-q", name, check=False)
+    staged = _git(repo, "diff", "--cached", "--name-only")
     committed: str | None = None
-    if status.stdout.strip():
+    if staged.stdout.strip():
         _git(repo, "commit", "-m", message)
         committed = _git(repo, "rev-parse", "HEAD").stdout.strip()
 

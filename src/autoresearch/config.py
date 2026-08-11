@@ -92,6 +92,25 @@ class FoundryRuntimeConfig(BaseModel):
     poll_s: int = Field(default=15, ge=1)
 
 
+class OpeningRoundConfig(BaseModel):
+    """Pin round 1 to a known-fast model family instead of letting the director route.
+
+    Skill routing is an LLM call, so an opening round can land on a family that
+    takes an agent a long time to write and a trainer a long time to run. Naming
+    skills here replaces that call for round 1 only: later rounds route normally
+    and can climb to heavier families once there is a result to beat.
+    """
+
+    skills: list[str] = Field(default_factory=list)
+    instruction: str = (
+        "This is the opening round, optimised for fast feedback rather than peak accuracy. "
+        "Every idea must be implementable with the pinned skills above using only pandas, "
+        "numpy and statsmodels - no gradient boosting, no neural or foundation models, and "
+        "no hyperparameter search. Prefer changes that are quick to write and train in "
+        "seconds, so the first scored result arrives early."
+    )
+
+
 class TaskConfig(BaseModel):
     name: str = "autoresearch-task"
     description: str = ""
@@ -109,6 +128,7 @@ class TaskConfig(BaseModel):
     idea_hints: list[str] = Field(default_factory=list)
     context: str = ""
     skills: list[Path] = Field(default_factory=list)
+    opening_round: OpeningRoundConfig = OpeningRoundConfig()
     config_path: Path | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
@@ -135,6 +155,16 @@ def load_config(path: Path) -> TaskConfig:
         raw = yaml.safe_load(handle)
     config = TaskConfig.model_validate(raw or {})
     config.config_path = path
+    if config.opening_round.skills:
+        from .skills import load_skills
+
+        available = {skill.name for skill in load_skills(config)}
+        unknown = [name for name in config.opening_round.skills if name not in available]
+        if unknown:
+            raise ValueError(
+                f"opening_round.skills names no such skill: {', '.join(unknown)}. "
+                f"Available: {', '.join(sorted(available))}"
+            )
     if config.metric.definition:
         from .metrics import load_spec
 

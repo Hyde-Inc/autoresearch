@@ -59,7 +59,23 @@ async def run_opencode(
     executable = shutil.which("opencode")
     if executable is None:
         return OpenCodeResult(127, None, "opencode is not installed or not on PATH")
-    command = [executable, "run", "--format", "json", "--auto", "--model", model]
+    # --dir pins opencode's project directory to cwd. Without it opencode
+    # resolves the project by walking up the tree; an agent worktree has only a
+    # .git *file* and (for Foundry tasks) sits inside the user's real repo, so
+    # opencode anchored there - file writes then landed in the real repo, the
+    # worktree snapshot saw no changes, and the worktree opencode.json
+    # permissions were never even read.
+    command = [
+        executable,
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        model,
+        "--dir",
+        str(cwd),
+    ]
     if session_id:
         command += ["--session", session_id]
     else:

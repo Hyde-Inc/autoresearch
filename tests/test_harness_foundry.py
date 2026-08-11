@@ -9,6 +9,7 @@ import pytest
 
 from autoresearch import foundry, harness_foundry
 from autoresearch.config import TaskConfig
+from autoresearch.foundry_build import FoundryBuildError
 from autoresearch.foundry_setup import read_gradle_properties, scaffold
 from autoresearch.harness_foundry import (
     _ensure_output_branch,
@@ -391,6 +392,43 @@ class TestScaffold:
         existing = FoundryDatasets(sales_train="ri.train", forecasts="ri.fcst")
         # No sales_raw -> sales_train is data, not a transform output.
         assert existing.pipeline_targets() == ["ri.fcst"]
+
+    def test_push_repo_never_stages_cli_control_files(self, tmp_path: Path) -> None:
+        import subprocess
+
+        from autoresearch.foundry_build import push_repo
+
+        repo = tmp_path / "transforms"
+        repo.mkdir()
+        for args in (
+            ("init", "-q", "-b", "master"),
+            ("config", "user.email", "t@example.com"),
+            ("config", "user.name", "t"),
+        ):
+            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+        (repo / "forecast.py").write_text("# baseline\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True
+        )
+
+        # A task run from the repo itself drops these into the worktree.
+        (repo / ".autoresearch-stop").write_text("stop\n")
+        (repo / ".autoresearch").mkdir()
+        (repo / ".autoresearch" / "state.json").write_text("{}\n")
+        (repo / "forecast.py").write_text("# agent edit\n")
+
+        with pytest.raises(FoundryBuildError):  # no remote configured; push fails last
+            push_repo(repo, branch="master", message="autoresearch: train")
+
+        staged = subprocess.run(
+            ["git", "show", "--name-only", "--format=", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+        assert staged == ["forecast.py"]
 
     def test_make_raw_injects_quality_issues(self) -> None:
         from autoresearch.foundry_setup import generate_history, make_raw

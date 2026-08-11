@@ -4,6 +4,7 @@ from pathlib import Path
 from autoresearch.skills import (
     load_skill,
     load_skills,
+    pinned_selection,
     select_skills,
     selected_skill_context,
 )
@@ -33,6 +34,14 @@ def test_select_skills_filters_unknown_names() -> None:
     selection = asyncio.run(select_skills("high under-forecast bias", skills, complete))
     assert [item.name for item in selection.selected] == ["ensembling"]
     assert "out-of-sample" in selected_skill_context(selection, skills)
+
+
+def test_pinned_selection_keeps_order_and_drops_unknown_names() -> None:
+    skills = load_skills()
+    selection = pinned_selection(["statistical-demand-models", "not-real"], skills)
+    assert [item.name for item in selection.selected] == ["statistical-demand-models"]
+    assert "pinned" in selection.selected[0].reason
+    assert "ExponentialSmoothing" in selected_skill_context(selection, skills)
 
 
 def test_builtin_library_has_grounded_model_family_playbooks() -> None:

@@ -14,6 +14,7 @@ from .models import Attempt, Idea
 from .skills import (
     SkillSelection,
     load_skills,
+    pinned_selection,
     select_skills,
     selected_skill_context,
     selection_json,
@@ -303,9 +304,14 @@ class ResearchDirector:
             f"Guardrails: {self.config.guardrails}\nRound: {round_number}\n"
             f"Prior attempts: {json.dumps(history)}\nLab notes:\n{notes[-5000:]}"
         )
-        self.last_skill_selection = await select_skills(
-            situation, self.skills, self._json_completion
-        )
+        opening = self.config.opening_round
+        pinned = round_number <= 1 and bool(opening.skills)
+        if pinned:
+            self.last_skill_selection = pinned_selection(opening.skills, self.skills)
+        else:
+            self.last_skill_selection = await select_skills(
+                situation, self.skills, self._json_completion
+            )
         skill_context = selected_skill_context(self.last_skill_selection, self.skills)
         selected_names = {item.name for item in self.last_skill_selection.selected}
         system = (
@@ -347,6 +353,8 @@ class ResearchDirector:
             f"Skill selection: {selection_json(self.last_skill_selection)}\n\n"
             f"Selected skill guidance:\n{skill_context or 'No skill selected.'}"
         )
+        if pinned and opening.instruction:
+            user += f"\n\nOpening-round constraint:\n{opening.instruction}"
         if feedback and previous:
             proposed = json.dumps([idea.model_dump(mode="json") for idea in previous])
             user += (

@@ -64,6 +64,7 @@ class _FakeLab:
         self.session_ids: list[str | None] = []
         self.data_dirs: list[Path] = []
         self.experiments: list[str] = []
+        self.permissions: list[str | None] = []
 
     async def run_opencode(self, cwd, prompt, model, timeout_s, log_path,
                            on_event=None, *, session_id=None, data_dir=None):
@@ -72,6 +73,8 @@ class _FakeLab:
         self.session_ids.append(session_id)
         self.data_dirs.append(data_dir)
         self.experiments.append((cwd / "EXPERIMENT.md").read_text())
+        permissions = cwd / "opencode.json"
+        self.permissions.append(permissions.read_text() if permissions.exists() else None)
         if data_dir is not None:  # the real runner creates the session store
             data_dir.mkdir(parents=True, exist_ok=True)
         content = self.sessions[index]
@@ -119,6 +122,38 @@ def _run_loop(
             on_phase=on_phase,
         )
     )
+
+
+def test_worker_confines_the_agent_when_the_repo_has_no_opencode_json(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A Foundry transforms repo carries no opencode.json, so the worker must
+    supply one (external_directory=deny keeps the agent out of the run store)
+    and clean it up so it never appears in the diff or reaches Foundry."""
+    config, store, repo = _setup(tmp_path)
+    lab = _FakeLab(
+        sessions=["print('v1')\n"],
+        evaluations=[Evaluation(True, metrics={"wmape": 0.08, "runtime_s": 5.0})],
+    )
+    result = _run_loop(monkeypatch, lab, config, store, repo, {"wmape": 0.10})
+    assert lab.permissions[0] is not None and '"external_directory": "deny"' in lab.permissions[0]
+    assert not (result.worktree / "opencode.json").exists()
+    assert "opencode.json" not in result.changed_paths
+
+
+def test_worker_keeps_a_tracked_opencode_json(tmp_path: Path, monkeypatch) -> None:
+    config, store, repo = _setup(tmp_path)
+    (repo / "opencode.json").write_text('{"permission": {"external_directory": "deny"}}\n')
+    asyncio.run(_run("git", "add", "opencode.json", cwd=repo))
+    asyncio.run(_run("git", "commit", "-m", "seed permissions", cwd=repo))
+    lab = _FakeLab(
+        sessions=["print('v1')\n"],
+        evaluations=[Evaluation(True, metrics={"wmape": 0.08, "runtime_s": 5.0})],
+    )
+    result = _run_loop(monkeypatch, lab, config, store, repo, {"wmape": 0.10})
+    # The seed's own file is used as-is and must survive the cleanup.
+    assert (result.worktree / "opencode.json").exists()
+    assert "opencode.json" not in result.changed_paths
 
 
 def test_evaluator_failure_feeds_back_and_the_fix_wins(tmp_path: Path, monkeypatch) -> None:
