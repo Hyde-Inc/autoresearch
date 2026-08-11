@@ -293,7 +293,7 @@ async def _propose_round(
                 parsed = parse_plan(plan_file)
             except PlanError as exc:
                 console.print(
-                    f"[yellow]! {exc}[/yellow]\n"
+                    f"[dark_orange3]! {exc}[/dark_orange3]\n"
                     "Fix the plan file and approve again, or give feedback / stop."
                 )
                 continue
@@ -554,7 +554,7 @@ async def run_research(
                 ideas = ideas[: maximum - completed]
             count = len(ideas)
             console.print(
-                f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments"
+                f"[bold blue]Round {round_number}[/bold blue]: launching {count} experiments"
             )
             header = (
                 f"Round {round_number} · baseline {config.metric.name} "
@@ -606,8 +606,8 @@ async def run_research(
                         )
                         if code:
                             console.print(
-                                f"[yellow]! could not push the promoted model to Foundry "
-                                f"{main_ref}: {output.strip()}[/yellow]"
+                                f"[dark_orange3]! could not push the promoted model to Foundry "
+                                f"{main_ref}: {output.strip()}[/dark_orange3]"
                             )
                         else:
                             console.print(
@@ -665,5 +665,4 @@ async def run_research(
         state["cost_usd"] = round(total_spend(), 6)
         store.save_state(state)
         Path(".autoresearch-stop").unlink(missing_ok=True)
-        console.print(f"[bold]Total model spend[/bold]: {format_cost(total_spend())}")
     return store

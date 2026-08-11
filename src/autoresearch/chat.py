@@ -133,7 +133,7 @@ class TurnRenderer:
     def on_content(self, token: str) -> None:
         self._start()
         if self.mode != "content":
-            self.console.print(f"\n\n[bold cyan]{self.speaker}[/bold cyan]")
+            self.console.print(f"\n\n[bold blue]{self.speaker}[/bold blue]")
             self.mode = "content"
             self._live = Live(
                 Markdown(""),

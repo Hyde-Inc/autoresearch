@@ -61,7 +61,7 @@ class Activity:
 
     def _message(self) -> str:
         elapsed = int(time.monotonic() - self._started_at)
-        return f"[bold cyan]{self.phase}[/bold cyan] [dim]— {self._next_phrase()} ({elapsed}s)[/dim]"
+        return f"[bold blue]{self.phase}[/bold blue] [dim]— {self._next_phrase()} ({elapsed}s)[/dim]"
 
     def _animate(self) -> None:
         while not self._stop.wait(self.interval_s):

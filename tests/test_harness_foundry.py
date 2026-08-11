@@ -299,13 +299,29 @@ class TestScaffold:
         assert props["transformsRepoRid"] == "ri.stemma.main.repository.abc"
         assert props["transformsRepoPath"].startswith("/org/Some Project")
 
-    def test_scaffold_writes_transform_contract_and_deps(self, tmp_path: Path) -> None:
+    def test_scaffold_writes_pipeline_contract_and_deps(self, tmp_path: Path) -> None:
+        from autoresearch.foundry_setup import default_refs
+
         repo = self._make_repo(tmp_path)
-        rel, _actions = scaffold(repo, "/org/Some Project/autoresearch", "master")
-        assert rel == "transforms-python/src/acme_project/datasets/forecast.py"
+        rel, _actions = scaffold(repo, default_refs("/org/Some Project/autoresearch"), "master")
+        datasets = repo / "transforms-python" / "src" / "acme_project" / "datasets"
+        assert rel == "transforms-python/src/acme_project/datasets/model_running/forecast.py"
+        # Three pipeline stages, each an importable package.
+        for stage, filename in (
+            ("data_preprocessing", "preprocess.py"),
+            ("model_running", "forecast.py"),
+            ("model_evaluation", "evaluate.py"),
+        ):
+            assert (datasets / stage / "__init__.py").exists()
+            assert (datasets / stage / filename).exists()
+        preprocess = (datasets / "data_preprocessing" / "preprocess.py").read_text()
+        assert '"/org/Some Project/autoresearch/sales_raw"' in preprocess
+        assert "def clean" in preprocess
         transform = (repo / rel).read_text()
         assert '"/org/Some Project/autoresearch/sales_train"' in transform
         assert "def build_forecasts" in transform
+        evaluate = (datasets / "model_evaluation" / "evaluate.py").read_text()
+        assert '"/org/Some Project/autoresearch/evaluation_metrics"' in evaluate
         contract = (repo / "AUTORESEARCH.md").read_text()
         assert rel in contract
         recipe = (repo / "transforms-python" / "conda_recipe" / "meta.yaml").read_text()
@@ -314,9 +330,62 @@ class TestScaffold:
         assert recipe.index("- xgboost") < recipe.index("\nbuild:")
 
     def test_scaffold_never_clobbers_an_existing_transform(self, tmp_path: Path) -> None:
+        from autoresearch.foundry_setup import default_refs
+
         repo = self._make_repo(tmp_path)
-        rel, _ = scaffold(repo, "/org/Some Project/autoresearch", "master")
+        refs = default_refs("/org/Some Project/autoresearch")
+        rel, _ = scaffold(repo, refs, "master")
         (repo / rel).write_text("# improved model\n")
-        _, actions = scaffold(repo, "/org/Some Project/autoresearch", "master")
+        _, actions = scaffold(repo, refs, "master")
         assert (repo / rel).read_text() == "# improved model\n"
-        assert not any("baseline transform" in action for action in actions)
+        assert not any("forecast.py" in action for action in actions)
+
+    def test_scaffold_migrates_legacy_single_file_layout(self, tmp_path: Path) -> None:
+        from autoresearch.foundry_setup import default_refs
+
+        repo = self._make_repo(tmp_path)
+        datasets = repo / "transforms-python" / "src" / "acme_project" / "datasets"
+        datasets.mkdir(parents=True)
+        legacy = datasets / "forecast.py"
+        legacy.write_text("# agent-improved winning model\n")
+        rel, actions = scaffold(repo, default_refs("/org/Some Project/autoresearch"), "master")
+        assert (repo / rel).read_text() == "# agent-improved winning model\n"
+        assert not legacy.exists()
+        assert any("migrated" in action for action in actions)
+
+    def test_scaffold_existing_datasets_by_rid_with_custom_columns(self, tmp_path: Path) -> None:
+        repo = self._make_repo(tmp_path)
+        refs = {
+            "sales_train": "ri.foundry.main.dataset.train",
+            "forecast_request": "ri.foundry.main.dataset.request",
+            "forecasts": "ri.foundry.main.dataset.fcst",
+            "validation_actuals": "ri.foundry.main.dataset.val",
+            "holdout_actuals": "ri.foundry.main.dataset.hold",
+            "evaluation_metrics": "ri.foundry.main.dataset.eval",
+            # no sales_raw: the data is already clean upstream
+        }
+        rel, _ = scaffold(
+            repo, refs, "master", id_col="item_id", date_col="ds", target_col="demand"
+        )
+        datasets = repo / "transforms-python" / "src" / "acme_project" / "datasets"
+        # No raw feed wired -> no preprocessing stage.
+        assert not (datasets / "data_preprocessing").exists()
+        transform = (repo / rel).read_text()
+        assert 'SALES_TRAIN = "ri.foundry.main.dataset.train"' in transform
+        assert 'ID = "item_id"' in transform
+        assert 'DATE = "ds"' in transform
+        assert 'TARGET = "demand"' in transform
+        evaluate = (datasets / "model_evaluation" / "evaluate.py").read_text()
+        assert 'EVALUATION_METRICS = "ri.foundry.main.dataset.eval"' in evaluate
+        contract = (repo / "AUTORESEARCH.md").read_text()
+        assert "`item_id` (str), `ds` (date), `demand` (float)" in contract
+
+    def test_make_raw_injects_quality_issues(self) -> None:
+        from autoresearch.foundry_setup import generate_history, make_raw
+
+        clean = generate_history(n_skus=4, n_days=90)
+        raw = make_raw(clean)
+        assert raw["units_sold"].isna().sum() > 0
+        assert (raw["units_sold"].dropna() < 0).sum() > 0
+        assert raw.duplicated(["sku_id", "date"]).sum() > 0
+        assert len(raw) < len(clean) * 1.02  # some rows dropped, some duplicated

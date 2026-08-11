@@ -53,11 +53,17 @@ class WorkspaceConfig(BaseModel):
 class FoundryDatasets(BaseModel):
     """Dataset RIDs the Foundry runtime reads and writes."""
 
+    sales_raw: str = ""
     sales_train: str = ""
     forecast_request: str = ""
     forecasts: str = ""
     validation_actuals: str = ""
     holdout_actuals: str = ""
+    evaluation_metrics: str = ""
+
+    def pipeline_targets(self) -> list[str]:
+        """Every buildable output of the pipeline (for a full rebuild)."""
+        return [rid for rid in (self.sales_train, self.forecasts, self.evaluation_metrics) if rid]
 
 
 class FoundryRuntimeConfig(BaseModel):

@@ -132,7 +132,7 @@ def print_spec(console: Console, spec: MetricSpec, validation: MetricValidation)
         color = "green" if check.passed else "red"
         console.print(f"[{color}]{check.name}[/{color}]: {check.detail}")
     for warning in validation.warnings:
-        console.print(f"[yellow]! {warning}[/yellow]")
+        console.print(f"[dark_orange3]! {warning}[/dark_orange3]")
 
 
 def _tool(name: str, description: str, properties: dict, required: list[str]) -> dict:
@@ -835,7 +835,7 @@ class SetupSession:
                 parsed = parse_plan(self.plan_path)
             except PlanError as exc:
                 self.console.print(
-                    f"[yellow]! {exc}[/yellow]\n"
+                    f"[dark_orange3]! {exc}[/dark_orange3]\n"
                     "Fix the plan file and type execute again, or give feedback to revise it."
                 )
                 continue
@@ -879,7 +879,7 @@ class SetupSession:
                         else:
                             result = self.execute(name, arguments)
                     if "error" in result:
-                        self.console.print(f"[yellow]! {result['error']}[/yellow]")
+                        self.console.print(f"[dark_orange3]! {result['error']}[/dark_orange3]")
                     messages.append(
                         {
                             "role": "tool",

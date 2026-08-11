@@ -20,21 +20,25 @@ import threading
 from collections.abc import Callable
 from typing import Self
 
+from rich import box
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
 from .agent_status import CANCELLED, FAILED, PASSED, REJECTED, TRAINING, AgentStatus
-from .costs import format_cost
 
+# Deep colors only: the dashboard must stay readable on light terminals, where
+# bright ANSI colors (cyan, yellow, bright green) wash out on the white background.
 _PHASE_STYLES = {
-    PASSED: "bold green",
-    FAILED: "bold red",
-    REJECTED: "yellow",
-    CANCELLED: "dim",
-    TRAINING: "blue",
+    PASSED: "bold green4",
+    FAILED: "bold red3",
+    REJECTED: "dark_orange3",
+    CANCELLED: "grey50",
+    TRAINING: "blue3",
 }
+_DEFAULT_PHASE_STYLE = "dark_cyan"
+_MUTED = "grey42"
 
 _LEGEND = "[1-9/↑↓] select   [c] chat   [x] cancel selected   [q] stop round   [?] help"
 _HELP_LINES = (
@@ -85,7 +89,7 @@ class AgentDashboard:
         # produce a table wider than a narrow Cursor terminal; terminal-level
         # wrapping then made Rich miscount rows and leave old Live frames
         # behind on screen.
-        table = Table(box=None, pad_edge=False, expand=True)
+        table = Table(box=box.SQUARE, show_lines=True, header_style="bold", expand=True)
         table.add_column("#", justify="right", width=3)
         table.add_column(
             "Experiment", min_width=16, ratio=3, no_wrap=True, overflow="ellipsis"
@@ -97,39 +101,35 @@ class AgentDashboard:
         table.add_column("Elapsed", justify="right", width=7, no_wrap=True)
         for position, agent in enumerate(self.agents):
             marker = ">" if position == self.selected else " "
-            style = _PHASE_STYLES.get(agent.phase, "cyan")
+            style = _PHASE_STYLES.get(agent.phase, _DEFAULT_PHASE_STYLE)
             table.add_row(
                 f"{marker}{agent.index}",
                 agent.title,
                 Text(agent.phase, style=style),
-                Text(agent.action, style="dim" if agent.done else ""),
+                Text(agent.action, style=_MUTED if agent.done else ""),
                 agent.elapsed,
             )
-        total_cost = sum(agent.cost_usd for agent in self.agents)
-        header = f"{self.header} · spend {format_cost(total_cost)}"
-        parts: list[RenderableType] = [Text(header, style="bold"), Text(), table, Text()]
+        parts: list[RenderableType] = [Text(self.header, style="bold"), Text(), table, Text()]
         selected = self.agents[self.selected] if self.agents else None
         if selected is not None:
             trail = " → ".join(selected.trail) or "waiting for the first event"
-            spent = format_cost(selected.cost_usd)
-            parts.append(Text(f"Selected: {trail} · spend {spent}", style="italic"))
+            parts.append(Text(f"Selected: {trail}", style="italic"))
             if selected.log_path is not None:
-                parts.append(Text(f"Log: {selected.log_path}", style="dim"))
+                parts.append(Text(f"Log: {selected.log_path}", style=_MUTED))
         if self.show_help:
             parts.append(Text())
-            parts.extend(Text(line, style="dim") for line in _HELP_LINES)
+            parts.extend(Text(line, style=_MUTED) for line in _HELP_LINES)
         else:
-            parts.append(Text(_LEGEND, style="dim"))
+            parts.append(Text(_LEGEND, style=_MUTED))
         return Group(*parts)
 
     def _summary_line(self) -> str:
         chunks = [
             f"{agent.index} {agent.title[:28]}: {agent.phase} "
-            f"({agent.action}, {agent.elapsed}, {format_cost(agent.cost_usd)})"
+            f"({agent.action}, {agent.elapsed})"
             for agent in self.agents
         ]
-        total = format_cost(sum(agent.cost_usd for agent in self.agents))
-        return f"[dashboard] spend {total} | " + " | ".join(chunks)
+        return "[dashboard] " + " | ".join(chunks)
 
     # ------------------------------------------------------------------ keys
 

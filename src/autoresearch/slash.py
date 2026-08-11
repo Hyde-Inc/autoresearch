@@ -106,7 +106,7 @@ COMMANDS = [
 
 def print_help(console: Console) -> None:
     table = Table(title="Slash commands", show_header=False)
-    table.add_column(style="bold cyan")
+    table.add_column(style="bold blue")
     table.add_column()
     for command, description in COMMANDS:
         table.add_row(command, description)
@@ -217,9 +217,9 @@ def handle_slash(text: str, settings: SessionSettings, console: Console) -> Slas
             settings.budget_s = _positive_int(argument, "budget", 60)
             console.print(f"[green]Per-experiment budget:[/green] {settings.budget_s}s")
             return SlashResult(True, f"per-experiment budget set to {settings.budget_s}s")
-        console.print(f"[yellow]Unknown command /{command}.[/yellow]")
+        console.print(f"[dark_orange3]Unknown command /{command}.[/dark_orange3]")
         print_help(console)
         return SlashResult(handled=True)
     except ValueError as exc:
-        console.print(f"[yellow]! {exc}[/yellow]")
+        console.print(f"[dark_orange3]! {exc}[/dark_orange3]")
         return SlashResult(handled=True)
