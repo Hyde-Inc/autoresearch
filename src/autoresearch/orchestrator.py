@@ -544,6 +544,10 @@ async def run_research(
         while completed < maximum and round_number < config.budget.rounds:
             if Path(".autoresearch-stop").exists():
                 stop_requested = True
+                console.print(
+                    "[dark_orange3]Stop flag found (.autoresearch-stop) - stopping the run "
+                    "before the next round.[/dark_orange3]"
+                )
                 break
             spent = total_spend()
             if max_cost is not None and spent >= max_cost:
