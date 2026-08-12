@@ -1,0 +1,4 @@
+# Critical paths per the Hyde SDLC standard (OPS-230).
+/src/ @sarthak-hyde
+/tests/ @sarthak-hyde
+/.github/ @sarthak-hyde
