@@ -98,7 +98,9 @@ def test_enter_accepts_selected_completion_without_submitting_prefix() -> None:
 
 def test_turn_renderer_renders_markdown_and_wraps_complete_words() -> None:
     output = io.StringIO()
-    renderer = TurnRenderer(Console(file=output, width=45, color_system=None))
+    # force_terminal=False: rich auto-enables terminal mode under GITHUB_ACTIONS,
+    # which starts Live's refresh thread and makes the captured output timing-dependent.
+    renderer = TurnRenderer(Console(file=output, width=45, color_system=None, force_terminal=False))
     renderer.on_content(
         "Baseline **WMAPE** is **0.104**. This sentence should wrap cleanly "
         "between words instead of splitting them.\n\n1. **Global XGBoost**"
