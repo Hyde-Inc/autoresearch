@@ -98,16 +98,17 @@ def test_enter_accepts_selected_completion_without_submitting_prefix() -> None:
 
 def test_turn_renderer_renders_markdown_and_wraps_complete_words() -> None:
     output = io.StringIO()
-    # force_terminal=False: rich auto-enables terminal mode under GITHUB_ACTIONS,
-    # which starts Live's refresh thread and makes the captured output timing-dependent.
+    # force_terminal=False: rich flips into terminal mode when FORCE_COLOR or
+    # GITHUB_ACTIONS is in the environment, which changes where Live wraps lines.
+    # Pinning it keeps the rendered output identical on dev machines and CI.
     renderer = TurnRenderer(Console(file=output, width=45, color_system=None, force_terminal=False))
     renderer.on_content(
         "Baseline **WMAPE** is **0.104**. This sentence should wrap cleanly "
         "between words instead of splitting them.\n\n1. **Global XGBoost**"
     )
     renderer.finish()
-    rendered = output.getvalue()
+    rendered = "\n".join(line.rstrip() for line in output.getvalue().splitlines())
     assert "**" not in rendered
     assert "Baseline WMAPE is 0.104" in rendered
     assert "1 Global XGBoost" in rendered
-    assert "instead\nof splitting" in rendered
+    assert "instead of\nsplitting them." in rendered
