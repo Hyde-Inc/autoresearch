@@ -562,3 +562,41 @@ Validation and holdout actuals are never copied into the seed workspace or agent
 raw project data stays outside too, so agents only ever see the train split. Agents can only
 change files under `solution/` by default. This is suitable for a trusted local demo. Use a
 container or VM for untrusted models.
+
+## How we ship
+
+This repo follows the Hyde SDLC standard (OPS-230). Two permanent branches:
+
+| Branch | Role |
+| --- | --- |
+| `staging` | Integration branch. Feature branches merge here first. |
+| `main` | Production source of truth. Only receives release PRs from `staging`. |
+
+```
+feature branch → PR → staging → verify → PR → main → tag vX.Y.Z
+```
+
+- Branch from the latest `staging` and open a PR back into `staging`. CI (lint, test,
+  build) must be green and the PR needs one approving review. Put the Linear ticket ID
+  in the PR title.
+- "Deploying to staging" for this CLI means installing from the `staging` branch and
+  smoke-testing it:
+
+```bash
+uv tool install --force git+https://github.com/Hyde-Inc/autoresearch@staging
+autoresearch doctor
+```
+
+- Releases: open a PR from `staging` into `main` with the release sign-off checklist,
+  merge, then create an immutable tag `vMAJOR.MINOR.PATCH` and a GitHub Release.
+  "Production" installs come from the tag:
+
+```bash
+uv tool install --force git+https://github.com/Hyde-Inc/autoresearch@v0.1.0
+```
+
+- Rollback: reinstall the previous tag with the same command.
+- Never push directly to `staging` or `main`; both are protected. Hotfixes go through a
+  PR into `main`, get a PATCH tag, and are merged back to `staging` the same day.
+- Secrets live in `.env` (never committed); required variable names are listed in
+  `.env.example`.
