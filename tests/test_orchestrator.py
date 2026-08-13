@@ -146,3 +146,27 @@ def test_stop_flag_cancels_the_whole_round_immediately(tmp_path: Path, monkeypat
     # Every agent's worktree was cleaned on the way out.
     assert not any(store.worktrees_dir.iterdir())
     assert all(item.status == "cancelled" for item in store.load_attempts())
+
+
+def test_seed_copy_skips_runs_dir_inside_the_repo(tmp_path) -> None:
+    """A runs/ folder inside the seed repo must not be copied into itself.
+
+    Regression: running from inside the repo put workspace.runs inside the
+    seed, and the plain copytree recursed (repo/runs/repo/runs/...) until
+    the OS path-length limit."""
+    import shutil
+
+    from autoresearch.orchestrator import _ignore_runs_root
+
+    seed = tmp_path / "repo"
+    (seed / "src").mkdir(parents=True)
+    (seed / "src" / "model.py").write_text("print('hi')\n")
+    runs_root = seed / "runs"
+    (runs_root / "old-run").mkdir(parents=True)
+    (runs_root / "old-run" / "state.json").write_text("{}")
+
+    destination = runs_root / "task" / "20260811" / "repo"
+    shutil.copytree(seed, destination, ignore=_ignore_runs_root(runs_root.resolve()))
+
+    assert (destination / "src" / "model.py").exists()
+    assert not (destination / "runs").exists()

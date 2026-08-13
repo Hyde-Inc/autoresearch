@@ -53,11 +53,23 @@ class WorkspaceConfig(BaseModel):
 class FoundryDatasets(BaseModel):
     """Dataset RIDs the Foundry runtime reads and writes."""
 
+    sales_raw: str = ""
     sales_train: str = ""
     forecast_request: str = ""
     forecasts: str = ""
     validation_actuals: str = ""
     holdout_actuals: str = ""
+    evaluation_metrics: str = ""
+
+    def pipeline_targets(self) -> list[str]:
+        """Every buildable output of the pipeline (for a full rebuild).
+
+        ``sales_train`` is a build target only when a raw feed is wired -
+        without ``sales_raw`` there is no preprocessing transform producing it
+        (it is an existing dataset), and asking Foundry to build it would hang
+        on a missing job spec."""
+        targets = [self.sales_train] if self.sales_raw and self.sales_train else []
+        return targets + [rid for rid in (self.forecasts, self.evaluation_metrics) if rid]
 
 
 class FoundryRuntimeConfig(BaseModel):
@@ -75,8 +87,28 @@ class FoundryRuntimeConfig(BaseModel):
     project_folder_rid: str = ""
     """Explicit project folder RID (overrides resolution from repo_rid)."""
     datasets: FoundryDatasets = FoundryDatasets()
-    build_timeout_s: int = Field(default=3600, ge=1)
+    build_timeout_s: int = Field(default=900, ge=1)
+    """Builds that outlive this are cancelled on Foundry, not just abandoned."""
     poll_s: int = Field(default=15, ge=1)
+
+
+class OpeningRoundConfig(BaseModel):
+    """Pin round 1 to a known-fast model family instead of letting the director route.
+
+    Skill routing is an LLM call, so an opening round can land on a family that
+    takes an agent a long time to write and a trainer a long time to run. Naming
+    skills here replaces that call for round 1 only: later rounds route normally
+    and can climb to heavier families once there is a result to beat.
+    """
+
+    skills: list[str] = Field(default_factory=list)
+    instruction: str = (
+        "This is the opening round, optimised for fast feedback rather than peak accuracy. "
+        "Every idea must be implementable with the pinned skills above using only pandas, "
+        "numpy and statsmodels - no gradient boosting, no neural or foundation models, and "
+        "no hyperparameter search. Prefer changes that are quick to write and train in "
+        "seconds, so the first scored result arrives early."
+    )
 
 
 class TaskConfig(BaseModel):
@@ -96,6 +128,7 @@ class TaskConfig(BaseModel):
     idea_hints: list[str] = Field(default_factory=list)
     context: str = ""
     skills: list[Path] = Field(default_factory=list)
+    opening_round: OpeningRoundConfig = OpeningRoundConfig()
     config_path: Path | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
@@ -122,6 +155,16 @@ def load_config(path: Path) -> TaskConfig:
         raw = yaml.safe_load(handle)
     config = TaskConfig.model_validate(raw or {})
     config.config_path = path
+    if config.opening_round.skills:
+        from .skills import load_skills
+
+        available = {skill.name for skill in load_skills(config)}
+        unknown = [name for name in config.opening_round.skills if name not in available]
+        if unknown:
+            raise ValueError(
+                f"opening_round.skills names no such skill: {', '.join(unknown)}. "
+                f"Available: {', '.join(sorted(available))}"
+            )
     if config.metric.definition:
         from .metrics import load_spec
 

@@ -10,7 +10,6 @@ else is configured.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -83,14 +82,14 @@ def _check_dotenv() -> Check:
 
 
 def _probe_openrouter(api_key: str) -> Check:
-    """Ask OpenRouter to validate the key and report remaining credit."""
+    """Ask OpenRouter to validate the key."""
     request = urllib.request.Request(
         "https://openrouter.ai/api/v1/key",
         headers={"Authorization": f"Bearer {api_key}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        with urllib.request.urlopen(request, timeout=15):
+            pass
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             return Check("openrouter", "fail", f"key rejected by OpenRouter (HTTP {exc.code})")
@@ -98,18 +97,7 @@ def _probe_openrouter(api_key: str) -> Check:
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         return Check("openrouter", "warn", f"key is set but OpenRouter was unreachable: {reason}")
-
-    data = payload.get("data", payload) if isinstance(payload, dict) else {}
-    usage = data.get("usage")
-    limit = data.get("limit")
-    remaining = data.get("limit_remaining")
-    if remaining is not None:
-        detail = f"key valid; {remaining} credit remaining"
-    elif limit is None:
-        detail = f"key valid; unlimited credit (usage ${usage or 0:.4f})"
-    else:
-        detail = f"key valid; used ${usage or 0:.4f} of ${limit}"
-    return Check("openrouter", "ok", detail)
+    return Check("openrouter", "ok", "key valid")
 
 
 def _check_openrouter(check_api: bool) -> Check:
