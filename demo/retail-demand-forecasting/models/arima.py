@@ -38,7 +38,7 @@ def fit_and_forecast(series: pd.Series, request_dates: pd.DatetimeIndex) -> np.n
         ).fit(method_kwargs={"maxiter": 50})
         forecast = model.forecast(len(request_dates), exog=weekday_dummies(request_dates))
         return np.clip(np.nan_to_num(forecast, nan=fallback), 0.0, None)
-    except Exception:
+    except Exception:  # noqa: BLE001 - statsmodels can raise anything; fall back flat
         return np.full(len(request_dates), max(0.0, fallback))
 
 
