@@ -41,6 +41,7 @@ from .plans import (
 )
 from .progress import Activity
 from .store import RunStore
+from .ui import THEME
 from .worker import (
     WorkerResult,
     _run,
@@ -50,7 +51,7 @@ from .worker import (
     run_worker,
 )
 
-console = Console()
+console = Console(theme=THEME)
 
 PROPOSALS_MIN = 2
 PROPOSALS_MAX = 5
@@ -73,6 +74,19 @@ def _better(candidate: float, incumbent: float, direction: str) -> bool:
 
 def _paths_allowed(paths: list[str], prefixes: list[str]) -> list[str]:
     return [path for path in paths if not any(path.startswith(prefix) for prefix in prefixes)]
+
+
+def _ignore_runs_root(runs_root: Path) -> Callable[[str, list[str]], set[str]]:
+    """``copytree`` ignore callback that skips the runs directory itself.
+
+    When the runs folder lives inside the seed repo (e.g. the task.yaml sits in
+    the repo and ``workspace.runs`` is relative), a plain copytree would copy
+    the run into itself recursively until the OS path-length limit."""
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        return {name for name in names if (Path(directory) / name).resolve() == runs_root}
+
+    return ignore
 
 
 def _main_ref(config: TaskConfig) -> str:
@@ -212,11 +226,11 @@ async def _execute_attempt(
 
 def _print_director_findings(director: ResearchDirector) -> None:
     if director.last_analysis:
-        console.print("[bold]Director analyzed the data and errors[/bold]")
+        console.print("[bold grey19]Director analyzed the data and errors[/bold grey19]")
         for line in director.last_analysis:
             console.print(f"  {line}")
     if director.last_skill_selection.selected:
-        console.print("[bold]Director consulted skills[/bold]")
+        console.print("[bold grey19]Director consulted skills[/bold grey19]")
         for selected in director.last_skill_selection.selected:
             console.print(f"  {selected.name}: {selected.reason}")
 
@@ -293,7 +307,7 @@ async def _propose_round(
                 parsed = parse_plan(plan_file)
             except PlanError as exc:
                 console.print(
-                    f"[yellow]! {exc}[/yellow]\n"
+                    f"[dark_orange3]! {exc}[/dark_orange3]\n"
                     "Fix the plan file and approve again, or give feedback / stop."
                 )
                 continue
@@ -479,10 +493,11 @@ async def run_research(
         if session_dir is None and prior.get("session_dir"):
             session_dir = Path(prior["session_dir"])
     else:
-        store = RunStore.create(config.resolve(config.workspace.runs), config.name)
+        runs_root = config.resolve(config.workspace.runs)
+        store = RunStore.create(runs_root, config.name)
         shutil.copy2(config.config_path, store.run_dir / "task.yaml")
         repo = store.run_dir / "repo"
-        shutil.copytree(seed_template, repo)
+        shutil.copytree(seed_template, repo, ignore=_ignore_runs_root(runs_root))
         await ensure_seed_repo(repo)
         with Activity(console, "Confirming the baseline before research"):
             baseline_eval = await validate_baseline(config)
@@ -516,7 +531,7 @@ async def run_research(
             }
         )
     console.print(
-        f"[bold]Baseline[/bold] {config.metric.name}={baseline[config.metric.name]:.6f}, "
+        f"[bold grey19]Baseline[/bold grey19] {config.metric.name}={baseline[config.metric.name]:.6f}, "
         f"holdout={baseline[f'holdout_{config.metric.name}']:.6f}"
     )
     director = ResearchDirector(config)
@@ -529,12 +544,16 @@ async def run_research(
         while completed < maximum and round_number < config.budget.rounds:
             if Path(".autoresearch-stop").exists():
                 stop_requested = True
+                console.print(
+                    "[dark_orange3]Stop flag found (.autoresearch-stop) - stopping the run "
+                    "before the next round.[/dark_orange3]"
+                )
                 break
             spent = total_spend()
             if max_cost is not None and spent >= max_cost:
                 stop_requested = True
                 console.print(
-                    f"[bold]Cost cap reached[/bold]: spent {format_cost(spent)} of "
+                    f"[bold grey19]Cost cap reached[/bold grey19]: spent {format_cost(spent)} of "
                     f"{format_cost(max_cost)} budget - stopping before the next round."
                 )
                 break
@@ -549,12 +568,12 @@ async def run_research(
                     director, store, config, session_dir, round_number, notes, count, review
                 )
                 if not ideas:
-                    console.print("[bold]Run ended at review.[/bold]")
+                    console.print("[bold grey19]Run ended at review.[/bold grey19]")
                     break
                 ideas = ideas[: maximum - completed]
             count = len(ideas)
             console.print(
-                f"[bold cyan]Round {round_number}[/bold cyan]: launching {count} experiments"
+                f"[bold blue]Round {round_number}[/bold blue]: launching {count} experiments"
             )
             header = (
                 f"Round {round_number} · baseline {config.metric.name} "
@@ -606,8 +625,8 @@ async def run_research(
                         )
                         if code:
                             console.print(
-                                f"[yellow]! could not push the promoted model to Foundry "
-                                f"{main_ref}: {output.strip()}[/yellow]"
+                                f"[dark_orange3]! could not push the promoted model to Foundry "
+                                f"{main_ref}: {output.strip()}[/dark_orange3]"
                             )
                         else:
                             console.print(
@@ -653,7 +672,7 @@ async def run_research(
             )
             if round_cancelled:
                 stop_requested = True
-                console.print("[bold]Round cancelled - research run stopped.[/bold]")
+                console.print("[bold grey19]Round cancelled - research run stopped.[/bold grey19]")
                 break
     finally:
         state = store.load_state()
@@ -665,5 +684,4 @@ async def run_research(
         state["cost_usd"] = round(total_spend(), 6)
         store.save_state(state)
         Path(".autoresearch-stop").unlink(missing_ok=True)
-        console.print(f"[bold]Total model spend[/bold]: {format_cost(total_spend())}")
     return store

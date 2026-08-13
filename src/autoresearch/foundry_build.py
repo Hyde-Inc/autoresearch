@@ -24,6 +24,12 @@ from . import foundry
 
 _TERMINAL = {"SUCCEEDED", "FAILED", "CANCELED", "CANCELLED", "ABORTED"}
 
+# CLI control files that live in the working directory. When a Foundry task is
+# run from the transforms repo itself they sit inside the worktree, and staging
+# them would publish them to Foundry master - a committed ``.autoresearch-stop``
+# then halts every later run right after the baseline.
+_NEVER_COMMIT = (".autoresearch-stop", ".autoresearch")
+
 
 class FoundryBuildError(RuntimeError):
     """A push or build step failed in a way the user can act on."""
@@ -65,10 +71,13 @@ def push_repo(repo_dir: str | Path, *, branch: str = "master", message: str) -> 
     if not (repo / ".git").exists():
         raise FoundryBuildError(f"{repo} is not a git repository")
 
-    _git(repo, "add", "-A")
-    status = _git(repo, "status", "--porcelain")
+    excludes = [f":(exclude){name}" for name in _NEVER_COMMIT]
+    _git(repo, "add", "-A", "--", ".", *excludes)
+    for name in _NEVER_COMMIT:
+        _git(repo, "rm", "--cached", "-r", "--ignore-unmatch", "-q", name, check=False)
+    staged = _git(repo, "diff", "--cached", "--name-only")
     committed: str | None = None
-    if status.stdout.strip():
+    if staged.stdout.strip():
         _git(repo, "commit", "-m", message)
         committed = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
@@ -175,6 +184,11 @@ def get_build(build_rid: str) -> dict:
     return foundry._api_json("GET", f"/api/v2/orchestration/builds/{build_rid}")
 
 
+def cancel_build(build_rid: str) -> None:
+    """Ask Foundry to cancel a running build (all of its unfinished jobs)."""
+    foundry._api_json("POST", f"/api/v2/orchestration/builds/{build_rid}/cancel")
+
+
 def _job_diagnostics(job_rids: list[str]) -> str:
     messages: list[str] = []
     for job_rid in job_rids[:4]:
@@ -191,14 +205,16 @@ def _job_diagnostics(job_rids: list[str]) -> str:
 def wait_for_build(
     build_rid: str,
     *,
-    timeout_s: int = 3600,
+    timeout_s: int = 900,
     poll_s: int = 15,
     on_status=None,
 ) -> BuildResult:
     """Poll a build until terminal. Raises :class:`FoundryBuildError` on failure.
 
-    ``on_status`` is an optional callback ``(status: str, elapsed_s: float)`` for
-    surfacing progress to the dashboard.
+    A build that outlives ``timeout_s`` is actively cancelled on Foundry (so it
+    stops consuming compute) before the error is raised. ``on_status`` is an
+    optional callback ``(status: str, elapsed_s: float)`` for surfacing progress
+    to the dashboard.
     """
     start = time.monotonic()
     last_status = ""
@@ -220,8 +236,13 @@ def wait_for_build(
                 )
             return result
         if elapsed > timeout_s:
+            cancelled = "cancelled on Foundry"
+            try:
+                cancel_build(build_rid)
+            except foundry.FoundryError as exc:
+                cancelled = f"cancel request failed: {exc}"
             raise FoundryBuildError(
-                f"Foundry build {build_rid} did not finish within {timeout_s}s "
-                f"(last status {status or 'unknown'})"
+                f"Foundry build {build_rid} exceeded the {timeout_s}s timeout "
+                f"(last status {status or 'unknown'}); {cancelled}"
             )
         time.sleep(poll_s)

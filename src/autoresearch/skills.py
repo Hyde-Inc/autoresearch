@@ -77,6 +77,18 @@ def named_skill_context(names: Iterable[str], skills: list[ResearchSkill]) -> st
     )
 
 
+def pinned_selection(names: Iterable[str], skills: list[ResearchSkill]) -> SkillSelection:
+    """The selection a task config asked for, in place of the routing LLM call."""
+    known = {skill.name for skill in skills}
+    return SkillSelection(
+        selected=[
+            SelectedSkill(name=name, reason="pinned for the opening round by the task config")
+            for name in names
+            if name in known
+        ]
+    )
+
+
 async def select_skills(
     situation: str,
     skills: list[ResearchSkill],

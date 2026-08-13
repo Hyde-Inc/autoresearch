@@ -225,6 +225,39 @@ def _api_json(
 
 
 # --------------------------------------------------------------------------- #
+# Dataset branches.
+# --------------------------------------------------------------------------- #
+
+
+def get_branch(rid: str, branch: str) -> dict | None:
+    """Return the branch record of a dataset, or None when it does not exist."""
+    quoted = urllib.parse.quote(branch, safe="")
+    try:
+        return _api_json("GET", f"/api/v2/datasets/{rid}/branches/{quoted}")
+    except FoundryError as exc:
+        if "404" in str(exc):
+            return None
+        raise
+
+
+def create_branch(rid: str, branch: str, *, transaction_rid: str | None = None) -> dict:
+    """Create a dataset branch, optionally pointing at an existing transaction."""
+    body: dict = {"name": branch}
+    if transaction_rid:
+        body["transactionRid"] = transaction_rid
+    try:
+        return _api_json("POST", f"/api/v2/datasets/{rid}/branches", body=body)
+    except FoundryError as exc:
+        if "400" not in str(exc):
+            raise
+        # Some stacks expect the v1-style field name.
+        body = {"branchName": branch}
+        if transaction_rid:
+            body["transactionRid"] = transaction_rid
+        return _api_json("POST", f"/api/v2/datasets/{rid}/branches", body=body)
+
+
+# --------------------------------------------------------------------------- #
 # Filesystem + dataset creation.
 # --------------------------------------------------------------------------- #
 

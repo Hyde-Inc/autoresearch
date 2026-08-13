@@ -524,24 +524,66 @@ experiment is merged and pushed to `master`, so promotion literally ships the mo
 Requires `FOUNDRY_HOSTNAME` and `FOUNDRY_TOKEN` in `.env` (scopes: `api:datasets-read`,
 `api:datasets-write`, `api:orchestration-write`).
 
+The installer scaffolds a **three-stage pipeline** into the transforms repo, so the whole
+lifecycle is visible in Foundry:
+
+```
+sales_raw ─▶ data_preprocessing/ ─▶ sales_train ─▶ model_running/ ─▶ forecasts
+                                                                        │
+                        evaluation_metrics ◀─ model_evaluation/ ◀───────┘
+```
+
+- `data_preprocessing/preprocess.py` — fixed infrastructure. Cleans the raw feed:
+  deduplicates, clips negative demand, fills null demand, restores missing calendar dates.
+- `model_running/forecast.py` — the only file agents may edit.
+- `model_evaluation/evaluate.py` — fixed infrastructure. Writes per-SKU + overall metrics
+  to the `evaluation_metrics` dataset so scores are visible inside Foundry too.
+
 ### `autoresearch foundry-setup --repo <transforms-repo>`
 One-shot installer for any cloned Foundry Python transforms repository. Reads the repo's
-`gradle.properties` for its identity, provisions the five datasets (`sales_train`,
-`forecast_request`, `forecasts`, `validation_actuals`, `holdout_actuals`) under the project's
-`autoresearch/` folder, scaffolds the baseline transform + `AUTORESEARCH.md` contract +
-curated conda dependencies, pushes so the baseline publishes, and writes `foundry-task.yaml`.
+`gradle.properties` for its identity, provisions the pipeline datasets (`sales_raw`,
+`sales_train`, `forecast_request`, `forecasts`, `validation_actuals`, `holdout_actuals`,
+`evaluation_metrics`) under the project's `autoresearch/` folder, scaffolds the three
+pipeline stages + `AUTORESEARCH.md` contract + curated conda dependencies, pushes so the
+baseline publishes, and writes `foundry-task.yaml`. Only the inputs are uploaded; the
+`sales_train`, `forecasts`, and `evaluation_metrics` datasets are filled by Foundry builds.
+An existing `datasets/forecast.py` (e.g. an agent-improved winner) is migrated into
+`model_running/`, never clobbered.
 
 ```bash
 autoresearch foundry-setup --repo ~/code/my-foundry-repo
+autoresearch foundry-build -c foundry-task.yaml --all   # first full pipeline build
 autoresearch run -c foundry-task.yaml        # the autonomous loop, training on Foundry
 ```
 
 - `--n-skus`, `--n-days`, `--validation-days`, `--holdout-days` — synthetic data shape.
 - `--no-push` — scaffold and provision only.
 
-### `autoresearch foundry-build -c foundry-task.yaml [-m MSG] [--force] [--no-push]`
+**Bring your own data.** If the datasets already exist on Foundry, skip the synthetic
+provisioning entirely with `--dataset key=RID` (repeatable). Required: `sales_train`,
+`forecast_request`, `validation_actuals`, `holdout_actuals`. The `forecasts` and
+`evaluation_metrics` outputs are created automatically if not given; pass `sales_raw`
+only if you also want the preprocessing stage scaffolded. Column names are configurable
+and flow into the scaffolded transforms, the contract, and the scorer:
+
+```bash
+autoresearch foundry-setup --repo ~/code/my-foundry-repo \
+  --dataset sales_train=ri.foundry.main.dataset.aaa \
+  --dataset forecast_request=ri.foundry.main.dataset.bbb \
+  --dataset validation_actuals=ri.foundry.main.dataset.ccc \
+  --dataset holdout_actuals=ri.foundry.main.dataset.ddd \
+  --id-col item_id --date-col ds --target-col demand --metric rmse
+```
+
+Custom metrics work on Foundry too: `autoresearch metric` turns a plain-English
+definition into verified code and points the task config's `metric.definition` at it;
+the Foundry scorer computes it alongside wmape/mape/rmse/bias_pct.
+
+### `autoresearch foundry-build -c foundry-task.yaml [-m MSG] [--all] [--force] [--no-push]`
 Manual one-shot: push the repo, wait for the transform to publish, build `forecasts` on the
-configured branch, and poll to completion. Useful for demos and debugging outside the loop.
+configured branch, and poll to completion. With `--all` it builds the entire pipeline
+(preprocessing → model → evaluation) in one build, jobs ordered by dependency. Useful for
+demos and debugging outside the loop.
 
 ### `autoresearch foundry-score -c foundry-task.yaml [--holdout]`
 Read the current `forecasts` output and the sealed actuals from Foundry and print the metrics
@@ -562,3 +604,41 @@ Validation and holdout actuals are never copied into the seed workspace or agent
 raw project data stays outside too, so agents only ever see the train split. Agents can only
 change files under `solution/` by default. This is suitable for a trusted local demo. Use a
 container or VM for untrusted models.
+
+## How we ship
+
+This repo follows the Hyde SDLC standard (OPS-230). Two permanent branches:
+
+| Branch | Role |
+| --- | --- |
+| `staging` | Integration branch. Feature branches merge here first. |
+| `main` | Production source of truth. Only receives release PRs from `staging`. |
+
+```
+feature branch → PR → staging → verify → PR → main → tag vX.Y.Z
+```
+
+- Branch from the latest `staging` and open a PR back into `staging`. CI (lint, test,
+  build) must be green and the PR needs one approving review. Put the Linear ticket ID
+  in the PR title.
+- "Deploying to staging" for this CLI means installing from the `staging` branch and
+  smoke-testing it:
+
+```bash
+uv tool install --force git+https://github.com/Hyde-Inc/autoresearch@staging
+autoresearch doctor
+```
+
+- Releases: open a PR from `staging` into `main` with the release sign-off checklist,
+  merge, then create an immutable tag `vMAJOR.MINOR.PATCH` and a GitHub Release.
+  "Production" installs come from the tag:
+
+```bash
+uv tool install --force git+https://github.com/Hyde-Inc/autoresearch@v0.1.0
+```
+
+- Rollback: reinstall the previous tag with the same command.
+- Never push directly to `staging` or `main`; both are protected. Hotfixes go through a
+  PR into `main`, get a PATCH tag, and are merged back to `staging` the same day.
+- Secrets live in `.env` (never committed); required variable names are listed in
+  `.env.example`.

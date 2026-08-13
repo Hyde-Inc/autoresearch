@@ -133,7 +133,7 @@ class TurnRenderer:
     def on_content(self, token: str) -> None:
         self._start()
         if self.mode != "content":
-            self.console.print(f"\n\n[bold cyan]{self.speaker}[/bold cyan]")
+            self.console.print(f"\n\n[bold blue]{self.speaker}[/bold blue]")
             self.mode = "content"
             self._live = Live(
                 Markdown(""),
@@ -215,7 +215,7 @@ def _read_line(console: Console, completions: Sequence[tuple[str, str]] | None) 
             raise
         except Exception:  # noqa: BLE001, S110 - no usable tty; fall back to plain input
             pass
-    return console.input("[dim]\u2502[/dim] [bold]>[/bold] ")
+    return console.input("[dim]\u2502[/dim] [bold grey19]>[/bold grey19] ")
 
 
 def input_box(console: Console, completions: Sequence[tuple[str, str]] | None = None) -> str:

@@ -80,6 +80,24 @@ def _push_head(worktree: Path, branch: str, *, force: bool) -> bool:
     return True
 
 
+def _ensure_output_branch(config: TaskConfig, branch: str) -> None:
+    """Pre-create the forecasts branch from the main branch's transaction.
+
+    On a brand-new branch the output dataset does not exist, so Foundry deems a
+    build warranted immediately and runs it with the main branch's job spec
+    (via fallbackBranches) *before* the experiment's own transform publishes -
+    silently producing baseline forecasts. Seeding the branch with the main
+    branch's data makes Foundry report ``BuildTargetsUpToDate`` until the
+    branch's own spec is live, exactly like pushes to the main branch."""
+    fdry = config.foundry
+    assert fdry is not None
+    rid = fdry.datasets.forecasts
+    if foundry.get_branch(rid, branch) is not None:
+        return
+    main = foundry.get_branch(rid, fdry.branch) or {}
+    foundry.create_branch(rid, branch, transaction_rid=main.get("transactionRid"))
+
+
 def _start_build(
     config: TaskConfig,
     branch: str,
@@ -188,6 +206,8 @@ def _train_on_foundry(
         if on_progress is not None:
             on_progress(f"pushing code to Foundry branch {branch}")
         expect_new_code = _push_head(worktree, branch, force=branch != fdry.branch)
+    if branch != fdry.branch:
+        _ensure_output_branch(config, branch)
     started = time.monotonic()
     build_rid = _start_build(config, branch, expect_new_code=expect_new_code, on_progress=on_progress)
     if build_rid is not None:

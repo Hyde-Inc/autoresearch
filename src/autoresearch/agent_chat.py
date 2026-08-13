@@ -110,12 +110,12 @@ class RoundChat:
         """Blocking chat loop; an empty reply (or Ctrl-C) returns to the dashboard."""
         console.print()
         console.print(
-            "[bold cyan]Round chat[/bold cyan] - the agents keep running. "
+            "[bold blue]Round chat[/bold blue] - the agents keep running. "
             "Ask what is happening; press Enter on an empty line to go back."
         )
         while True:
             try:
-                question = console.input("\n[bold]chat >[/bold] ").strip()
+                question = console.input("\n[bold grey19]chat >[/bold grey19] ").strip()
             except (EOFError, KeyboardInterrupt):
                 return
             if not question or question.lower() in {"back", "exit", "quit"}:

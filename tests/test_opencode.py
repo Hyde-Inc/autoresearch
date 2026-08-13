@@ -219,6 +219,10 @@ def test_resume_reuses_the_session_and_the_persistent_data_dir(
     assert "--title" in first_args and "--session" not in first_args
     assert "--session" in second_args and "--title" not in second_args
     assert second_args[second_args.index("--session") + 1] == "ses_test01"
+    # The project directory is pinned; opencode must not walk up out of the
+    # worktree and resolve an enclosing repository as the project root.
+    for args in (first_args, second_args):
+        assert args[args.index("--dir") + 1] == str(tmp_path)
     # Both calls ran against the same caller-owned session store, which survives.
     homes = {
         (tmp_path / f"data-home-{index}.txt").read_text().strip() for index in (1, 2)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -14,7 +15,6 @@ from rich.table import Table
 
 from .chat import input_box
 from .config import load_config
-from .costs import format_cost
 from .director import openrouter_client
 from .doctor import run_checks
 from .foundry import FoundryError, parse_dataset_reference, read_dataset
@@ -27,9 +27,10 @@ from .report import build_report
 from .skills import load_skills
 from .slash import SessionSettings, parse_reply, print_help
 from .store import RunStore, latest_run
+from .ui import THEME
 
 app = typer.Typer(no_args_is_help=True, help="Parallel autonomous ML experimentation.")
-console = Console()
+console = Console(theme=THEME)
 ConfigOption = Annotated[
     Path, typer.Option("--config", "-c", exists=True, dir_okay=False, help="Task YAML")
 ]
@@ -63,7 +64,7 @@ def _print_quality_gate(preview: Preview) -> None:
             f"({preview.dropped_pct:.1f}%) dropped during cleaning[/{drop_style}]"
         )
     for warning in preview.warnings:
-        console.print(f"[yellow]! {warning}[/yellow]")
+        console.print(f"[dark_orange3]! {warning}[/dark_orange3]")
 
 
 def _store_from(run_dir: Path | None, config: Path | None = None) -> RunStore:
@@ -73,7 +74,8 @@ def _store_from(run_dir: Path | None, config: Path | None = None) -> RunStore:
         cfg = load_config(config)
         found = latest_run(cfg.resolve(cfg.workspace.runs), cfg.name)
     else:
-        found = latest_run(Path("runs"))
+        # `start`-created tasks keep runs under the hidden .autoresearch/runs.
+        found = latest_run(Path("runs")) or latest_run(Path(".autoresearch/runs"))
     if found is None:
         raise typer.BadParameter("no run found; pass --run-dir")
     return RunStore(found)
@@ -106,7 +108,7 @@ def run(
             max_cost=max_cost,
         )
     )
-    console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
+    console.print(f"Run complete: [bold grey19]{store.run_dir}[/bold grey19]")
 
 
 @app.command(name="foundry-setup")
@@ -123,6 +125,24 @@ def foundry_setup(
     n_days: Annotated[int, typer.Option(min=60)] = 210,
     validation_days: Annotated[int, typer.Option(min=1)] = 28,
     holdout_days: Annotated[int, typer.Option(min=1)] = 28,
+    dataset: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--dataset",
+            help=(
+                "Use an EXISTING dataset instead of provisioning synthetic data, as "
+                "key=RID (repeatable). Keys: sales_train, forecast_request, "
+                "validation_actuals, holdout_actuals (required); sales_raw, forecasts, "
+                "evaluation_metrics (optional - outputs are created if missing)."
+            ),
+        ),
+    ] = None,
+    id_col: Annotated[str, typer.Option(help="Item/series id column name")] = "sku_id",
+    date_col: Annotated[str, typer.Option(help="Date column name")] = "date",
+    target_col: Annotated[str, typer.Option(help="Target column name")] = "units_sold",
+    metric_name: Annotated[
+        str, typer.Option("--metric", help="Primary metric: wmape, mape, rmse, or bias_pct")
+    ] = "wmape",
     write_config: Annotated[
         Path, typer.Option(help="Where to write the runtime: foundry task.yaml")
     ] = Path("foundry-task.yaml"),
@@ -132,16 +152,17 @@ def foundry_setup(
 ) -> None:
     """Install autoresearch into a Foundry transforms repo, end to end.
 
-    Reads the repo's own gradle.properties for its identity, provisions the five
-    datasets, scaffolds the baseline transform + AUTORESEARCH.md contract +
-    curated dependencies into the repo, pushes it so Foundry publishes the
-    baseline, and writes a ``runtime: foundry`` task.yaml. After this,
+    Reads the repo's own gradle.properties for its identity, provisions the
+    pipeline datasets (or wires into existing ones via --dataset key=RID),
+    scaffolds the pipeline transforms + AUTORESEARCH.md contract + curated
+    dependencies into the repo, pushes it so Foundry publishes the baseline,
+    and writes a ``runtime: foundry`` task.yaml. After this,
     ``autoresearch run -c foundry-task.yaml`` runs the whole loop autonomously.
     """
     import yaml
 
     from . import foundry_setup as setup
-    from .foundry import resolve_parent_folder
+    from .foundry import ensure_dataset, ensure_folder, resolve_parent_folder
     from .foundry_build import FoundryBuildError, push_repo
 
     _load_env()
@@ -162,41 +183,85 @@ def foundry_setup(
     if not project:
         raise typer.BadParameter("could not resolve the project folder; pass --project-folder-rid")
 
-    console.print("[bold]Generating synthetic demand history[/bold]")
-    history = setup.generate_history(n_skus=n_skus, n_days=n_days)
-    frames = setup.chronological_split(
-        history, validation_days=validation_days, holdout_days=holdout_days
-    )
-    summary = Table(title="Chronological split", show_edge=False)
-    summary.add_column("Split")
-    summary.add_column("Rows", justify="right")
-    for key in ("sales_train", "validation_actuals", "holdout_actuals", "forecast_request"):
-        summary.add_row(key, f"{len(frames[key]):,}")
-    console.print(summary)
+    if dataset:
+        # Existing-data mode: no synthetic generation, no uploads. Wire the
+        # transforms straight to the given RIDs; only missing outputs are created.
+        rids: dict[str, str] = {}
+        for entry in dataset:
+            key, _, rid = entry.partition("=")
+            if key not in setup.DATASET_NAMES or not rid:
+                raise typer.BadParameter(
+                    f"--dataset '{entry}' must be key=RID with key one of "
+                    f"{', '.join(setup.DATASET_NAMES)}"
+                )
+            rids[key] = rid
+        required = ("sales_train", "forecast_request", "validation_actuals", "holdout_actuals")
+        missing = [key for key in required if key not in rids]
+        if missing:
+            raise typer.BadParameter(f"--dataset missing required keys: {', '.join(missing)}")
+        try:
+            folder = ensure_folder(setup.FOLDER, project)
+            for key in ("forecasts", "evaluation_metrics"):
+                if key not in rids:
+                    rids[key] = ensure_dataset(setup.DATASET_NAMES[key], folder)
+                    console.print(f"  created output dataset {key}: {rids[key]}")
+        except FoundryError as exc:
+            console.print(f"[red]Foundry setup failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        datasets_config = {key: rids.get(key, "") for key in setup.CONFIG_DATASET_KEYS}
+        refs = dict(rids)
+        data_home = "existing project datasets, wired by RID"
+    else:
+        console.print("[bold grey19]Generating synthetic demand history[/bold grey19]")
+        history = setup.generate_history(n_skus=n_skus, n_days=n_days)
+        frames = setup.chronological_split(
+            history, validation_days=validation_days, holdout_days=holdout_days
+        )
+        # The raw feed is the dirty version of the train split: the on-Foundry
+        # data_preprocessing stage cleans it back into sales_train.
+        frames["sales_raw"] = setup.make_raw(frames["sales_train"])
+        summary = Table(title="Chronological split", show_edge=False)
+        summary.add_column("Split")
+        summary.add_column("Rows", justify="right")
+        for key in ("sales_raw", "validation_actuals", "holdout_actuals", "forecast_request"):
+            summary.add_row(key, f"{len(frames[key]):,}")
+        console.print(summary)
 
-    console.print(f"[bold]Provisioning datasets under[/bold] {datasets_path}")
-    try:
-        result = setup.provision(frames, project_folder_rid=project, branch=branch)
-    except FoundryError as exc:
-        console.print(f"[red]Foundry setup failed:[/red] {exc}")
-        raise typer.Exit(1) from exc
+        console.print(f"[bold grey19]Provisioning datasets under[/bold grey19] {datasets_path}")
+        try:
+            result = setup.provision(frames, project_folder_rid=project, branch=branch)
+        except FoundryError as exc:
+            console.print(f"[red]Foundry setup failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        datasets_config = setup.result_as_config(result)
+        refs = setup.default_refs(datasets_path)
+        data_home = f"under `{datasets_path}/`"
 
     table = Table(title="Foundry datasets", show_edge=False)
     table.add_column("Dataset")
     table.add_column("RID")
-    for key, rid in setup.result_as_config(result).items():
-        table.add_row(key, rid)
+    for key, rid in datasets_config.items():
+        if rid:
+            table.add_row(key, rid)
     console.print(table)
 
-    console.print("[bold]Scaffolding the repo[/bold]")
-    transform_rel, actions = setup.scaffold(repo, datasets_path, branch)
+    console.print("[bold grey19]Scaffolding the repo[/bold grey19]")
+    transform_rel, actions = setup.scaffold(
+        repo,
+        refs,
+        branch,
+        id_col=id_col,
+        date_col=date_col,
+        target_col=target_col,
+        data_home=data_home,
+    )
     for action in actions:
         console.print(f"  {action}")
 
     if no_push:
-        console.print("[yellow]--no-push: remember to push before running[/yellow]")
+        console.print("[dark_orange3]--no-push: remember to push before running[/dark_orange3]")
     else:
-        console.print(f"[bold]Pushing to Foundry[/bold] ({branch}) so the baseline publishes")
+        console.print(f"[bold grey19]Pushing to Foundry[/bold grey19] ({branch}) so the baseline publishes")
         try:
             push_repo(repo, branch=branch, message="autoresearch: install baseline transform")
         except FoundryBuildError as exc:
@@ -205,11 +270,14 @@ def foundry_setup(
 
     task = {
         "name": "foundry-demand-forecasting",
-        "goal": "Reduce validation WMAPE on the Foundry demand dataset.",
+        "goal": f"Reduce validation {metric_name.upper()} on the Foundry demand dataset.",
         "runtime": "foundry",
-        "metric": {"name": "wmape", "direction": "min"},
-        "data": {"id_column": "sku_id", "date_column": "date", "target_column": "units_sold"},
-        "agents": {"count": 3},
+        "metric": {"name": metric_name, "direction": "min"},
+        "data": {"id_column": id_col, "date_column": date_col, "target_column": target_col},
+        # Foundry sessions are slower per iteration (publish + build) and the
+        # transforms repos are larger to explore, so give coding sessions more
+        # headroom than the local defaults while keeping spend bounded.
+        "agents": {"count": 3, "timeout_s": 1500, "budget_s": 3000},
         "budget": {"rounds": 3, "max_experiments": 9},
         "workspace": {
             "seed": str(repo),
@@ -221,13 +289,13 @@ def foundry_setup(
             "branch": branch,
             "repo_rid": repo_rid,
             "project_folder_rid": project,
-            "datasets": setup.result_as_config(result),
+            "datasets": datasets_config,
         },
     }
     write_config = write_config.resolve()
     write_config.write_text(yaml.safe_dump(task, sort_keys=False))
     console.print(f"\n[green]Wrote task config:[/green] {write_config}")
-    console.print(f"Next: [bold]autoresearch run -c {write_config}[/bold]")
+    console.print(f"Next: [bold grey19]autoresearch run -c {write_config}[/bold grey19]")
 
 
 def _repo_rid_from_git(repo: Path) -> str:
@@ -257,6 +325,20 @@ def foundry_build_cmd(
     force: Annotated[
         bool, typer.Option("--force", help="Rebuild even if Foundry considers the output up to date")
     ] = False,
+    build_all: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Build the whole pipeline (preprocessing -> model -> evaluation), not just forecasts",
+        ),
+    ] = False,
+    no_wait: Annotated[
+        bool,
+        typer.Option(
+            "--no-wait",
+            help="Trigger the build and return immediately instead of polling to completion",
+        ),
+    ] = False,
     timeout_s: Annotated[
         int | None, typer.Option(min=1, help="Override the build timeout (seconds)")
     ] = None,
@@ -264,7 +346,9 @@ def foundry_build_cmd(
     """Push the transforms repo and trigger a Foundry build of the forecasts dataset.
 
     This is the manual 'train on Foundry' step: it publishes the current transform
-    code and runs a build on Foundry compute, then reports the result.
+    code and runs a build on Foundry compute, then reports the result. With
+    ``--all`` the build covers every pipeline output (Foundry runs the jobs in
+    dependency order): sales_train, forecasts, evaluation_metrics.
     """
     from .foundry_build import (
         FoundryBuildError,
@@ -278,25 +362,37 @@ def foundry_build_cmd(
     if cfg.runtime != "foundry" or cfg.foundry is None:
         raise typer.BadParameter("config is not runtime: foundry (run foundry-setup first)")
     fdry = cfg.foundry
-    target = fdry.datasets.forecasts
-    if not target:
+    if not fdry.datasets.forecasts:
         raise typer.BadParameter("foundry.datasets.forecasts RID is unset; run foundry-setup first")
+    targets = fdry.datasets.pipeline_targets() if build_all else [fdry.datasets.forecasts]
+    label = "full pipeline" if build_all else "forecasts"
     repo_dir = cfg.resolve(fdry.repo_dir)
 
     try:
         if not no_push:
-            console.print(f"[bold]Pushing[/bold] {repo_dir} → Foundry branch [cyan]{fdry.branch}[/cyan]")
+            console.print(f"[bold grey19]Pushing[/bold grey19] {repo_dir} → Foundry branch [blue]{fdry.branch}[/blue]")
             sha = push_repo(repo_dir, branch=fdry.branch, message=message)
             console.print(f"  pushed{f' commit {sha[:8]}' if sha else ' (nothing new to commit)'}")
-        console.print(f"[bold]Triggering build[/bold] of forecasts [dim]{target}[/dim]")
+        console.print(f"[bold grey19]Triggering build[/bold grey19] of {label} ({len(targets)} targets)")
 
         def on_wait(elapsed: float) -> None:
             console.print(f"  [{elapsed:6.0f}s] waiting for Foundry to publish the transform…")
 
         build_rid = create_build_when_ready(
-            [target], branch=fdry.branch, force=force, on_wait=on_wait
+            targets, branch=fdry.branch, force=force, on_wait=on_wait
         )
         console.print(f"  build {build_rid}")
+        if no_wait:
+            hostname = os.getenv("FOUNDRY_HOSTNAME", "").strip()
+            hostname = hostname.removeprefix("https://").removeprefix("http://").rstrip("/")
+            if hostname:
+                console.print(
+                    "  watch it live: "
+                    f"https://{hostname}/workspace/data-integration/dataset/preview/"
+                    f"{fdry.datasets.forecasts}/{fdry.branch}"
+                )
+            console.print("[green4]Build triggered[/green4] — running on Foundry now")
+            return
 
         def on_status(status: str, elapsed: float) -> None:
             console.print(f"  [{elapsed:6.0f}s] {status}")
@@ -307,7 +403,7 @@ def foundry_build_cmd(
             poll_s=fdry.poll_s,
             on_status=on_status,
         )
-        console.print(f"[green]Build {result.status}[/green] — forecasts written to {target}")
+        console.print(f"[green]Build {result.status}[/green] — {label} built")
     except (FoundryBuildError, FoundryError) as exc:
         console.print(f"[red]Foundry build failed:[/red] {exc}")
         raise typer.Exit(1) from exc
@@ -389,7 +485,7 @@ def resume(
             review=review_round,
         )
     )
-    console.print(f"Run complete: [bold]{completed.run_dir}[/bold]")
+    console.print(f"Run complete: [bold grey19]{completed.run_dir}[/bold grey19]")
 
 
 @app.command()
@@ -435,13 +531,13 @@ def ingest(
         raise typer.Exit(1) from None
 
     if rid:
-        console.print(f"Reading Foundry dataset [bold]{rid}[/bold]" + (f" ({branch})" if branch else ""))
+        console.print(f"Reading Foundry dataset [bold grey19]{rid}[/bold grey19]" + (f" ({branch})" if branch else ""))
         try:
             frame = read_dataset(rid, branch=branch)
         except FoundryError as exc:
             console.print(f"[red]x {exc}[/red]")
             raise typer.Exit(1) from None
-        console.print(f"Downloaded [bold]{len(frame)}[/bold] rows from Foundry")
+        console.print(f"Downloaded [bold grey19]{len(frame)}[/bold grey19] rows from Foundry")
     else:
         path = Path(source)
         if not path.is_file():
@@ -471,7 +567,7 @@ def ingest(
             console.print(f"[red]x {error}[/red]")
         raise typer.Exit(1)
     console.print(
-        f"Found [bold]{preview.rows}[/bold] clean rows, [bold]{preview.skus}[/bold] items, "
+        f"Found [bold grey19]{preview.rows}[/bold grey19] clean rows, [bold grey19]{preview.skus}[/bold grey19] items, "
         f"{preview.distinct_dates} dates ({preview.date_min} to {preview.date_max})"
     )
     if preview.dropped_pct > max_drop_pct:
@@ -550,13 +646,13 @@ def review_round(round_number: int, ideas: list[Idea], plan_path: Path) -> Revie
     console.print(table)
     console.print(
         Panel(
-            f"[bold]{plan_path}[/bold] (opened in your editor)\n"
+            f"[bold grey19]{plan_path}[/bold grey19] (opened in your editor)\n"
             "Edit the file freely - the edited file is exactly what runs.\n"
             "Reply [green]execute[/green] to launch, [red]stop[/red] to end the run, or "
             "give feedback to revise the plan.\n"
-            "While the round runs you get a live dashboard: [bold]1-9/arrows[/bold] select "
-            "an agent, [bold]x[/bold] cancels it (the others keep going), [bold]q[/bold] "
-            "stops the whole round, [bold]?[/bold] shows help.",
+            "While the round runs you get a live dashboard: [bold grey19]1-9/arrows[/bold grey19] select "
+            "an agent, [bold grey19]x[/bold grey19] cancels it (the others keep going), [bold grey19]q[/bold grey19] "
+            "stops the whole round, [bold grey19]?[/bold grey19] shows help.",
             title=f"Round {round_number} plan written",
         )
     )
@@ -581,14 +677,14 @@ def start(
     repo = (repo or Path(".")).resolve()
     settings = SessionSettings()
     session = SetupSession(openrouter_client(), console, settings=settings, repo=repo)
-    console.print(f"Project: [bold]{repo}[/bold]")
+    console.print(f"Project: [bold grey19]{repo}[/bold grey19]")
     console.print(
         Panel(
             "The Research Director surveys your project itself. Set what it needs with "
-            "slash commands or just say it - type [bold cyan]/[/bold cyan] to see the "
+            "slash commands or just say it - type [bold blue]/[/bold blue] to see the "
             "command menu:\n"
-            "  [bold cyan]/goal[/bold cyan] reduce wmape        "
-            "[bold cyan]/baseline[/bold cyan] models/arima.py\n"
+            "  [bold blue]/goal[/bold blue] reduce wmape        "
+            "[bold blue]/baseline[/bold blue] models/arima.py\n"
             "Once goal, baseline, and metric are settled it evaluates the baseline, opens "
             "a session folder like research/001-reduce-wmape/, and pops the round-1 plan "
             "open in your editor. You edit it, type execute, and the round runs. Each "
@@ -631,7 +727,7 @@ def start(
     except Exception as exc:  # noqa: BLE001 - CLI should show a concise failure
         console.print(f"[bold red]Research run failed:[/bold red] {exc}")
         raise typer.Exit(1) from None
-    console.print(f"Run complete: [bold]{store.run_dir}[/bold]")
+    console.print(f"Run complete: [bold grey19]{store.run_dir}[/bold grey19]")
 
 
 @app.command()
@@ -646,7 +742,7 @@ def validate(config: ConfigOption) -> None:
     console.print(f"validation={json.dumps(result.metrics, indent=2)}")
     console.print(f"holdout={json.dumps(result.holdout_metrics, indent=2)}")
     if result.guardrail_failures:
-        console.print(f"[yellow]Guardrail failures:[/yellow] {result.guardrail_failures}")
+        console.print(f"[dark_orange3]Guardrail failures:[/dark_orange3] {result.guardrail_failures}")
 
 
 @app.command()
@@ -667,7 +763,6 @@ def leaderboard(
         metric.upper(),
         "RMSE",
         "Holdout",
-        "Cost",
         "Promoted",
     ):
         table.add_column(column)
@@ -680,7 +775,6 @@ def leaderboard(
             f"{item.metrics.get(metric, float('nan')):.6f}",
             f"{item.metrics.get('rmse', float('nan')):.3f}",
             f"{item.holdout_metrics.get('wmape', float('nan')):.6f}",
-            format_cost(item.metadata.get("cost_usd", 0.0) or 0.0),
             "yes" if item.promoted else "",
         )
     console.print(table)
@@ -734,7 +828,11 @@ def doctor(
 ) -> None:
     """Check that tools and credentials needed to run research are in place."""
     _load_env()
-    symbols = {"ok": "[green]✓[/green]", "warn": "[yellow]![/yellow]", "fail": "[red]✗[/red]"}
+    symbols = {
+        "ok": "[green4]✓[/green4]",
+        "warn": "[dark_orange3]![/dark_orange3]",
+        "fail": "[red3]✗[/red3]",
+    }
     table = Table(title="autoresearch doctor", show_edge=False)
     table.add_column("")
     table.add_column("Check")

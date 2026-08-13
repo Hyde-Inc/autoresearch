@@ -26,7 +26,9 @@ def _agents() -> list[AgentStatus]:
 
 
 def _rendered(dashboard: AgentDashboard) -> str:
-    console = Console(width=140, file=io.StringIO(), legacy_windows=False)
+    # Explicit height too: rich only honors an explicit width unconditionally
+    # (e.g. under TERM=dumb in CI) when both dimensions are pinned.
+    console = Console(width=140, height=50, file=io.StringIO(), legacy_windows=False)
     with console.capture() as capture:
         console.print(dashboard.render())
     return capture.get()
@@ -49,7 +51,7 @@ def test_render_shows_rows_selection_detail_and_legend() -> None:
 
 def test_render_stays_within_narrow_cursor_terminal_width() -> None:
     buffer = io.StringIO()
-    console = Console(width=100, file=buffer, legacy_windows=False)
+    console = Console(width=100, height=50, file=buffer, legacy_windows=False)
     dashboard = AgentDashboard(
         console,
         "Round 1 · baseline WMAPE 0.1039 · 3 agents",

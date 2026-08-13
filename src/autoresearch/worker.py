@@ -13,6 +13,7 @@ from .agent_status import COMMITTING, EVALUATING, EXPLORING, SETTING_UP, TRAININ
 from .config import TaskConfig
 from .harness import Evaluation, evaluate_validation
 from .harness_foundry import evaluate_validation as foundry_evaluate_validation
+from .ingest import _OPENCODE_JSON
 from .metrics import load_task_spec
 from .models import Idea
 from .opencode import OpenCodeResult, run_opencode
@@ -94,7 +95,10 @@ def _prompt_rules(config: TaskConfig) -> str:
         "forecasting logic. Do not run training or install packages yourself; only the "
         "libraries pinned in the repo's conda recipe are available on Foundry. After your "
         "reply ends, the orchestrator pushes your code to Foundry, builds it there on the "
-        "real data, and reports the score back into this conversation. Do not ask "
+        "real data, and reports the score back into this conversation. Everything you "
+        "need is inside this working directory - never read parent directories or "
+        "autoresearch run artifacts (runs/, research/, .autoresearch*); they are outputs "
+        "of other experiments and reading them wastes session budget. Do not ask "
         "questions. Do not commit changes."
     )
 
@@ -267,6 +271,16 @@ async def run_worker(
             f"```python\n{spec.code}\n```\n"
         )
     (worktree / "EXPERIMENT.md").write_text(experiment)
+    # Confine the agent to its worktree. Local seeds carry a tracked
+    # opencode.json with external_directory=deny; a Foundry transforms repo
+    # does not, and the worktree sits inside the run store - without this the
+    # agent can wander up into runs/ and read old runs and sibling agents'
+    # worktrees, burning session budget. Untracked, so (like EXPERIMENT.md)
+    # it is never snapshotted or pushed.
+    permissions_path = worktree / "opencode.json"
+    wrote_permissions = not permissions_path.exists()
+    if wrote_permissions:
+        permissions_path.write_text(_OPENCODE_JSON)
     entry = _entry_path(config)
     trains_where = (
         "the orchestrator PUSHES it to Foundry, BUILDS it there on the real data"
@@ -422,6 +436,8 @@ async def run_worker(
         await _run("git", "reset", "--hard", best_commit, cwd=worktree)
         head = best_commit
     (worktree / "EXPERIMENT.md").unlink(missing_ok=True)
+    if wrote_permissions:
+        permissions_path.unlink(missing_ok=True)
     (worktree / config.data.output).unlink(missing_ok=True)
     phase(COMMITTING, "reviewing changes")
     _, porcelain = await _run("git", "status", "--porcelain", cwd=worktree)
