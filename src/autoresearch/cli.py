@@ -147,13 +147,13 @@ def _print_run_summary(store: RunStore) -> None:
         delta = f"[{color}]{improvement:+.2f}%[/{color}]"
 
     lines = [
-        f"[bold]{summary['task']}[/bold]  ·  {counts['completed']} experiments"
-        f" over {summary['rounds'] or '?'} round(s)",
+        (f"[bold]{summary['task']}[/bold]  ·  {counts['completed']} experiments"
+         f" over {summary['rounds'] or '?'} round(s)"),
         "",
         f"{metric.upper()}: baseline {_fmt(baseline)} → final {_fmt(final)}  ({delta})",
-        f"Passed {counts['passed']} · promoted {counts['promoted']} · "
-        f"rejected {counts['rejected']} · failed {counts['failed']} · "
-        f"cancelled {counts['cancelled']}",
+        (f"Passed {counts['passed']} · promoted {counts['promoted']} · "
+         f"rejected {counts['rejected']} · failed {counts['failed']} · "
+         f"cancelled {counts['cancelled']}"),
         f"Model spend: {format_cost(summary['total_cost_usd'])}",
     ]
     best = summary["best_attempt"]
