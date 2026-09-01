@@ -20,7 +20,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import Attempt, Idea
+from .models import AnalysisRecord, Attempt, Evidence, Idea
 
 # Frontmatter keys the human may edit that flow back into the run.
 OVERRIDE_KEYS = ("goal", "metric", "n_agents", "guardrails", "timeout_s", "budget_s")
@@ -144,6 +144,114 @@ def refresh_session_readme(session_dir: Path) -> Path:
     return destination
 
 
+def _evidence_line(item: Evidence) -> str:
+    observation = item.observation.strip()
+    if item.kind == "analysis":
+        return f"- {observation} — analysis [{item.source}]" if item.source else f"- {observation}"
+    if item.kind == "skill":
+        return f"- {observation} — skill {item.source}"
+    if item.kind == "prior_attempt":
+        return f"- {observation} — prior attempt {item.source}"
+    return f"- {observation} — user context"
+
+
+_EVIDENCE_TAIL = re.compile(
+    r"\s+—\s+(?:analysis\s*\[(?P<analysis>[^\]]+)\]|skill\s+(?P<skill>.+)"
+    r"|prior attempt\s+(?P<attempt>.+)|user context)\s*$"
+)
+
+
+def _parse_evidence(body: str) -> list[Evidence]:
+    """Read '### Why this idea' bullets back into Evidence, tolerating edits:
+    a bullet without a recognizable source tail becomes a plain observation."""
+    match = re.search(
+        r"^###\s*Why this idea\s*\n(.*?)(?=^###\s|\Z)", body, re.MULTILINE | re.DOTALL
+    )
+    if not match:
+        return []
+    items: list[Evidence] = []
+    for line in match.group(1).splitlines():
+        text = line.strip().lstrip("-").strip()
+        if not text:
+            continue
+        tail = _EVIDENCE_TAIL.search(text)
+        if tail is None:
+            items.append(Evidence(kind="analysis", observation=text))
+        elif tail.group("analysis"):
+            items.append(
+                Evidence(
+                    kind="analysis",
+                    source=tail.group("analysis").strip(),
+                    observation=text[: tail.start()].strip(),
+                )
+            )
+        elif tail.group("skill"):
+            items.append(
+                Evidence(
+                    kind="skill",
+                    source=tail.group("skill").strip(),
+                    observation=text[: tail.start()].strip(),
+                )
+            )
+        elif tail.group("attempt"):
+            items.append(
+                Evidence(
+                    kind="prior_attempt",
+                    source=tail.group("attempt").strip(),
+                    observation=text[: tail.start()].strip(),
+                )
+            )
+        else:
+            items.append(Evidence(kind="user_context", observation=text[: tail.start()].strip()))
+    return items
+
+
+def _format_value(value: object) -> str:
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+_MAX_TABLE_ROWS = 20
+
+
+def _rows_table(rows: list[dict]) -> list[str]:
+    columns: list[str] = []
+    for row in rows:
+        columns += [key for key in row if key not in columns]
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "|" + "---|" * len(columns),
+    ]
+    for row in rows[:_MAX_TABLE_ROWS]:
+        lines.append("| " + " | ".join(_format_value(row.get(c, "")) for c in columns) + " |")
+    if len(rows) > _MAX_TABLE_ROWS:
+        lines.append(f"| ... {len(rows) - _MAX_TABLE_ROWS} more rows ... " + "|" * len(columns))
+    return lines
+
+
+def _render_analysis_result(result: dict) -> list[str]:
+    """Compact, generic markdown rendering of one tool result: scalar values as
+    bullets, dicts of dicts and lists of dicts as tables (the example cases)."""
+    lines: list[str] = []
+    for key, value in result.items():
+        if isinstance(value, dict) and value and all(
+            isinstance(item, dict) for item in value.values()
+        ):
+            rows = [{"": name, **item} for name, item in value.items()]
+            lines += [f"{key}:", "", *_rows_table(rows), ""]
+        elif isinstance(value, dict):
+            inline = ", ".join(f"{k}={_format_value(v)}" for k, v in value.items())
+            lines.append(f"- {key}: {inline}")
+        elif isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+            lines += [f"{key}:", "", *_rows_table(value), ""]
+        elif isinstance(value, list):
+            lines.append(f"- {key}: {', '.join(_format_value(item) for item in value)}")
+        else:
+            lines.append(f"- {key}: {_format_value(value)}")
+    return lines
+
+
 def render_plan(
     *,
     round_number: int,
@@ -155,7 +263,7 @@ def render_plan(
     guardrails: list[str] | None = None,
     timeout_s: int | None = None,
     budget_s: int | None = None,
-    analysis: list[str] | None = None,
+    analysis: list[AnalysisRecord | str] | None = None,
 ) -> str:
     frontmatter = {
         "round": round_number,
@@ -179,10 +287,6 @@ def render_plan(
         "the frontmatter. The edited file is exactly what runs when you type `execute`.",
         "",
     ]
-    if analysis:
-        lines += ["## Director's analysis", ""]
-        lines += [f"- {item}" for item in analysis]
-        lines.append("")
     for index, idea in enumerate(ideas, 1):
         lines += [
             f"## Experiment {index}: {idea.title}",
@@ -190,6 +294,12 @@ def render_plan(
             f"- category: {idea.category}",
             f"- skills: {', '.join(idea.skills_used) or 'none'}",
             "",
+        ]
+        if idea.evidence:
+            lines += ["### Why this idea", ""]
+            lines += [_evidence_line(item) for item in idea.evidence]
+            lines.append("")
+        lines += [
             "### Hypothesis",
             "",
             idea.hypothesis.strip(),
@@ -199,6 +309,21 @@ def render_plan(
             idea.instructions.strip(),
             "",
         ]
+    if analysis:
+        lines += [
+            "## Analysis appendix",
+            "",
+            "Verbatim outputs of the analyses the director ran while designing this",
+            "round. 'Why this idea' bullets cite these by id.",
+            "",
+        ]
+        for record in analysis:
+            if isinstance(record, str):
+                lines.append(f"- {record}")
+                continue
+            lines += [f"### {record.id} — {record.signature()}", ""]
+            lines += _render_analysis_result(record.result)
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -245,6 +370,7 @@ def _parse_experiment(heading: str, body: str) -> Idea:
         instructions=instructions,
         category=category,
         skills_used=skills,
+        evidence=_parse_evidence(body),
     )
 
 

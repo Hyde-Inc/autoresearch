@@ -10,7 +10,7 @@ from openai import OpenAI
 from . import eda, evals
 from .config import TaskConfig
 from .metrics import load_task_spec
-from .models import Attempt, Idea
+from .models import AnalysisRecord, Attempt, Idea, filter_evidence
 from .skills import (
     SkillSelection,
     load_skills,
@@ -114,7 +114,7 @@ class ResearchDirector:
         )
         self.skills = load_skills(config)
         self.last_skill_selection = SkillSelection()
-        self.last_analysis: list[str] = []
+        self.last_analysis: list[AnalysisRecord] = []
 
     async def _json_completion(self, system: str, user: str) -> dict:
         def call() -> dict:
@@ -237,13 +237,20 @@ class ResearchDirector:
                     except json.JSONDecodeError:
                         arguments = {}
                     result = self._run_analysis_tool(store, tool_call.function.name, arguments)
-                    rendered = ", ".join(f"{k}={v}" for k, v in arguments.items())
-                    self.last_analysis.append(f"{tool_call.function.name}({rendered})")
+                    record = AnalysisRecord(
+                        id=f"A{len(self.last_analysis) + 1}",
+                        tool=tool_call.function.name,
+                        arguments=arguments,
+                        result=result,
+                    )
+                    self.last_analysis.append(record)
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": json.dumps(result),
+                            "content": json.dumps(
+                                {"analysis_id": record.id, "result": result}
+                            ),
                         }
                     )
             messages.append(
@@ -320,13 +327,21 @@ class ResearchDirector:
             "respect runtime and metric guardrails. Every idea must be standalone and implementable "
             "using only installed dependencies. Agents can edit only solution/. Use the supplied "
             "forecasting skills as decision guidance. Return strict JSON with key 'ideas', an "
-            "array of objects with exactly: title, hypothesis, instructions, category, skills_used. "
-            "skills_used must contain only selected skill names."
+            "array of objects with exactly: title, hypothesis, instructions, category, skills_used, "
+            "evidence. skills_used must contain only selected skill names. evidence shows the user "
+            "why the idea came to mind: an array of objects with kind, source, and observation. "
+            "kind is one of 'analysis' (source is an analysis_id such as A2 from a tool result you "
+            "actually received), 'skill' (source is a selected skill name), 'prior_attempt' "
+            "(source is a prior attempt title), or 'user_context' (source may be empty). "
+            "observation is one short concrete sentence quoting the specific numbers, cases, or "
+            "guidance that motivated the idea. Cite only sources that exist; every idea needs at "
+            "least one evidence entry."
         )
         if store is not None:
             system += (
                 " Before answering you may call the analysis tools to study the training data "
-                "and where scored attempts made their errors; ground your ideas in what you find."
+                "and where scored attempts made their errors; ground your ideas in what you find. "
+                "Each tool result carries an analysis_id you must use when citing it as evidence."
             )
         spec = load_task_spec(self.config)
         metric_context = f" Definition: {spec.understanding}" if spec else ""
@@ -363,7 +378,11 @@ class ResearchDirector:
                 "Revise the proposal accordingly - keep what the reviewer liked, change or "
                 "replace what they pushed back on."
             )
-        if store is not None:
+        # The pinned opening round is optimised for fast feedback: skills are
+        # already chosen and there are no scored attempts to analyse, so skip the
+        # multi-round EDA tool loop and generate the ideas in a single call.
+        # Later rounds keep the full analysis so ideas stay grounded in results.
+        if store is not None and not pinned:
             frames = store.list_validation_frames()
             user += (
                 f"\n\nAttempts with stored validation forecasts for analyze_errors/"
@@ -373,8 +392,10 @@ class ResearchDirector:
         else:
             payload = await self._json_completion(system, user)
         ideas = [Idea.model_validate(item) for item in payload.get("ideas", [])]
+        analysis_ids = {record.id for record in self.last_analysis}
         for idea in ideas:
             idea.skills_used = [name for name in idea.skills_used if name in selected_names]
+            filter_evidence(idea, analysis_ids, selected_names)
         if len(ideas) < minimum:
             raise RuntimeError(f"director returned {len(ideas)} ideas; expected at least {minimum}")
         return ideas[:maximum]

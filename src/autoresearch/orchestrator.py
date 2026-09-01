@@ -227,8 +227,8 @@ async def _execute_attempt(
 def _print_director_findings(director: ResearchDirector) -> None:
     if director.last_analysis:
         console.print("[bold grey19]Director analyzed the data and errors[/bold grey19]")
-        for line in director.last_analysis:
-            console.print(f"  {line}")
+        for record in director.last_analysis:
+            console.print(f"  {record.id}: {record.signature()}")
     if director.last_skill_selection.selected:
         console.print("[bold grey19]Director consulted skills[/bold grey19]")
         for selected in director.last_skill_selection.selected:
@@ -560,8 +560,25 @@ async def run_research(
             round_number += 1
             count = min(parallel, maximum - completed)
             notes = store.notes_file.read_text() if store.notes_file.exists() else ""
-            if round_number == 1 and initial_ideas:
-                ideas = initial_ideas[:count]
+            # Pre-seeded opening-round ideas (from the interview, or pinned in the
+            # task config) skip director generation entirely for round 1.
+            seeded = initial_ideas
+            from_config = False
+            if round_number == 1 and not seeded and config.opening_round.ideas:
+                seeded = config.opening_round.ideas
+                from_config = True
+            if round_number == 1 and seeded:
+                if from_config and config.opening_round.think_seconds > 0:
+                    # Cosmetic pause so the director's 'thinking' shows briefly
+                    # before the pre-seeded plan appears.
+                    with Activity(console, f"Director designing round {round_number}"):
+                        await asyncio.sleep(config.opening_round.think_seconds)
+                if from_config:
+                    console.print(
+                        f"[bold grey19]Opening round[/bold grey19]: using "
+                        f"{len(config.opening_round.ideas)} pre-seeded ideas from the task config"
+                    )
+                ideas = seeded[:count]
                 plan_file = initial_plan_path
             else:
                 ideas, plan_file = await _propose_round(

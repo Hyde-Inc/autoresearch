@@ -31,7 +31,7 @@ from .config import DEFAULT_MODEL, TaskConfig, load_config
 from .discover import read_repo_file, render_inventory, repo_inventory
 from .editor import open_in_editor
 from .metrics import MetricInterpreter, MetricSpec, MetricValidation, adopt_spec, eval_columns
-from .models import Idea
+from .models import AnalysisRecord, Idea, filter_evidence
 from .orchestrator import validate_baseline
 from .plans import (
     PlanError,
@@ -156,8 +156,30 @@ _IDEA_SCHEMA = {
             "instructions": {"type": "string"},
             "category": {"type": "string"},
             "skills_used": {"type": "array", "items": {"type": "string"}},
+            "evidence": {
+                "type": "array",
+                "description": "Why this idea came to mind, each entry citing a real "
+                "source: an analysis_id (A1, A2, ...) from explore_data or "
+                "evaluate_baseline results, a skill name, or something the user said.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["analysis", "skill", "prior_attempt", "user_context"],
+                        },
+                        "source": {"type": "string"},
+                        "observation": {
+                            "type": "string",
+                            "description": "One short concrete sentence with the specific "
+                            "numbers, cases, or guidance that motivated the idea",
+                        },
+                    },
+                    "required": ["kind", "observation"],
+                },
+            },
         },
-        "required": ["title", "hypothesis", "instructions"],
+        "required": ["title", "hypothesis", "instructions", "evidence"],
     },
 }
 
@@ -342,6 +364,7 @@ class SetupSession:
         self.skills: list[ResearchSkill] = load_skills(self.config)
         self.pending_spec: MetricSpec | None = None
         self.final_ideas: list[Idea] | None = None
+        self.analysis_log: list[AnalysisRecord] = []
         self.survey: str | None = cached_survey(self.repo)
         self.session_dir: Path | None = None
         self.plan_path: Path | None = None
@@ -431,7 +454,11 @@ class SetupSession:
                 f"   f. Propose exactly {self.settings.n_agents} round-1 experiment(s), "
                 "each a single testable change, citing which skills informed it, and call "
                 "write_plan with the ideas (fields: title, hypothesis, instructions, "
-                "category, skills_used). This saves the plan as an editable markdown file. "
+                "category, skills_used, evidence). evidence shows the user why each idea "
+                "came to mind: cite the analysis_id (A1, A2, ...) that explore_data and "
+                "evaluate_baseline results carry, or a skill name, each with one concrete "
+                "observation (specific numbers or guidance). Cite only analyses you "
+                "actually ran. This saves the plan as an editable markdown file. "
                 "After calling it, tell the user in one short message where the plan file "
                 "is and that they can edit it freely, then reply 'execute' to launch, give "
                 "feedback to revise, or 'stop'. Do not launch anything yourself - the "
@@ -470,7 +497,11 @@ class SetupSession:
                 f"4. Propose a round-1 plan of exactly {self.settings.n_agents} "
                 "experiment(s), each a single testable change, citing which skills informed "
                 "it, and call write_plan with the ideas (fields: title, hypothesis, "
-                "instructions, category, skills_used). Tell the user where the plan file "
+                "instructions, category, skills_used, evidence). evidence shows the user "
+                "why each idea came to mind: cite the analysis_id (A1, A2, ...) that "
+                "explore_data and evaluate_baseline results carry, or a skill name, each "
+                "with one concrete observation. Cite only analyses you actually ran. "
+                "Tell the user where the plan file "
                 "is; they edit it and reply 'execute' to launch, give feedback to revise "
                 "(call write_plan again), or 'stop'.\n\n"
                 f"Current task config:\n{self.config.config_path.read_text()}\n"
@@ -503,6 +534,17 @@ class SetupSession:
     def _tool_read_file(self, path: str) -> dict:
         return {"path": path, "content": read_repo_file(self.repo, path)}
 
+    def _record_analysis(self, tool: str, arguments: dict, result: dict) -> dict:
+        """Log a citable analysis record and hand its id back to the director,
+        so round-1 ideas can cite the exact output as evidence."""
+        if "error" in result:
+            return result
+        record = AnalysisRecord(
+            id=f"A{len(self.analysis_log) + 1}", tool=tool, arguments=arguments, result=result
+        )
+        self.analysis_log.append(record)
+        return {"analysis_id": record.id, "result": result}
+
     def _tool_explore_data(
         self,
         path: str,
@@ -516,22 +558,24 @@ class SetupSession:
             return {"error": f"path escapes the project: {path}"}
         frame = eda.load_table(target)
         if analysis == "profile":
-            return eda.profile(frame)
-        if analysis == "seasonality":
+            result = eda.profile(frame)
+        elif analysis == "seasonality":
             if not (date_column and target_column):
                 return {"error": "seasonality needs date_column and target_column"}
-            return eda.seasonality(frame, date_column, target_column)
-        if analysis == "intermittency":
+            result = eda.seasonality(frame, date_column, target_column)
+        elif analysis == "intermittency":
             if not (id_column and date_column and target_column):
                 return {"error": "intermittency needs id_column, date_column, target_column"}
-            return eda.intermittency(frame, id_column, date_column, target_column)
-        if analysis == "drivers":
+            result = eda.intermittency(frame, id_column, date_column, target_column)
+        elif analysis == "drivers":
             if not target_column:
                 return {"error": "drivers needs target_column"}
-            return eda.drivers(
+            result = eda.drivers(
                 frame, target_column, exclude=[c for c in (id_column, date_column) if c]
             )
-        return {"error": f"unknown analysis: {analysis}"}
+        else:
+            return {"error": f"unknown analysis: {analysis}"}
+        return self._record_analysis("explore_data", {"path": path, "analysis": analysis}, result)
 
     def _tool_prepare_workspace(
         self,
@@ -656,7 +700,11 @@ class SetupSession:
                 title="Protected baseline evaluation",
             )
         )
-        return {"validation": result.metrics, "holdout": result.holdout_metrics}
+        return self._record_analysis(
+            "evaluate_baseline",
+            {},
+            {"validation": result.metrics, "holdout": result.holdout_metrics},
+        )
 
     def _tool_record_context(self, text: str) -> dict:
         append_context(self._require_config(), text)
@@ -674,10 +722,12 @@ class SetupSession:
         if not ideas:
             return {"error": "provide at least one experiment idea"}
         known = {skill.name for skill in self.skills}
+        analysis_ids = {record.id for record in self.analysis_log}
         parsed = []
         for item in ideas:
             idea = Idea.model_validate(item)
             idea.skills_used = [name for name in idea.skills_used if name in known]
+            filter_evidence(idea, analysis_ids, known)
             parsed.append(idea)
         parsed = parsed[: self.settings.n_agents]
         if self.plan_path is None:
@@ -696,16 +746,22 @@ class SetupSession:
                 guardrails=config.guardrails,
                 timeout_s=self.settings.timeout_s,
                 budget_s=self.settings.budget_s,
+                analysis=list(self.analysis_log),
             )
         )
         refresh_session_readme(self.session_dir)
         opened = open_in_editor(self.plan_path)
         table = Table(title=f"Proposed round 1 ({len(parsed)} researches in parallel)")
-        for column in ("#", "Experiment", "Hypothesis", "Skills"):
+        for column in ("#", "Experiment", "Hypothesis", "Why", "Skills"):
             table.add_column(column)
         for index, idea in enumerate(parsed, 1):
+            why = "; ".join(item.observation for item in idea.evidence[:2])
             table.add_row(
-                str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-"
+                str(index),
+                idea.title,
+                idea.hypothesis,
+                why or "-",
+                ", ".join(idea.skills_used) or "-",
             )
         self.console.print(table)
         opened_note = "Opened in your editor.\n" if opened else ""

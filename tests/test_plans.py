@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from autoresearch.models import Attempt, Idea
+from autoresearch.models import AnalysisRecord, Attempt, Evidence, Idea
 from autoresearch.plans import (
     PlanError,
     findings_path,
@@ -53,6 +53,53 @@ def test_render_parse_roundtrip(tmp_path: Path) -> None:
     assert parsed.overrides["n_agents"] == 2
     assert parsed.overrides["timeout_s"] == 1200
     assert parsed.overrides["budget_s"] == 3600
+
+
+def test_evidence_renders_and_roundtrips_with_analysis_appendix(tmp_path: Path) -> None:
+    idea = _idea("Weekday profile", ["retail-demand-data"])
+    idea.evidence = [
+        Evidence(kind="analysis", source="A2", observation="Thu/Fri bias is about -25%"),
+        Evidence(kind="skill", source="retail-demand-data", observation="Playbook prefers weekday profiles on short history"),
+        Evidence(kind="prior_attempt", source="Global mean", observation="A flat mean ignored the weekend spike"),
+        Evidence(kind="user_context", observation="User said weekends behave differently"),
+    ]
+    records = [
+        AnalysisRecord(
+            id="A2",
+            tool="analyze_errors",
+            arguments={"attempt_id": "baseline"},
+            result={
+                "overall": {"wmape": 0.44, "bias_pct": -13.3},
+                "wmape_by_weekday": {"thu": {"wmape": 0.5, "bias_pct": -25.0}},
+                "worst": [{"item": "sku-1", "wmape": 1.05, "direction": "under"}],
+            },
+        )
+    ]
+    path = _write(tmp_path, [idea], goal="reduce wmape", metric="wmape", analysis=records)
+    text = path.read_text()
+    assert "### Why this idea" in text
+    assert "- Thu/Fri bias is about -25% — analysis [A2]" in text
+    assert "— skill retail-demand-data" in text
+    assert "## Analysis appendix" in text
+    assert "### A2 — analyze_errors(attempt_id=baseline)" in text
+    assert "| sku-1 | 1.05 | under |" in text  # verbatim example cases survive
+    parsed = parse_plan(path)
+    evidence = parsed.ideas[0].evidence
+    assert [item.kind for item in evidence] == ["analysis", "skill", "prior_attempt", "user_context"]
+    assert evidence[0].source == "A2"
+    assert evidence[0].observation == "Thu/Fri bias is about -25%"
+    assert evidence[1].source == "retail-demand-data"
+    assert evidence[2].source == "Global mean"
+    # Hypothesis and instructions still parse cleanly around the new section.
+    assert parsed.ideas[0].hypothesis == "Weekday profile should reduce error"
+    # A hand-added bullet without a source tail still parses as an observation.
+    edited = text.replace(
+        "- Thu/Fri bias is about -25% — analysis [A2]",
+        "- Thu/Fri bias is about -25% — analysis [A2]\n- my own hunch about promotions",
+    )
+    path.write_text(edited)
+    hunch = [e for e in parse_plan(path).ideas[0].evidence if "hunch" in e.observation]
+    assert hunch and hunch[0].source == ""
 
 
 def test_session_folders_are_numbered_and_named_after_the_goal(tmp_path: Path) -> None:

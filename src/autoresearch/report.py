@@ -1,9 +1,64 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from .costs import format_cost
 from .store import RunStore
+
+
+def summarize_run(run_dir: Path) -> dict[str, Any]:
+    """A compact, machine-readable snapshot of a run's outcome.
+
+    Shared by ``autoresearch report`` and the end-of-run summary so the terminal
+    panel and the ``--json`` payload never drift apart.
+    """
+    store = RunStore(run_dir)
+    state = store.load_state()
+    attempts = store.load_attempts()
+    metric = state.get("primary_metric", "wmape")
+    direction = state.get("metric_direction", "min")
+    baseline = (state.get("baseline") or {}).get(metric)
+    final = (state.get("incumbent") or {}).get(metric)
+    improvement = None
+    if baseline not in (None, 0) and final is not None:
+        improvement = (baseline - final) / baseline * 100
+        if direction == "max":
+            improvement = -improvement
+    total_cost = sum(item.metadata.get("cost_usd", 0.0) or 0.0 for item in attempts)
+    promoted = [item for item in attempts if item.promoted]
+    ranked = store.leaderboard(metric, direction)
+    best = ranked[0] if ranked else None
+    return {
+        "run_dir": str(store.run_dir),
+        "task": state.get("task", store.run_dir.name),
+        "goal": state.get("goal"),
+        "status": state.get("status"),
+        "rounds": state.get("round"),
+        "metric": metric,
+        "metric_direction": direction,
+        "baseline": baseline,
+        "final": final,
+        "improvement_pct": improvement,
+        "total_cost_usd": total_cost,
+        "counts": {
+            "completed": len(attempts),
+            "passed": sum(item.status == "passed" for item in attempts),
+            "rejected": sum(item.status == "rejected" for item in attempts),
+            "failed": sum(item.status == "failed" for item in attempts),
+            "cancelled": sum(item.status == "cancelled" for item in attempts),
+            "promoted": len(promoted),
+        },
+        "best_attempt": None
+        if best is None
+        else {
+            "id": best.id,
+            "title": best.idea.title,
+            "metric": best.metrics.get(metric),
+            "promoted": best.promoted,
+        },
+        "promoted": [{"id": item.id, "title": item.idea.title} for item in promoted],
+    }
 
 
 def build_report(run_dir: Path) -> str:
