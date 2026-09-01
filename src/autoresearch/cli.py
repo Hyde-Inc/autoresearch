@@ -13,8 +13,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from . import __version__
 from .chat import input_box
 from .config import load_config
+from .costs import format_cost
 from .director import openrouter_client
 from .doctor import run_checks
 from .foundry import FoundryError, parse_dataset_reference, read_dataset
@@ -23,7 +25,7 @@ from .interview import SetupSession, print_spec
 from .metrics import MetricInterpreter, adopt_spec, eval_columns
 from .models import Idea
 from .orchestrator import ReviewDecision, run_research, validate_baseline
-from .report import build_report
+from .report import build_report, summarize_run
 from .skills import load_skills
 from .slash import SessionSettings, parse_reply, print_help
 from .store import RunStore, latest_run
@@ -34,6 +36,48 @@ console = Console(theme=THEME)
 ConfigOption = Annotated[
     Path, typer.Option("--config", "-c", exists=True, dir_okay=False, help="Task YAML")
 ]
+
+
+class _State:
+    """Global flags shared across commands (set by the app-level callback)."""
+
+    def __init__(self) -> None:
+        self.json = False
+
+
+STATE = _State()
+
+
+def _emit_json(payload: object) -> None:
+    """Print a machine-readable JSON payload (used when ``--json`` is set)."""
+    console.print_json(json.dumps(payload, default=str))
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        console.print(f"autoresearch {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-V",
+            help="Show the autoresearch version and exit",
+            callback=_version_callback,
+            is_eager=True,
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON instead of tables"),
+    ] = False,
+) -> None:
+    """Parallel autonomous ML experimentation."""
+    STATE.json = json_output
 
 
 def _load_env() -> None:
@@ -81,6 +125,50 @@ def _store_from(run_dir: Path | None, config: Path | None = None) -> RunStore:
     return RunStore(found)
 
 
+def _print_run_summary(store: RunStore) -> None:
+    """End-of-run recap: outcome vs baseline, best attempt, spend, and paths."""
+    summary = summarize_run(store.run_dir)
+    if STATE.json:
+        _emit_json(summary)
+        return
+
+    metric = summary["metric"]
+    counts = summary["counts"]
+    baseline, final = summary["baseline"], summary["final"]
+    improvement = summary["improvement_pct"]
+
+    def _fmt(value: object) -> str:
+        return f"{value:.6f}" if isinstance(value, (int, float)) else "n/a"
+
+    if improvement is None:
+        delta = "[grey62]no baseline comparison[/grey62]"
+    else:
+        color = "green4" if improvement > 0 else "red3" if improvement < 0 else "grey62"
+        delta = f"[{color}]{improvement:+.2f}%[/{color}]"
+
+    lines = [
+        f"[bold]{summary['task']}[/bold]  ·  {counts['completed']} experiments"
+        f" over {summary['rounds'] or '?'} round(s)",
+        "",
+        f"{metric.upper()}: baseline {_fmt(baseline)} → final {_fmt(final)}  ({delta})",
+        f"Passed {counts['passed']} · promoted {counts['promoted']} · "
+        f"rejected {counts['rejected']} · failed {counts['failed']} · "
+        f"cancelled {counts['cancelled']}",
+        f"Model spend: {format_cost(summary['total_cost_usd'])}",
+    ]
+    best = summary["best_attempt"]
+    if best is not None:
+        star = " [green4]★ promoted[/green4]" if best["promoted"] else ""
+        lines.append(f"Best: [bold]{best['title']}[/bold] ({best['id']}) "
+                     f"{metric}={_fmt(best['metric'])}{star}")
+    lines.extend([
+        "",
+        f"[grey62]{store.run_dir}[/grey62]",
+        "[grey62]autoresearch report · autoresearch leaderboard[/grey62]",
+    ])
+    console.print(Panel("\n".join(lines), title="Run summary", border_style="grey42"))
+
+
 @app.command()
 def run(
     config: ConfigOption,
@@ -108,7 +196,7 @@ def run(
             max_cost=max_cost,
         )
     )
-    console.print(f"Run complete: [bold grey19]{store.run_dir}[/bold grey19]")
+    _print_run_summary(store)
 
 
 @app.command(name="foundry-setup")
@@ -430,6 +518,23 @@ def foundry_score_cmd(
     forecasts = read_dataset(fdry.datasets.forecasts, branch=fdry.branch)
     forecasts[d.date_column] = pd.to_datetime(forecasts[d.date_column], utc=True).dt.tz_localize(None)
 
+    def score(rid: str, label: str) -> dict[str, object]:
+        actuals = read_dataset(rid, branch=fdry.branch)
+        actuals[d.date_column] = pd.to_datetime(actuals[d.date_column], utc=True).dt.tz_localize(None)
+        merged = actuals.merge(forecasts[[*keys, "forecast"]], on=keys, validate="one_to_one")
+        met = forecasting_metrics(
+            merged[d.target_column].to_numpy(float), merged["forecast"].to_numpy(float)
+        )
+        return {"split": label, "rows": len(merged), **met}
+
+    results = [score(fdry.datasets.validation_actuals, "validation")]
+    if holdout:
+        results.append(score(fdry.datasets.holdout_actuals, "holdout"))
+
+    if STATE.json:
+        _emit_json(results)
+        return
+
     table = Table(title="Foundry evaluation", show_edge=False)
     table.add_column("Split")
     table.add_column("Rows", justify="right")
@@ -437,26 +542,15 @@ def foundry_score_cmd(
     table.add_column("mape", justify="right")
     table.add_column("rmse", justify="right")
     table.add_column("bias%", justify="right")
-
-    def score(rid: str, label: str) -> None:
-        actuals = read_dataset(rid, branch=fdry.branch)
-        actuals[d.date_column] = pd.to_datetime(actuals[d.date_column], utc=True).dt.tz_localize(None)
-        merged = actuals.merge(forecasts[[*keys, "forecast"]], on=keys, validate="one_to_one")
-        met = forecasting_metrics(
-            merged[d.target_column].to_numpy(float), merged["forecast"].to_numpy(float)
-        )
+    for r in results:
         table.add_row(
-            label,
-            f"{len(merged):,}",
-            f"{met['wmape']:.4f}",
-            f"{met['mape']:.4f}",
-            f"{met['rmse']:.3f}",
-            f"{met['bias_pct']:.2f}",
+            str(r["split"]),
+            f"{r['rows']:,}",
+            f"{r['wmape']:.4f}",
+            f"{r['mape']:.4f}",
+            f"{r['rmse']:.3f}",
+            f"{r['bias_pct']:.2f}",
         )
-
-    score(fdry.datasets.validation_actuals, "validation")
-    if holdout:
-        score(fdry.datasets.holdout_actuals, "holdout")
     console.print(table)
 
 
@@ -485,7 +579,7 @@ def resume(
             review=review_round,
         )
     )
-    console.print(f"Run complete: [bold grey19]{completed.run_dir}[/bold grey19]")
+    _print_run_summary(completed)
 
 
 @app.command()
@@ -639,10 +733,17 @@ def parse_review_reply(text: str) -> ReviewDecision:
 def review_round(round_number: int, ideas: list[Idea], plan_path: Path) -> ReviewDecision:
     """Console review gate: show the proposed round and its editable plan file."""
     table = Table(title=f"Proposed round {round_number} ({len(ideas)} researches in parallel)")
-    for column in ("#", "Experiment", "Hypothesis", "Skills"):
+    for column in ("#", "Experiment", "Hypothesis", "Why", "Skills"):
         table.add_column(column)
     for index, idea in enumerate(ideas, 1):
-        table.add_row(str(index), idea.title, idea.hypothesis, ", ".join(idea.skills_used) or "-")
+        why = "; ".join(item.observation for item in idea.evidence[:2])
+        table.add_row(
+            str(index),
+            idea.title,
+            idea.hypothesis,
+            why or "-",
+            ", ".join(idea.skills_used) or "-",
+        )
     console.print(table)
     console.print(
         Panel(
@@ -754,6 +855,24 @@ def leaderboard(
     store = _store_from(run_dir, config)
     state = store.load_state()
     metric = state.get("primary_metric", "wmape")
+    ranked = store.leaderboard(metric, state.get("metric_direction", "min"))
+    if STATE.json:
+        _emit_json(
+            [
+                {
+                    "rank": rank,
+                    "id": item.id,
+                    "experiment": item.idea.title,
+                    "skills": item.idea.skills_used,
+                    metric: item.metrics.get(metric),
+                    "rmse": item.metrics.get("rmse"),
+                    "holdout_wmape": item.holdout_metrics.get("wmape"),
+                    "promoted": item.promoted,
+                }
+                for rank, item in enumerate(ranked, 1)
+            ]
+        )
+        return
     table = Table(title=f"{state.get('task', 'Autoresearch')} leaderboard")
     for column in (
         "Rank",
@@ -766,7 +885,7 @@ def leaderboard(
         "Promoted",
     ):
         table.add_column(column)
-    for rank, item in enumerate(store.leaderboard(metric, state.get("metric_direction", "min")), 1):
+    for rank, item in enumerate(ranked, 1):
         table.add_row(
             str(rank),
             item.id,
@@ -828,6 +947,20 @@ def doctor(
 ) -> None:
     """Check that tools and credentials needed to run research are in place."""
     _load_env()
+    checks = run_checks(check_api=not no_api)
+    failures = [c for c in checks if c.status == "fail"]
+    if STATE.json:
+        _emit_json(
+            {
+                "ready": not failures,
+                "checks": [
+                    {"name": c.name, "status": c.status, "detail": c.detail} for c in checks
+                ],
+            }
+        )
+        if failures:
+            raise typer.Exit(1)
+        return
     symbols = {
         "ok": "[green4]✓[/green4]",
         "warn": "[dark_orange3]![/dark_orange3]",
@@ -837,11 +970,9 @@ def doctor(
     table.add_column("")
     table.add_column("Check")
     table.add_column("Detail")
-    checks = run_checks(check_api=not no_api)
     for check in checks:
         table.add_row(symbols[check.status], check.name, check.detail)
     console.print(table)
-    failures = [c for c in checks if c.status == "fail"]
     if failures:
         console.print(
             f"\n[red]{len(failures)} problem(s) must be fixed before a run.[/red] "

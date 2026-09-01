@@ -205,7 +205,8 @@ def test_repo_session_explores_project_itself(tmp_path: Path) -> None:
     assert "escapes the project" in session.execute("read_file", {"path": "../secrets"})["error"]
 
     profile = session.execute("explore_data", {"path": "data/sales.parquet", "analysis": "profile"})
-    assert profile["rows"] == 80
+    assert profile["analysis_id"] == "A1"
+    assert profile["result"]["rows"] == 80
     seasonality = session.execute(
         "explore_data",
         {
@@ -215,7 +216,11 @@ def test_repo_session_explores_project_itself(tmp_path: Path) -> None:
             "target_column": "units_sold",
         },
     )
-    assert seasonality["daily_total_autocorrelation"]["lag_7"] > 0.9
+    assert seasonality["analysis_id"] == "A2"
+    assert seasonality["result"]["daily_total_autocorrelation"]["lag_7"] > 0.9
+    # Each run is logged verbatim so round-1 ideas can cite it as evidence.
+    assert [record.id for record in session.analysis_log] == ["A1", "A2"]
+    assert session.analysis_log[0].tool == "explore_data"
 
 
 def test_survey_runs_in_background_and_folds_into_prompt(tmp_path: Path, monkeypatch) -> None:

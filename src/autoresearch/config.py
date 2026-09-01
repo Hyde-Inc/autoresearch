@@ -6,6 +6,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+from .models import Idea
+
 DEFAULT_MODEL = "openrouter/moonshotai/kimi-k3"
 
 
@@ -109,6 +111,13 @@ class OpeningRoundConfig(BaseModel):
         "no hyperparameter search. Prefer changes that are quick to write and train in "
         "seconds, so the first scored result arrives early."
     )
+    ideas: list[Idea] = Field(default_factory=list)
+    """Pre-seeded round-1 experiments. When set, the director skips idea
+    generation for the opening round and launches these verbatim - deterministic
+    and instant, useful for demos or reproducing a known starting point."""
+    think_seconds: int = Field(default=0, ge=0)
+    """Cosmetic: when pre-seeded ``ideas`` are used, show the director 'thinking'
+    spinner for this many seconds before revealing them (0 disables)."""
 
 
 class TaskConfig(BaseModel):
