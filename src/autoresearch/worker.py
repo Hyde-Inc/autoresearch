@@ -95,11 +95,15 @@ def _prompt_rules(config: TaskConfig) -> str:
         "forecasting logic. Do not run training or install packages yourself; only the "
         "libraries pinned in the repo's conda recipe are available on Foundry. After your "
         "reply ends, the orchestrator pushes your code to Foundry, builds it there on the "
-        "real data, and reports the score back into this conversation. Everything you "
-        "need is inside this working directory - never read parent directories or "
-        "autoresearch run artifacts (runs/, research/, .autoresearch*); they are outputs "
-        "of other experiments and reading them wastes session budget. Do not ask "
-        "questions. Do not commit changes."
+        "real data, and reports the score back into this conversation. The repository is "
+        "already set up: AUTORESEARCH.md and EXPERIMENT.md already document the file to "
+        "edit, the input dataset schemas (sales_train, forecast_request), the available "
+        "libraries, and the output schema, so you do NOT need to explore. Go straight to "
+        f"the edit: open {entry}, read it once, and rewrite the forecasting logic. Do not "
+        "run ls, git, glob, or cat, and do not read any other files - exploration wastes "
+        "paid session budget and the build is faster the sooner you edit. Never read "
+        "parent directories or autoresearch run artifacts (runs/, research/, "
+        ".autoresearch*). Do not ask questions. Do not commit changes."
     )
 
 
@@ -245,11 +249,14 @@ async def run_worker(
     if code:
         return WorkerResult(branch, worktree, None, "", [], OpenCodeResult(code, None, output), output)
 
-    experiment = (
-        f"# Experiment: {idea.title}\n\n"
-        f"## Hypothesis\n{idea.hypothesis}\n\n"
-        f"## Instructions\n{idea.instructions}\n"
-    )
+    experiment = f"# Experiment: {idea.title}\n\n## Hypothesis\n{idea.hypothesis}\n\n"
+    if idea.evidence:
+        bullets = "\n".join(
+            f"- {item.observation}" + (f" (source: {item.source})" if item.source else "")
+            for item in idea.evidence
+        )
+        experiment += f"## Why this idea\n{bullets}\n\n"
+    experiment += f"## Instructions\n{idea.instructions}\n"
     if idea.skills_used:
         skill_context = named_skill_context(idea.skills_used, load_skills(config))
         experiment += f"\n## Research skills used\n{', '.join(idea.skills_used)}\n"
