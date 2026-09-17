@@ -12,7 +12,7 @@ from rich.theme import Theme
 
 THEME = Theme(
     {
-        "table.header": "bold blue3",
-        "table.title": "bold blue3",
+        "table.header": "bold blue",
+        "table.title": "bold blue",
     }
 )

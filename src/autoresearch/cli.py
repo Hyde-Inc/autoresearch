@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import pandas as pd
 import typer
@@ -30,6 +30,9 @@ from .skills import load_skills
 from .slash import SessionSettings, parse_reply, print_help
 from .store import RunStore, latest_run
 from .ui import THEME
+
+if TYPE_CHECKING:
+    from .review import ReviewReport
 
 app = typer.Typer(no_args_is_help=True, help="Parallel autonomous ML experimentation.")
 console = Console(theme=THEME)
@@ -856,6 +859,7 @@ def leaderboard(
     state = store.load_state()
     metric = state.get("primary_metric", "wmape")
     ranked = store.leaderboard(metric, state.get("metric_direction", "min"))
+    label = metric.upper()
     if STATE.json:
         _emit_json(
             [
@@ -865,8 +869,7 @@ def leaderboard(
                     "experiment": item.idea.title,
                     "skills": item.idea.skills_used,
                     metric: item.metrics.get(metric),
-                    "rmse": item.metrics.get("rmse"),
-                    "holdout_wmape": item.holdout_metrics.get("wmape"),
+                    f"holdout_{metric}": item.holdout_metrics.get(metric),
                     "promoted": item.promoted,
                 }
                 for rank, item in enumerate(ranked, 1)
@@ -874,16 +877,7 @@ def leaderboard(
         )
         return
     table = Table(title=f"{state.get('task', 'Autoresearch')} leaderboard")
-    for column in (
-        "Rank",
-        "ID",
-        "Experiment",
-        "Skills",
-        metric.upper(),
-        "RMSE",
-        "Holdout",
-        "Promoted",
-    ):
+    for column in ("Rank", "ID", "Experiment", "Skills", label, f"Holdout {label}", "Promoted"):
         table.add_column(column)
     for rank, item in enumerate(ranked, 1):
         table.add_row(
@@ -892,11 +886,159 @@ def leaderboard(
             item.idea.title,
             ", ".join(item.idea.skills_used),
             f"{item.metrics.get(metric, float('nan')):.6f}",
-            f"{item.metrics.get('rmse', float('nan')):.3f}",
-            f"{item.holdout_metrics.get('wmape', float('nan')):.6f}",
+            f"{item.holdout_metrics.get(metric, float('nan')):.6f}",
             "yes" if item.promoted else "",
         )
     console.print(table)
+
+
+def _fmt_metric(value: float | None) -> str:
+    if value is None:
+        return "\u2014"
+    return f"{value:.4f}" if abs(value) < 10 else f"{value:,.2f}"
+
+
+def _fmt_improvement(rel: float | None) -> str:
+    if rel is None:
+        return "[dim]\u2014[/dim]"
+    pct = rel * 100
+    if abs(pct) < 0.05:
+        return "[dim]~0.0%[/dim]"
+    colour = "green" if pct > 0 else "red"
+    return f"[{colour}]{pct:+.1f}%[/{colour}]"
+
+
+def _print_review(report: ReviewReport) -> None:
+    from rich.rule import Rule
+
+    from .review import improvement
+
+    label = report.metric.upper()
+    console.print()
+    console.print(Rule(f"[bold blue]Review gate \u00b7 {report.attempt_id}[/bold blue]", style="blue"))
+    overall = report.overall_improvement
+    console.print(
+        f"[bold grey19]Overall {label}[/bold grey19]  "
+        f"baseline {_fmt_metric(report.overall_baseline)}  \u2192  "
+        f"candidate {_fmt_metric(report.overall_candidate)}   {_fmt_improvement(overall)}"
+    )
+
+    for step in report.steps:
+        console.print()
+        console.print(f"[bold blue]{step.title}[/bold blue]")
+        for block in step.blocks:
+            table = Table(title=block.label, title_style="bold blue")
+            table.add_column("Segment", style="bold grey19")
+            table.add_column("Rows", justify="right")
+            table.add_column(f"Baseline {label}", justify="right")
+            table.add_column(f"Candidate {label}", justify="right")
+            table.add_column("Change", justify="right")
+            for seg in block.segments:
+                rel = improvement(seg.baseline, seg.candidate, report.direction)
+                table.add_row(
+                    seg.label,
+                    f"{seg.size:,}",
+                    _fmt_metric(seg.baseline),
+                    _fmt_metric(seg.candidate),
+                    _fmt_improvement(rel),
+                )
+            console.print(table)
+
+    console.print()
+    console.print("[bold blue]Step 4 - aggregate readiness score[/bold blue]")
+    score_table = Table(title_style="bold blue")
+    score_table.add_column("Dimension", style="bold grey19")
+    score_table.add_column("Score", justify="right")
+    score_table.add_column("Status")
+    status_colour = {"Pass": "green", "Warn": "yellow", "Fail": "red"}
+    for dim in report.dimensions:
+        colour = status_colour.get(dim.status, "white")
+        score_table.add_row(dim.name, f"{dim.score:.0f}/100", f"[{colour}]{dim.status}[/{colour}]")
+    console.print(score_table)
+
+    verdict_colour = {
+        "Ready to merge": "green",
+        "Review recommended": "yellow",
+        "Not recommended": "red",
+    }.get(report.verdict, "white")
+    console.print(
+        Panel(
+            f"[bold {verdict_colour}]{report.verdict}[/bold {verdict_colour}]  "
+            f"[dim](aggregate {report.aggregate_score:.0f}/100)[/dim]",
+            title="Readiness",
+        )
+    )
+
+
+@app.command()
+def review(
+    attempt_id: str,
+    run_dir: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    config: Annotated[Path | None, typer.Option("-c", exists=True, dir_okay=False)] = None,
+) -> None:
+    """Break the primary metric down by group, cut, and period before merging."""
+    from .review import build_review
+
+    store = _store_from(run_dir, config)
+    task_yaml = config or (store.run_dir / "task.yaml")
+    if not task_yaml.exists():
+        raise typer.BadParameter(f"no task config found; pass -c (looked for {task_yaml})")
+    cfg = load_config(task_yaml)
+
+    candidate = store.load_validation_frame(attempt_id)
+    if candidate is None:
+        raise typer.BadParameter(
+            f"no saved validation forecasts for '{attempt_id}' in {store.run_dir}"
+        )
+    baseline = store.load_validation_frame("baseline")
+    if baseline is None:
+        raise typer.BadParameter(
+            "no baseline validation frame saved for this run; cannot compare segments"
+        )
+
+    report = build_review(cfg, baseline, candidate, attempt_id)
+    if STATE.json:
+        _emit_json(
+            {
+                "attempt": report.attempt_id,
+                "metric": report.metric,
+                "direction": report.direction,
+                "overall": {
+                    "baseline": report.overall_baseline,
+                    "candidate": report.overall_candidate,
+                    "improvement": report.overall_improvement,
+                },
+                "steps": [
+                    {
+                        "title": step.title,
+                        "blocks": [
+                            {
+                                "label": block.label,
+                                "segments": [
+                                    {
+                                        "label": seg.label,
+                                        "rows": seg.size,
+                                        "baseline": seg.baseline,
+                                        "candidate": seg.candidate,
+                                    }
+                                    for seg in block.segments
+                                ],
+                            }
+                            for block in step.blocks
+                        ],
+                    }
+                    for step in report.steps
+                ],
+                "dimensions": [
+                    {"name": dim.name, "score": dim.score, "status": dim.status}
+                    for dim in report.dimensions
+                ],
+                "aggregate_score": report.aggregate_score,
+                "verdict": report.verdict,
+            }
+        )
+        return
+    _print_review(report)
 
 
 @app.command()

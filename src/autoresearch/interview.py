@@ -23,6 +23,7 @@ import yaml
 from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 
 from . import eda
@@ -320,6 +321,19 @@ _ACTIVITY_PHASES = {
     "evaluate_baseline": "Evaluating baseline on validation + hidden holdout",
     "define_custom_metric": "Defining and verifying the custom metric",
 }
+_TOOL_PHASES: dict[str, str] = {
+    "read_file": "Data Discovery",
+    "explore_data": "Data Analysis",
+    "prepare_workspace": "Workspace Setup",
+    "write_baseline": "Baseline",
+    "evaluate_baseline": "Baseline",
+    "replace_baseline": "Baseline",
+    "finalize_brief": "Research Brief",
+    "record_context": "Research Brief",
+    "define_custom_metric": "Custom Metric",
+    "adopt_custom_metric": "Custom Metric",
+    "write_plan": "Research Plan",
+}
 
 _RUNTIME_CONTRACT = """\
 Runtime contract for solution/train.py (the baseline and every experiment):
@@ -370,6 +384,7 @@ class SetupSession:
         self.plan_path: Path | None = None
         self._survey_thread: threading.Thread | None = None
         self._survey_outcome: dict = {}
+        self._current_phase: str = ""
 
     def _reload(self) -> None:
         assert self.config_path is not None
@@ -531,6 +546,102 @@ class SetupSession:
         except Exception as exc:  # noqa: BLE001 - surfaced to the director, not the terminal
             return {"error": str(exc)}
 
+    # ------------------------------------------------------------------
+    # Pretty-print helpers for structured analysis output
+    # ------------------------------------------------------------------
+
+    def _print_profile(self, path: str, result: dict) -> None:
+        table = Table(
+            title=f"Dataset profile  [dim]({result['rows']:,} rows)[/dim]",
+            title_style="bold blue",
+            show_lines=False,
+            pad_edge=True,
+        )
+        table.add_column("Column", style="bold grey19")
+        table.add_column("Type", style="dim")
+        table.add_column("Unique", justify="right")
+        table.add_column("Missing", justify="right")
+        table.add_column("Range / Examples")
+        for col in result["columns"]:
+            if "min" in col:
+                detail = f"{col['min']} .. {col['max']}  (mean {col['mean']})"
+            elif col.get("looks_like_dates"):
+                detail = f"{col['date_min']} .. {col['date_max']}  ({col['distinct_dates']} days)"
+            elif "examples" in col:
+                detail = ", ".join(col["examples"][:4])
+            else:
+                detail = ""
+            table.add_row(
+                col["name"],
+                col["dtype"],
+                f"{col['unique']:,}",
+                str(col["missing"]) if col["missing"] else "",
+                detail,
+            )
+        self.console.print(table)
+
+    def _print_seasonality(self, result: dict) -> None:
+        profile = result.get("weekday_profile_vs_mean", {})
+        table = Table(title="Weekday seasonality  [dim](ratio vs. daily mean)[/dim]", title_style="bold blue")
+        for day in profile:
+            table.add_column(day.upper(), justify="center")
+        table.add_row(*(f"{v:.2f}" for v in profile.values()))
+        self.console.print(table)
+        auto = result.get("daily_total_autocorrelation", {})
+        parts = [f"{k}: {v}" for k, v in auto.items() if v is not None]
+        if parts:
+            self.console.print(f"[dim]Autocorrelation  {' | '.join(parts)}[/dim]")
+        trend = result.get("linear_trend_per_day_vs_mean")
+        if trend is not None:
+            self.console.print(f"[dim]Daily trend vs mean  {trend:+.4f}[/dim]")
+
+    def _print_intermittency(self, result: dict) -> None:
+        table = Table(title="Demand patterns", title_style="bold blue")
+        table.add_column("Pattern", style="bold grey19")
+        table.add_column("Count", justify="right")
+        for pattern, count in result.get("demand_pattern_counts", {}).items():
+            table.add_row(pattern.capitalize(), f"{count:,}")
+        self.console.print(table)
+        zs = result.get("overall_zero_share")
+        if zs is not None:
+            self.console.print(f"[dim]Overall zero share  {zs:.1%}[/dim]")
+
+    def _print_drivers(self, result: dict) -> None:
+        corrs = result.get("correlation_with_target", {})
+        if corrs:
+            table = Table(title="Feature correlations with target", title_style="bold blue")
+            table.add_column("Feature", style="bold grey19")
+            table.add_column("Correlation", justify="right")
+            for name, val in sorted(corrs.items(), key=lambda x: abs(x[1]), reverse=True)[:10]:
+                table.add_row(name, f"{val:+.4f}")
+            self.console.print(table)
+        lifts = result.get("binary_flag_lift_on_target", {})
+        if lifts:
+            table = Table(title="Binary flag lift on target", title_style="bold blue")
+            table.add_column("Flag", style="bold grey19")
+            table.add_column("Lift", justify="right")
+            for name, val in sorted(lifts.items(), key=lambda x: x[1], reverse=True):
+                table.add_row(name, f"{val:.2f}x")
+            self.console.print(table)
+
+    def _print_analysis(self, analysis: str, path: str, result: dict) -> None:
+        """Route analysis output to the appropriate pretty-printer."""
+        printers = {
+            "profile": self._print_profile,
+            "seasonality": self._print_seasonality,
+            "intermittency": self._print_intermittency,
+            "drivers": self._print_drivers,
+        }
+        printer = printers.get(analysis)
+        if printer is None:
+            return
+        if analysis == "profile":
+            printer(path, result)
+        else:
+            printer(result)
+
+    # ------------------------------------------------------------------
+
     def _tool_read_file(self, path: str) -> dict:
         return {"path": path, "content": read_repo_file(self.repo, path)}
 
@@ -575,6 +686,7 @@ class SetupSession:
             )
         else:
             return {"error": f"unknown analysis: {analysis}"}
+        self._print_analysis(analysis, path, result)
         return self._record_analysis("explore_data", {"path": path, "analysis": analysis}, result)
 
     def _tool_prepare_workspace(
@@ -601,17 +713,21 @@ class SetupSession:
         self.config_path = prepared.config_path
         self._reload()
         self.skills = load_skills(self.config)
-        self.console.print(
-            Panel(
-                f"[bold grey19]Train[/bold grey19] {prepared.train_rows:,} rows through {prepared.train_end}\n"
-                f"[bold grey19]Validation[/bold grey19] {prepared.validation_rows:,} rows through "
-                f"{prepared.validation_end}\n"
-                f"[bold grey19]Hidden holdout[/bold grey19] {prepared.holdout_rows:,} rows through "
-                f"{prepared.holdout_end}\n"
-                f"[bold grey19]Items[/bold grey19] {prepared.items}",
-                title=f"Protected task workspace ({prepared.task_dir})",
-            )
+        self.console.print(f"[dim]{prepared.task_dir}[/dim]")
+        splits_table = Table(title="Data splits", title_style="bold blue")
+        splits_table.add_column("Split", style="bold grey19")
+        splits_table.add_column("Rows", justify="right")
+        splits_table.add_column("Through")
+        splits_table.add_row("Train", f"{prepared.train_rows:,}", str(prepared.train_end))
+        splits_table.add_row(
+            "Validation", f"{prepared.validation_rows:,}", str(prepared.validation_end)
         )
+        splits_table.add_row(
+            "Hidden holdout", f"{prepared.holdout_rows:,}", str(prepared.holdout_end)
+        )
+        splits_table.add_section()
+        splits_table.add_row("Items", f"{prepared.items:,}", "")
+        self.console.print(splits_table)
         return {
             "ok": True,
             "task_dir": str(prepared.task_dir),
@@ -625,7 +741,9 @@ class SetupSession:
     def _tool_write_baseline(self, code: str) -> dict:
         destination = write_baseline(self._require_config(), code)
         lines = len(code.splitlines())
-        self.console.print(f"[dim]Baseline written: {destination} ({lines} lines)[/dim]")
+        self.console.print(
+            f"[green]Baseline written[/green]  {destination}  [dim]({lines} lines)[/dim]"
+        )
         return {"ok": True, "written_to": str(destination), "lines": lines}
 
     def _tool_finalize_brief(
@@ -689,17 +807,41 @@ class SetupSession:
         destination = replace_baseline(self._require_config(), Path(path))
         return {"ok": True, "installed_at": str(destination)}
 
+    @staticmethod
+    def _metric_label(key: str) -> str:
+        known = {
+            "wmape": "WMAPE",
+            "mape": "MAPE",
+            "rmse": "RMSE",
+            "bias_pct": "Bias %",
+            "runtime_s": "Runtime (s)",
+        }
+        return known.get(key, key.replace("_", " ").title())
+
+    @staticmethod
+    def _fmt_metric(value: object) -> str:
+        if isinstance(value, float):
+            return f"{value:,.2f}" if abs(value) >= 10 else f"{value:.4f}"
+        return str(value) if value is not None else "\u2014"
+
     def _tool_evaluate_baseline(self) -> dict:
         result = asyncio.run(validate_baseline(self._require_config()))
         if result.error:
             return {"error": result.error}
-        self.console.print(
-            Panel(
-                f"[bold grey19]Validation[/bold grey19]  {json.dumps(result.metrics)}\n"
-                f"[bold grey19]Hidden holdout[/bold grey19]  {json.dumps(result.holdout_metrics)}",
-                title="Protected baseline evaluation",
+        table = Table(title="Baseline evaluation", title_style="bold blue")
+        table.add_column("Metric", style="bold grey19")
+        table.add_column("Validation", justify="right")
+        table.add_column("Holdout", justify="right")
+        all_keys = list(dict.fromkeys(
+            list(result.metrics.keys()) + list(result.holdout_metrics.keys())
+        ))
+        for key in all_keys:
+            table.add_row(
+                self._metric_label(key),
+                self._fmt_metric(result.metrics.get(key)),
+                self._fmt_metric(result.holdout_metrics.get(key)),
             )
-        )
+        self.console.print(table)
         return self._record_analysis(
             "evaluate_baseline",
             {},
@@ -922,6 +1064,13 @@ class SetupSession:
                     raise RuntimeError("the director looped on tools without finishing setup")
                 for call in message["tool_calls"]:
                     name = call["function"]["name"]
+                    phase = _TOOL_PHASES.get(name, "")
+                    if phase and phase != self._current_phase:
+                        self._current_phase = phase
+                        self.console.print()
+                        self.console.print(
+                            Rule(f"[bold blue]{phase}[/bold blue]", style="blue")
+                        )
                     self.console.print(f"[dim]-> {_TOOL_LABELS.get(name, name)}[/dim]")
                     try:
                         arguments = json.loads(call["function"]["arguments"] or "{}")

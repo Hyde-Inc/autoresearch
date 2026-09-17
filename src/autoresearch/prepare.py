@@ -121,9 +121,12 @@ def prepare_workspace(
     train.to_parquet(seed / "data" / "train.parquet", index=False)
     private = task_dir / "private"
     private.mkdir()
-    actual_columns = [id_column, date_column, target_column]
-    validation[actual_columns].to_parquet(private / "validation.parquet", index=False)
-    holdout[actual_columns].to_parquet(private / "holdout.parquet", index=False)
+    # Keep every column (target + covariates) in the sealed actuals. The agent
+    # request is always rebuilt from the id/date keys alone (see harness), so
+    # these covariates never reach the model - they exist only so the review
+    # gate can cut the metric by price, flags, category, etc. after the fact.
+    validation.to_parquet(private / "validation.parquet", index=False)
+    holdout.to_parquet(private / "holdout.parquet", index=False)
 
     slug = slugify(name or repo.name)
     (seed / "TASK.md").write_text(

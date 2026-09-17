@@ -22,6 +22,7 @@ def _repo(tmp_path: Path) -> Path:
             "sku_id": ["a"] * 30 + ["b"] * 30,
             "date": list(dates) * 2,
             "units_sold": np.arange(60, dtype=float),
+            "price": np.linspace(10.0, 25.0, 60),
         }
     ).to_parquet(repo / "data" / "sales.parquet", index=False)
     return repo
@@ -83,6 +84,9 @@ def test_prepare_workspace_builds_protected_task(tmp_path: Path) -> None:
     train = pd.read_parquet(seed / "data" / "train.parquet")
     validation = pd.read_parquet(task_dir / "private" / "validation.parquet")
     assert train["date"].max() < validation["date"].min()
+    # Sealed actuals keep every covariate column (for the review gate's cuts);
+    # they are protected in private/ and never reach the agent.
+    assert set(validation.columns) == set(train.columns)
 
 
 def test_prepare_workspace_rejects_bad_input(tmp_path: Path) -> None:
