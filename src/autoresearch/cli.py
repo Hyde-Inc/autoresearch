@@ -121,8 +121,15 @@ def _store_from(run_dir: Path | None, config: Path | None = None) -> RunStore:
         cfg = load_config(config)
         found = latest_run(cfg.resolve(cfg.workspace.runs), cfg.name)
     else:
-        # `start`-created tasks keep runs under the hidden .autoresearch/runs.
-        found = latest_run(Path("runs")) or latest_run(Path(".autoresearch/runs"))
+        # Runs live either under ./runs (ingested tasks) or the hidden
+        # .autoresearch/runs (`start`-created tasks). Pick the most recent
+        # across both, rather than always preferring ./runs.
+        candidates = [
+            run
+            for run in (latest_run(Path("runs")), latest_run(Path(".autoresearch/runs")))
+            if run is not None
+        ]
+        found = max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
     if found is None:
         raise typer.BadParameter("no run found; pass --run-dir")
     return RunStore(found)
@@ -908,6 +915,47 @@ def _fmt_improvement(rel: float | None) -> str:
     return f"[{colour}]{pct:+.1f}%[/{colour}]"
 
 
+def _review_payload(report: ReviewReport) -> dict:
+    """Serialize a review report to the shape the CLI and downstream apps read."""
+    return {
+        "attempt": report.attempt_id,
+        "metric": report.metric,
+        "direction": report.direction,
+        "overall": {
+            "baseline": report.overall_baseline,
+            "candidate": report.overall_candidate,
+            "improvement": report.overall_improvement,
+        },
+        "steps": [
+            {
+                "title": step.title,
+                "blocks": [
+                    {
+                        "label": block.label,
+                        "segments": [
+                            {
+                                "label": seg.label,
+                                "rows": seg.size,
+                                "baseline": seg.baseline,
+                                "candidate": seg.candidate,
+                            }
+                            for seg in block.segments
+                        ],
+                    }
+                    for block in step.blocks
+                ],
+            }
+            for step in report.steps
+        ],
+        "dimensions": [
+            {"name": dim.name, "score": dim.score, "status": dim.status}
+            for dim in report.dimensions
+        ],
+        "aggregate_score": report.aggregate_score,
+        "verdict": report.verdict,
+    }
+
+
 def _print_review(report: ReviewReport) -> None:
     from rich.rule import Rule
 
@@ -998,47 +1046,119 @@ def review(
 
     report = build_review(cfg, baseline, candidate, attempt_id)
     if STATE.json:
-        _emit_json(
-            {
-                "attempt": report.attempt_id,
-                "metric": report.metric,
-                "direction": report.direction,
-                "overall": {
-                    "baseline": report.overall_baseline,
-                    "candidate": report.overall_candidate,
-                    "improvement": report.overall_improvement,
-                },
-                "steps": [
-                    {
-                        "title": step.title,
-                        "blocks": [
-                            {
-                                "label": block.label,
-                                "segments": [
-                                    {
-                                        "label": seg.label,
-                                        "rows": seg.size,
-                                        "baseline": seg.baseline,
-                                        "candidate": seg.candidate,
-                                    }
-                                    for seg in block.segments
-                                ],
-                            }
-                            for block in step.blocks
-                        ],
-                    }
-                    for step in report.steps
-                ],
-                "dimensions": [
-                    {"name": dim.name, "score": dim.score, "status": dim.status}
-                    for dim in report.dimensions
-                ],
-                "aggregate_score": report.aggregate_score,
-                "verdict": report.verdict,
-            }
-        )
+        _emit_json(_review_payload(report))
         return
     _print_review(report)
+
+
+def _build_export_bundle(store: RunStore, cfg) -> dict:
+    """Compose a run into one JSON bundle for downstream apps (dashboards/UI).
+
+    Reuses the same building blocks as the terminal commands - run summary,
+    leaderboard, segment breakdowns, and the review gate - so the UI never
+    drifts from what the CLI reports.
+    """
+    from .review import build_review, discover_dimensions, segment_period_matrix
+
+    summary = summarize_run(store.run_dir)
+    state = store.load_state()
+    attempts = store.load_attempts()
+    metric = summary["metric"]
+    direction = summary["metric_direction"]
+    baseline_metrics = state.get("baseline") or {}
+    base_val = baseline_metrics.get(metric)
+
+    ranked = store.leaderboard(metric, direction)
+    strategies = []
+    for rank, item in enumerate(ranked, 1):
+        candidate_value = item.metrics.get(metric)
+        delta = delta_pp = improvement_pct = None
+        if base_val is not None and candidate_value is not None:
+            raw = (base_val - candidate_value) if direction == "min" else (candidate_value - base_val)
+            delta = raw
+            delta_pp = raw * 100
+            if base_val:
+                improvement_pct = raw / abs(base_val) * 100
+        strategies.append(
+            {
+                "rank": rank,
+                "id": item.id,
+                "title": item.idea.title,
+                "hypothesis": item.idea.hypothesis,
+                "category": item.idea.category,
+                "skills_used": item.idea.skills_used,
+                "evidence": [ev.model_dump() for ev in item.idea.evidence],
+                "metric": candidate_value,
+                "delta": delta,
+                "delta_pp": delta_pp,
+                "improvement_pct": improvement_pct,
+                "promoted": item.promoted,
+                "holdout_metric": item.holdout_metrics.get(metric),
+                "cost_usd": item.metadata.get("cost_usd"),
+                "duration_s": item.duration_s,
+            }
+        )
+
+    segments: dict = {}
+    review_payload = None
+    best = ranked[0] if ranked else None
+    baseline_frame = store.load_validation_frame("baseline")
+    if best is not None and cfg is not None and baseline_frame is not None:
+        candidate_frame = store.load_validation_frame(best.id)
+        if candidate_frame is not None:
+            for column in discover_dimensions(candidate_frame, cfg)["categories"]:
+                segments[column] = segment_period_matrix(
+                    cfg, baseline_frame, candidate_frame, column
+                )
+            review_payload = _review_payload(
+                build_review(cfg, baseline_frame, candidate_frame, best.id)
+            )
+
+    return {
+        "run": {
+            "task": summary["task"],
+            "goal": summary["goal"],
+            "status": summary["status"],
+            "metric": metric,
+            "direction": direction,
+            "rounds": summary["rounds"],
+            "experiments": summary["counts"]["completed"],
+            "wall_clock_s": sum((item.duration_s or 0.0) for item in attempts),
+            "compute_usd": summary["total_cost_usd"],
+        },
+        "baseline": {
+            metric: base_val,
+            f"holdout_{metric}": baseline_metrics.get(f"holdout_{metric}"),
+        },
+        "outcome": {
+            "final": summary["final"],
+            "improvement_pct": summary["improvement_pct"],
+            "best_attempt": summary["best_attempt"],
+            "promoted": summary["promoted"],
+            "counts": summary["counts"],
+        },
+        "strategies": strategies,
+        "segments": segments,
+        "review": review_payload,
+    }
+
+
+@app.command()
+def export(
+    run_dir: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    config: Annotated[Path | None, typer.Option("-c", exists=True, dir_okay=False)] = None,
+    output: Annotated[Path | None, typer.Option("-o", help="Write the bundle to a file")] = None,
+) -> None:
+    """Export a run as a single JSON bundle for downstream apps and dashboards."""
+    store = _store_from(run_dir, config)
+    task_yaml = config or (store.run_dir / "task.yaml")
+    cfg = load_config(task_yaml) if task_yaml.exists() else None
+    bundle = _build_export_bundle(store, cfg)
+    if output:
+        output.write_text(json.dumps(bundle, indent=2, default=str) + "\n")
+        console.print(f"Wrote {output}")
+    else:
+        _emit_json(bundle)
 
 
 @app.command()

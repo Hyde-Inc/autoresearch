@@ -65,10 +65,14 @@ def seasonality(frame: pd.DataFrame, date_column: str, target_column: str) -> di
             ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], weekday, strict=False
         )
     }
-    autocorr = {
-        f"lag_{lag}": _round(daily.autocorr(lag)) if len(daily) > lag + 1 else None
-        for lag in (1, 7, 14, 28)
-    }
+    # A constant series has zero variance, so the autocorrelation divides by
+    # zero and numpy warns before returning NaN. That NaN is expected and
+    # handled below; silence the noise so it stays out of the demo output.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        autocorr = {
+            f"lag_{lag}": _round(daily.autocorr(lag)) if len(daily) > lag + 1 else None
+            for lag in (1, 7, 14, 28)
+        }
     trend = _round(
         np.polyfit(np.arange(len(daily)), daily.to_numpy(dtype=float), 1)[0]
         / max(daily.mean(), 1e-9)
@@ -121,22 +125,26 @@ def drivers(frame: pd.DataFrame, target_column: str, exclude: list[str]) -> dict
     target = pd.to_numeric(frame[target_column], errors="coerce")
     correlations: dict[str, float] = {}
     lifts: dict[str, float] = {}
-    for name in frame.columns:
-        if name == target_column or name in exclude:
-            continue
-        series = frame[name]
-        if not pd.api.types.is_numeric_dtype(series):
-            continue
-        values = pd.to_numeric(series, errors="coerce")
-        unique = set(values.dropna().unique())
-        if unique <= {0, 1} and len(unique) > 1:
-            on = target[values == 1].mean()
-            off = target[values == 0].mean()
-            lifts[str(name)] = _round(on / max(off, 1e-9))
-        else:
-            corr = target.corr(values)
-            if pd.notna(corr):
-                correlations[str(name)] = _round(corr)
+    # Constant columns have zero variance, so their correlation divides by zero
+    # and numpy warns before returning NaN. The NaN is dropped just below;
+    # silence the warning so it does not clutter the terminal.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for name in frame.columns:
+            if name == target_column or name in exclude:
+                continue
+            series = frame[name]
+            if not pd.api.types.is_numeric_dtype(series):
+                continue
+            values = pd.to_numeric(series, errors="coerce")
+            unique = set(values.dropna().unique())
+            if unique <= {0, 1} and len(unique) > 1:
+                on = target[values == 1].mean()
+                off = target[values == 0].mean()
+                lifts[str(name)] = _round(on / max(off, 1e-9))
+            else:
+                corr = target.corr(values)
+                if pd.notna(corr):
+                    correlations[str(name)] = _round(corr)
     return {
         "correlation_with_target": correlations,
         "binary_flag_lift_on_target": lifts,

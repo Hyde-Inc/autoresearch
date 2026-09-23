@@ -4,7 +4,12 @@ import numpy as np
 import pandas as pd
 
 from autoresearch.config import DataConfig, MetricConfig, TaskConfig
-from autoresearch.review import build_review, improvement
+from autoresearch.review import (
+    build_review,
+    discover_dimensions,
+    improvement,
+    segment_period_matrix,
+)
 
 
 def _config(direction: str = "min") -> TaskConfig:
@@ -81,6 +86,29 @@ def test_review_flags_a_worse_model() -> None:
     report = build_review(_config(), baseline, candidate, "a2")
     assert report.verdict == "Not recommended"
     assert report.aggregate_score < 55
+
+
+def test_discover_dimensions_splits_categories_and_cuts() -> None:
+    _, candidate = _frames(seed=2, base_scale=6.0, cand_scale=6.0)
+    dims = discover_dimensions(candidate, _config())
+    assert "vertical" in dims["categories"]
+    assert "selling_price" in dims["cuts"]
+    assert "oos_flag" in dims["cuts"]
+    # id/date/target/forecast are never offered as segment axes.
+    for reserved in ("sku", "date", "demand", "forecast"):
+        assert reserved not in dims["categories"]
+        assert reserved not in dims["cuts"]
+
+
+def test_segment_period_matrix_shape() -> None:
+    baseline, candidate = _frames(seed=4, base_scale=9.0, cand_scale=5.0)
+    matrix = segment_period_matrix(_config(), baseline, candidate, "vertical", buckets=4)
+    assert matrix["column"] == "vertical"
+    assert len(matrix["periods"]) == 4
+    assert matrix["segments"]  # one series per top category value
+    for series in matrix["segments"]:
+        assert len(series["candidate"]) == len(matrix["periods"])
+        assert len(series["baseline"]) == len(matrix["periods"])
 
 
 def test_review_handles_minimal_columns() -> None:

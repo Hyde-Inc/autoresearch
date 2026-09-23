@@ -371,6 +371,68 @@ def _verdict(aggregate: float, dimensions: list[Dimension]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def discover_dimensions(frame: pd.DataFrame, config: TaskConfig) -> dict[str, list[str]]:
+    """Public view of the segment axes available in a validation frame.
+
+    Powers a UI dimension picker: ``categories`` are group-by columns (vertical,
+    region, ...) and ``cuts`` are numeric/flag columns turned into bins.
+    """
+    groups, cuts = _discover(frame, config)
+    return {"categories": list(groups), "cuts": [name for _, name in cuts]}
+
+
+def _date_periods(dates: list, buckets: int) -> list[tuple[str, set]]:
+    """Split sorted unique dates into contiguous buckets with short labels."""
+    if not dates:
+        return []
+    buckets = min(buckets, len(dates))
+    out: list[tuple[str, set]] = []
+    for chunk in np.array_split(dates, buckets):
+        if len(chunk) == 0:
+            continue
+        lo = pd.Timestamp(chunk[0]).strftime("%m-%d")
+        hi = pd.Timestamp(chunk[-1]).strftime("%m-%d")
+        out.append((lo if lo == hi else f"{lo}..{hi}", {pd.Timestamp(d) for d in chunk}))
+    return out
+
+
+def segment_period_matrix(
+    config: TaskConfig,
+    baseline_frame: pd.DataFrame,
+    candidate_frame: pd.DataFrame,
+    column: str,
+    buckets: int = 8,
+) -> dict:
+    """Metric per (category value x evaluation period) for candidate and baseline.
+
+    This is the data behind the 'accuracy by <segment> over time' line chart and
+    the segment x period heatmap. Returns one series per top category value.
+    """
+    compute = _metric_computer(config)
+    date_col = config.data.date_column
+    cand_dt = pd.to_datetime(candidate_frame[date_col]).dt.normalize()
+    base_dt = pd.to_datetime(baseline_frame[date_col]).dt.normalize()
+    periods = _date_periods(sorted(cand_dt.unique()), buckets)
+    labels = [label for label, _ in periods]
+    top = candidate_frame[column].value_counts().head(_MAX_CATEGORY_VALUES).index.tolist()
+
+    def series(frame: pd.DataFrame, dt: pd.Series, value) -> list[float | None]:
+        rows = frame[frame[column] == value]
+        rows_dt = dt[frame[column] == value]
+        return [compute(rows[rows_dt.isin(members)]) for _, members in periods]
+
+    segments = []
+    for value in top:
+        segments.append(
+            {
+                "label": str(value),
+                "candidate": series(candidate_frame, cand_dt, value),
+                "baseline": series(baseline_frame, base_dt, value),
+            }
+        )
+    return {"column": column, "periods": labels, "segments": segments}
+
+
 def build_review(
     config: TaskConfig,
     baseline_frame: pd.DataFrame,
